@@ -8,7 +8,8 @@ Objects stay inside the backend (pymtex: Python objects, matlab: the MATLAB sess
 referenced by an EBSDHandle; arrays are fetched on demand with get_ebsd().
 
 Planned core operations (added to both backends in the same change, with conformance tests):
-cleanup, calc_grains, kam, gb_map, reconstruct_parent (variant graph), grain_size, figures.
+cleanup, calc_grains, kam, gb_map, reconstruct_parent (variant graph), grain_geometry and
+merge_colonies (grain size, phase 4), figures.
 """
 from __future__ import annotations
 
@@ -98,6 +99,18 @@ class GrainParams(BaseModel):
 # Burgers alpha/alpha misorientation types between variants of one beta grain (angles, deg);
 # computed in each backend from orientation.Burgers(csBeta, csAlpha) variants, these are labels only.
 BURGERS_TYPES = (10.53, 60.0, 60.83, 63.26, 90.0)
+
+
+class ColonyParams(BaseModel):
+    """Alpha colony / packet segmentation (user decision 2026-10-31, docs/decisions.md D14): neighbouring
+    alpha grains (laths) are merged when the misorientation of their MEAN orientations is within
+    burgers_tol_deg of the Burgers type-1 alpha/alpha misorientation (10.53 deg about <0001>), i.e. the
+    two laths share one {110}beta || (0001)alpha plane (same Ti packet). Merging is transitive (MTEX merge)."""
+    burgers_tol_deg: float = 3.0
+
+
+# per-grain geometry computed by MTEX in each backend (grain_geometry); same keys in both
+GEOMETRY_KEYS = ("id", "perimeter_um", "caliper_long_um", "caliper_short_um", "caliper_long_angle_deg")
 
 
 class MapParams(BaseModel):
@@ -243,6 +256,18 @@ class AnalysisBackend(Protocol):
 
     def render_chart(self, spec: "ChartSpec", out_png: Path) -> Path: ...
 
+    # grain size (phase 4)
+    def grain_geometry(self, gh: GrainsHandle) -> dict[str, np.ndarray]:
+        """Per grain (MTEX): id, perimeter_um (outer loop), caliper_long_um / caliper_short_um (longest /
+        shortest projection width of the outline), caliper_long_angle_deg (direction of the longest
+        caliper, from map +x toward +y, 0..180)."""
+        ...
+
+    def merge_colonies(self, gh: GrainsHandle, params: ColonyParams) -> GrainsHandle:
+        """Alpha colonies: grains of `gh` merged by ColonyParams; get_grains / grain_geometry work on the
+        result (pixel ids in file order, edge flags, mean orientations)."""
+        ...
+
 
 # per-pixel reconstruction state (prop 'recon_state' of the parent map, same codes in both backends)
 RECON_NOT_INDEXED, RECON_REMOVED, RECON_TRANSFORMED, RECON_UNTRANSFORMED, RECON_RETAINED_BETA = 0, 1, 2, 3, 4
@@ -290,6 +315,7 @@ class ChartSpec:
     log_y: bool = False
     vlines: list[tuple[float, str]] = field(default_factory=list)
     color: tuple[float, float, float] = (0.3, 0.45, 0.7)
+    curves: list[tuple[np.ndarray, np.ndarray, str]] = field(default_factory=list)   # (x, y, label): fits
     width_cm: float = 12.0
     dpi: int = 300
 

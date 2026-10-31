@@ -19,7 +19,7 @@ import numpy as np
 
 from .. import __version__
 from ..settings import REPO_ROOT, load_settings
-from .base import (BackendUnavailable, ChartSpec, CleanupParams, CleanupReport, EBSDData, EBSDHandle,
+from .base import (BackendUnavailable, ChartSpec, CleanupParams, ColonyParams, CleanupReport, EBSDData, EBSDHandle,
                    GrainParams, GrainsData, GrainsHandle, LoadParams, MapParams, ReconData, RenderSpec)
 
 MATLAB_DIR = REPO_ROOT / "matlab"
@@ -171,6 +171,17 @@ class MatlabBackend:
         p = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in mp.model_dump().items()}
         return self._h5("ti64.computeMap", gh.id, p)["values"].astype(float)
 
+    def grain_geometry(self, gh: GrainsHandle) -> dict[str, np.ndarray]:
+        d = self._h5("ti64.grainGeometry", gh.id)
+        out = {k: np.atleast_1d(np.asarray(v, float)).ravel() for k, v in d.items()}
+        out["id"] = out["id"].astype(np.int64)
+        return out
+
+    def merge_colonies(self, gh: GrainsHandle, cp: ColonyParams) -> GrainsHandle:
+        cid, n, _ = self.call("ti64.mergeColonies", gh.id, {"burgers_tol_deg": float(cp.burgers_tol_deg)},
+                              nargout=3)
+        return GrainsHandle(self.name, str(cid), int(n))
+
     @staticmethod
     def _num(values) -> object:
         """Python list -> MATLAB numeric row (a plain list would arrive as a cell array)."""
@@ -262,6 +273,10 @@ class MatlabBackend:
              "log_y": bool(spec.log_y), "vline_x": self._num([x for x, _ in spec.vlines]),
              "vline_labels": [lab for _, lab in spec.vlines], "color": self._num(spec.color),
              "width_cm": float(spec.width_cm), "dpi": float(spec.dpi)}
+        if spec.curves:
+            o["curve_x"] = self._num(np.concatenate([np.r_[np.asarray(x, float), np.nan] for x, _, _ in spec.curves])[:-1])
+            o["curve_y"] = self._num(np.concatenate([np.r_[np.asarray(y, float), np.nan] for _, y, _ in spec.curves])[:-1])
+            o["curve_labels"] = [lab for _, _, lab in spec.curves]
         self.call("ti64.renderChart", self._num(spec.centers), self._num(spec.heights), o, str(out_png), nargout=0)
         return out_png
 

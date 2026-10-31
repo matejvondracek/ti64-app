@@ -38,6 +38,7 @@ def _nav() -> None:
         ui.link("Sample sheet", "/sample").classes("text-white")
         ui.link("Maps", "/maps").classes("text-white")
         ui.link("Reconstruction", "/recon").classes("text-white")
+        ui.link("Grain size", "/grainsize").classes("text-white")
         ui.link("Settings", "/settings").classes("text-white")
         p = current_project()
         ui.label(f"project: {p.name} ({p.info().backend})" if p else "no project open").classes("ml-auto")
@@ -532,10 +533,138 @@ def recon_page() -> None:
             ui.button("Run sweep", on_click=sweep).mark("run_sweep")
 
 
+# ---- Grain size page -------------------------------------------------------------------------------
+GS_FIG_KINDS = ["alpha_ecd", "alpha_ecd_area", "lath_thickness", "lath_minor_axis", "colony_ecd", "colony_ecd_area",
+                "beta_ecd", "beta_width", "beta_length", "colony_map"]
+
+
+def _fmt(v, nd=2) -> str:
+    return "–" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
+
+
+def _grainsize_summary(p: Project, step) -> None:
+    """Summary table of a grainsize.run step + links to the CSV / XLSX tables."""
+    import json  # noqa: PLC0415
+
+    s = json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8"))
+
+    def st(d, aw=True):
+        if not d:
+            return "–"
+        t = f"mean {_fmt(d['mean'])}, median {_fmt(d['median'])} µm (n = {d['n']})"
+        if aw and d.get("area_weighted"):
+            t += f"; area-weighted {_fmt(d['area_weighted']['mean'])} µm"
+        ln = d.get("lognormal") or {}
+        if ln.get("sigma"):
+            t += f"; log-normal median {_fmt(ln['median'])}, σ {_fmt(ln['sigma'])}"
+        return t
+    a, c, b, rb = s["alpha"], s["colony"], s.get("prior_beta"), s["retained_beta"]
+    rows = [("backend / rules", f"{s['backend']}; {s['rules']}"),
+            ("lath partition", f"grains.calc {s['grains']}: HAGB {s['lath_partition']['hagb_deg']:g}°"),
+            ("alpha grain ECD", st(a["ecd"])),
+            ("lath thickness, intercept ⊥ long axis", st(a["thickness_intercept"], False)),
+            ("lath thickness, minor axis 2b", st(a["thickness_minor_axis"], False)),
+            ("colony ECD", st(c["ecd"]) + f" ({c['n_alpha_grains_merged']} alpha grains merged)")]
+    if b:
+        rows.append(("prior-β ECD", st(b["ecd"])))
+        for k, lab in (("across_bd", "prior-β width (across BD)"), ("along_bd", "prior-β length (along BD)")):
+            if k in b:
+                rows.append((lab, f"E112 mean intercept {_fmt(b[k]['mean_e112_um'], 1)} µm "
+                                  f"({b[k]['n_complete']} complete + {b[k]['n_truncated']} edge chords)"))
+    rows.append(("retained β (indexed fraction)", f"loaded {100 * rb['loaded']['fraction']:.3f} %, "
+                                                  f"analysed map {100 * rb['source_map']['fraction']:.3f} %"))
+    rows += [("warning", w) for w in s["warnings"]]
+    ui.table(columns=[{"name": "k", "label": "", "field": "k", "align": "left"},
+                      {"name": "v", "label": "", "field": "v", "align": "left"}],
+             rows=[{"k": k, "v": v} for k, v in rows]).props("dense flat").classes("w-full").mark("gs_summary")
+    for k, r in step.outputs.items():
+        if r.kind in ("csv", "xlsx"):
+            ui.label(f"{k}: {p.root / r.path}").classes("text-xs")
+
+
+def grainsize_page() -> None:
+    _nav()
+    p = current_project()
+    with ui.column().classes("p-4 gap-3 w-full max-w-6xl"):
+        if p is None:
+            ui.label("Open a project first.")
+            return
+        sheets = {s.map_id: s for s in p.samples()}
+        if not sheets:
+            ui.label("Enter a sample sheet and load a map first.")
+            return
+        mid = ui.select(list(sheets), value=next(iter(sheets)), label="Map").classes("w-64").mark("gs_map")
+        res = ui.column().classes("w-full")
+        out = ui.column().classes("w-full")
+
+        async def do(op: str, params: dict, label: str, backend: str | None = None):
+            n = ui.notification(f"{label} ...", spinner=True, timeout=None)
+            try:
+                step = await ng_run.io_bound(service.run, p, op, {"map_id": mid.value, **params}, backend)
+                ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
+                return step
+            except Exception as e:  # noqa: BLE001
+                _error(e)
+            finally:
+                n.dismiss()
+
+        with ui.expansion("1 Alpha grains (laths) and colonies", value=True).classes("w-full"):
+            ui.label("Laths = grains of a grains.calc step (threshold below; 15° keeps 10.53° packet pairs in one "
+                     "grain, then colonies = alpha grains). Prior β uses the newest reconstruction of the map.").classes("text-sm")
+            with ui.row().classes("items-end"):
+                hagb = ui.number("lath boundary [°]", value=15.0).classes("w-36").mark("gs_hagb")
+                minpx = ui.number("min. pixels", value=5).classes("w-28")
+                edge = ui.checkbox("exclude edge grains", value=True)
+                asp = ui.number("lath aspect ≥", value=2.0).classes("w-28")
+                tol = ui.number("colony tol. [°]", value=3.0).classes("w-28")
+                bsp = ui.number("β line spacing [µm]", value=1.0).classes("w-36")
+
+            async def run_gs():
+                g = await do("grains.calc", {"grains": {"hagb_deg": hagb.value}}, "grains")
+                if not g:
+                    return
+                step = await do("grainsize.run", {"min_px": int(minpx.value), "exclude_edge": edge.value,
+                                                  "lath_min_aspect": asp.value, "colony": {"burgers_tol_deg": tol.value},
+                                                  "beta_line_spacing_um": bsp.value}, "grain size")
+                if step:
+                    res.clear()
+                    with res:
+                        _grainsize_summary(p, step)
+            ui.button("Run grain size", on_click=run_gs).mark("run_gs")
+        with ui.expansion("2 Figures", value=True).classes("w-full"):
+            fk = ui.select(GS_FIG_KINDS, value="alpha_ecd", label="figure").classes("w-48").mark("gs_fig")
+
+            async def draw():
+                s = service.latest_step(p, ("grainsize.run",), map_id=mid.value)
+                step = await do("grainsize.figure", {"kind": fk.value}, f"figure {fk.value}",
+                                s.backend if s else None)
+                if step:
+                    out.clear()
+                    with out:
+                        ui.image(str(p.root / step.outputs["figure"].path)).classes("w-full max-w-4xl")
+            ui.button("Draw", on_click=draw).mark("run_gs_fig")
+        with ui.expansion("3 Validate against OIM").classes("w-full"):
+            ui.label("OIM Analysis grain file export (text, '# Column k: …' header); use the same grain tolerance "
+                     "and minimum size in OIM as above.").classes("text-sm")
+            with ui.row().classes("items-end"):
+                oim = ui.input("OIM grain file").classes("w-96").mark("gs_oim")
+
+                async def compare():
+                    s = service.latest_step(p, ("grainsize.run",), map_id=mid.value)
+                    step = await do("grainsize.compare_oim", {"file": oim.value}, "OIM comparison",
+                                    s.backend if s else None)
+                    if step:
+                        out.clear()
+                        with out:
+                            ui.image(str(p.root / step.outputs["comparison"].path)).classes("w-full max-w-3xl")
+                ui.button("Compare", on_click=compare)
+
+
 def build() -> None:
     ui.page("/")(project_page)
     ui.page("/maps")(maps_page)
     ui.page("/recon")(recon_page)
+    ui.page("/grainsize")(grainsize_page)
     ui.page("/sample")(sample_page)
     ui.page("/settings")(settings_page)
 

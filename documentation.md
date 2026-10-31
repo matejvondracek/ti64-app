@@ -1,6 +1,6 @@
 # Ti64 EBSD/BSE analysis app – documentation
 
-State after phase 3 (2026-10-31). Details of decisions: `docs/decisions.md`; data facts:
+State after phase 4 (2026-10-31). Details of decisions: `docs/decisions.md`; data facts:
 `docs/data_audit.md`; timings and RAM: `docs/performance.md`; reconstruction method (phase 3):
 `docs/beta_reconstruction_method.md`.
 
@@ -26,7 +26,7 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 | CLI | `ti64 backends`, `ti64 replay <project>` |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
 | Test crops | `python scripts/make_crops.py` (300×300 and 1000×1000 points, into `data/test/crops/`) |
-| Full-map check | `python scripts/run_phase2_full.py JU02 pymtex --angle 270`; reconstruction: `python scripts/run_phase3_full.py JU02 pymtex --angle 270 [--or-mode burgers] [--sweep]` |
+| Full-map check | `python scripts/run_phase2_full.py JU02 pymtex --angle 270`; reconstruction: `python scripts/run_phase3_full.py JU02 pymtex --angle 270 [--or-mode burgers] [--sweep]`; grain size: `python scripts/run_phase4_full.py JU02 pymtex --angle 270 [--hagb 5]` |
 
 Machine paths (MTEX folder, MATLAB, literature) go in `settings.local.toml` (git-ignored, template
 `settings.example.toml`) or `%APPDATA%\ti64app\settings.toml`.
@@ -77,8 +77,25 @@ Machine paths (MTEX folder, MATLAB, literature) go in `settings.local.toml` (git
 | Tests | `tests/unit/test_recon_analysis.py` (synthetic Burgers variants, calipers), `test_ops_recon.py` (JU02 crop1000: run, figures, sweep, MCP, replay), `tests/conformance/test_phase3.py` (both backends, 3 crop1000s, same OR), `test_phase3_full.py` (full JU02 vs reference), `matlab/tests/ReconTest.m` |
 | Comparison script | `scripts/compare_recon.py` (full map, both backends, three OR modes), results in decisions D12 |
 
+### Phase 4 – grain size (ISO 13067 / ASTM E2627 rules)
+| Feature | Implementation |
+| --- | --- |
+| Rules: minimum pixels per grain (default 5), edge grains excluded, method reported with every number; QA warnings (pixels per grain, number of grains) | `GrainSizeParams` in `ops_grainsize.py`; decisions D14 |
+| Alpha grain ECD, number- and area-weighted (lath partition = a `grains.calc` step, threshold configurable, default 15°) | op `grainsize.run`; MTEX area from each backend |
+| Per-grain MTEX geometry: perimeter, longest / shortest caliper, caliper direction | backend method `grain_geometry` (pymtex `PymtexAnalysis.grain_geometry`; MATLAB `+ti64/grainGeometry.m`) |
+| Lath thickness: minor axis of the second-moment ellipse; median linear intercept perpendicular to each lath's long axis | `modules/grain_size.py` (`moment_ellipse`, `GridIndex`, `chords`, `lath_intercepts`), Python-only, same for both backends |
+| Colony / packet size: alpha grains merged across Burgers 10.53° boundaries (mean orientations, tolerance 3°) | `ColonyParams`; backend method `merge_colonies` (pymtex `grain2d.merge`; MATLAB `+ti64/mergeColonies.m`) |
+| Prior-β ECD, width / length relative to the build direction: E112 mean intercepts across / along BD (edge chords counted half), chord distributions (line-length-weighted), per-grain calipers | `directional_intercepts`; `recon_analysis.grain_shape`; needs a `recon.run` step |
+| Retained-β fraction (loaded map, analysed map, reconstruction) | `grainsize.run` summary |
+| Statistics: mean, SD, median, p10/p90, number- and area-weighted log-normal fits (MLE, KS) | `dist_stats`, `lognormal_pdf`, `hist_edges` |
+| Tables per map: summary, alpha grains, colonies, prior β (CSV) + one XLSX workbook | output kinds `csv` / `xlsx` in `service.py` (XLSX hashed by cell values, replay compares tables numerically) |
+| Figures (drawn by the backend that computed the step): histograms with log-normal fits (alpha ECD number / area, lath thickness intercept / minor axis, colony ECD number / area, prior-β ECD, width, length), colony map | op `grainsize.figure`; `ChartSpec.curves` drawn by matplotlib and `+ti64/renderChart.m` |
+| Validation against OIM grain size (OIM grain file export, same rules, KS test, overlay histogram) | `read_oim_grain_file`, op `grainsize.compare_oim` (format not yet verified on a real export) |
+| GUI / MCP | `gui/app.py` Grain size page (`/grainsize`); MCP tools `grain_size`, `grain_size_figure`, `compare_oim_grain_size` |
+| Tests | `tests/unit/test_grain_size.py` (synthetic rectangles / ellipses on square + hex grids, E112, log-normal), `test_ops_grainsize.py` (crop300 + crop1000 with reconstruction, tables, figures, OIM, MCP, replay), `test_gui_pages.py`, `tests/conformance/test_phase4.py` (3 crop300s + JU02 crop1000), `matlab/tests/GrainSizeTest.m` |
+
 ### Stubs (later phases)
-`modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`; grain-size statistics (phase 4).
+`modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
 ## TODO / open points
 
@@ -98,6 +115,14 @@ Phase 3 open points:
       a first choice: confirm, or use e.g. the grain's principal axes / MTEX `caliper` (D13).
 - [ ] Variant-selection statistics against the build direction (e.g. α c-axis angle to BD per variant) if needed.
 
+Phase 4 open points:
+- [ ] **OIM grain file export** of a test map (Analysis → Export → Grain File, with the grain tolerance and minimum
+      size used) to validate the alpha ECD (`grainsize.compare_oim`) and to verify the parser (D14).
+- [ ] Lath partition default: 15° makes colonies = alpha grains; 5° separates the 10.53° packet pairs (D14).
+- [ ] ISO 13067 / ASTM E2627 texts (not in the literature folder) to confirm min_px and the QA thresholds.
+- [ ] Prior-β boundaries are ragged at lath scale, so E112 intercepts (~22 µm on JU02) are far below the per-grain
+      calipers; consider boundary smoothing of the parent grains before intercepts (D14).
+
 Decisions to make:
 - [ ] Keep retained beta in the noise cleanup? The EBSD_part2 rule removes ~1/3 of indexed beta (D10).
 - [ ] PRIAS: re-export .ang with PRIAS columns, or virtual BSE from the .up2 later.
@@ -107,4 +132,4 @@ Technical:
 - [ ] Cache loaded + cleaned maps per backend (CLAUDE.md; objects are currently rebuilt from the recipe).
 - [ ] "Compare backends" tool (one step on both backends, numbers and figures side by side).
 - [ ] MATLAB halfQuadraticFilter (`l1TVFilter`) is slow (~40× pymtex).
-- [ ] Phases 4–10 (grain size, GUI/export, MCP/CLI, 4PB, crack, .up2 re-indexing, packaging).
+- [ ] Phases 5–10 (GUI/export, MCP/CLI, 4PB, crack, .up2 re-indexing, packaging).

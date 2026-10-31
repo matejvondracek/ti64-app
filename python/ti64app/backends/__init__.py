@@ -1,6 +1,10 @@
 """Backend registry. Use get_backend(name); never import a backend from Python-only modules."""
 from __future__ import annotations
 
+# Bind Python's own expat DLL before the MATLAB Engine package is touched: importing `matlab` puts MATLAB's
+# folders on the DLL search path, after which pyexpat (openpyxl -> XLSX tables) fails with "DLL load failed".
+import xml.parsers.expat  # noqa: F401, E402
+
 from .base import AnalysisBackend, BackendFeatureUnavailable, BackendUnavailable  # noqa: F401
 from .matlab_backend import MatlabBackend
 from .pymtex_backend import PymtexBackend

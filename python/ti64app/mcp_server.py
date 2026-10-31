@@ -305,6 +305,53 @@ def recon_sweep(project: str, map_id: str, grid: dict[str, list[Any]], base: dic
 
 
 @server.tool()
+def grain_size(project: str, map_id: str, params: dict[str, Any] | None = None,
+               backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Grain size per ISO 13067 / ASTM E2627 rules on the newest grains.calc partition (lath threshold = its
+    hagb_deg, default 15°) and, if present, the newest reconstruction. params (GrainSizeParams): min_px 5,
+    exclude_edge true, lath_min_aspect 2, lath_angle_bin_deg 5, colony {burgers_tol_deg 3}, beta_line_spacing_um 1,
+    beta_min_ecd_um (default recon histMinECD), use_recon true. Returns alpha ECD (number/area-weighted), lath
+    thickness (intercept + minor axis), colony ECD, prior-beta ECD, width/length vs build direction (E112 mean
+    intercepts + calipers), retained-beta fraction, log-normal fits, warnings, and the CSV/XLSX table paths."""
+    p = _project(project)
+    step = service.run(p, "grainsize.run", {"map_id": map_id, **(params or {})}, backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "summary": json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8")),
+            "tables": {k: str(p.root / r.path) for k, r in step.outputs.items() if r.kind in ("csv", "xlsx")}}
+
+
+@server.tool()
+def grain_size_figure(project: str, map_id: str,
+                      kind: Literal["alpha_ecd", "alpha_ecd_area", "lath_thickness", "lath_minor_axis", "colony_ecd",
+                                    "colony_ecd_area", "beta_ecd", "beta_width", "beta_length", "colony_map"],
+                      grainsize: str | None = None) -> dict[str, Any]:
+    """Histogram with log-normal fit (or the colony map) of the newest (or given) grain-size step, drawn by the
+    backend that computed it. Returns the PNG path."""
+    p = _project(project)
+    s = p.recipe().step(grainsize) if grainsize else service.latest_step(p, ("grainsize.run",), map_id=map_id)
+    params = {"map_id": map_id, "kind": kind, "grainsize": grainsize}
+    step = service.run(p, "grainsize.figure", {k: v for k, v in params.items() if v is not None},
+                       backend=s.backend if s else None)
+    return {**_step_summary(step), "png": str(p.root / step.outputs["figure"].path)}
+
+
+@server.tool()
+def compare_oim_grain_size(project: str, map_id: str, file: str, phase: int | None = None) -> dict[str, Any]:
+    """Validate the alpha grain ECD of the newest grain-size step against an OIM Analysis grain file export
+    (same min-pixel / edge rules applied to the OIM grains; means, log-normal fits, two-sample KS, histogram)."""
+    p = _project(project)
+    s = service.latest_step(p, ("grainsize.run",), map_id=map_id)
+    params = {"map_id": map_id, "file": file, "phase": phase}
+    step = service.run(p, "grainsize.compare_oim", {k: v for k, v in params.items() if v is not None},
+                       backend=s.backend if s else None)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "png": str(p.root / step.outputs["comparison"].path),
+            "result": json.loads((p.root / step.outputs["result"].path).read_text(encoding="utf-8"))}
+
+
+@server.tool()
 def replay_project(project: str, backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
     """Re-run the project's recipe in a scratch copy and compare all outputs with the recorded ones."""
     rep = service.replay(_project(project), backend=backend)

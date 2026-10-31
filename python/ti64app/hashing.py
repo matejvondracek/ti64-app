@@ -42,6 +42,24 @@ def png_hash(path: Path) -> str:
     return array_hash({"rgba": a})
 
 
+def bytes_hash(path: Path) -> str:
+    """Hash of a file's bytes (CSV tables: written deterministically)."""
+    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def xlsx_hash(path: Path) -> str:
+    """Hash of the CELL VALUES of every sheet (sheet names in order), independent of the timestamps an
+    .xlsx container carries."""
+    from openpyxl import load_workbook  # noqa: PLC0415
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        content = [[ws.title, [list(r) for r in ws.iter_rows(values_only=True)]] for ws in wb.worksheets]
+    finally:
+        wb.close()
+    return json_hash(content)
+
+
 def file_fingerprint(path: Path) -> str:
     """Cheap fingerprint of an input file: size + first and last 4 MB (full hash below 8 MB).
     Enough to notice a replaced or edited file without reading 43 GB .up2 files."""

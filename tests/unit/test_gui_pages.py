@@ -98,3 +98,24 @@ async def test_recon_page_runs_reconstruction_and_figure(crop300_ju02):
         user.find("run_recon_fig").click()
         await user.should_see("figure parent_ipf done", retries=200)
     assert [s.op for s in p.recipe().steps][-2:] == ["recon.run", "recon.figure"]
+
+
+@pytest.mark.anyio
+async def test_grainsize_page_runs(crop300_ju02):
+    from ti64app import service
+    from tests.conftest import sample_params
+
+    p = Project.open_or_create("gui_gs")
+    service.run(p, "sample.set", sample_params(crop300_ju02))
+    service.run(p, "ebsd.load", {"map_id": "JU02_c300"})
+    async with user_simulation(main_file=MAIN) as user:
+        import sys
+        sys.modules["ti64app.gui.app"].STATE["project"] = "gui_gs"
+        await user.open("/grainsize")
+        await user.should_see("1 Alpha grains (laths) and colonies")
+        user.find("run_gs").click()
+        await user.should_see("grain size done", retries=400)
+        await user.should_see(marker="gs_summary")
+        user.find("run_gs_fig").click()
+        await user.should_see("figure alpha_ecd done", retries=200)
+    assert [s.op for s in p.recipe().steps][-3:] == ["grains.calc", "grainsize.run", "grainsize.figure"]

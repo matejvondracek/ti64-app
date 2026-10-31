@@ -4,8 +4,8 @@
     report = replay(project)                   # re-runs all steps in a scratch project, compares outputs
 
 Operations: sample.set, ebsd.load, up2.header, bse.load (here) and the EBSD operations in
-ops_ebsd.py (cleanup, grains, maps, figures) and ops_recon.py
-(prior-beta reconstruction, its figures, parameter sweep). Backend-dependent ops use the project's backend
+ops_ebsd.py (cleanup, grains, maps, figures), ops_recon.py
+(prior-beta reconstruction, its figures, parameter sweep) and ops_grainsize.py (grain size, phase 4). Backend-dependent ops use the project's backend
 (Settings) unless `backend=` overrides it.
 
 Objects (maps, grains) stay inside the backend; SESSION remembers which backend object belongs to
@@ -29,7 +29,7 @@ from pydantic import BaseModel
 from . import __version__
 from .backends import get_backend
 from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, LoadParams
-from .hashing import array_hash, file_fingerprint, json_hash, npz_hash, png_hash
+from .hashing import array_hash, bytes_hash, file_fingerprint, json_hash, npz_hash, png_hash, xlsx_hash
 from .io import bse as bse_io
 from .io import up2 as up2_io
 from .project import Project, write_json
@@ -173,6 +173,14 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any) -> OutputRef
         path = ctx.out_dir / f"{name}.json"
         write_json(path, value)
         h = json_hash(json.loads(path.read_text(encoding="utf-8")))
+    elif kind == "csv":                       # value = table {column: 1-D array}
+        path = ctx.out_dir / f"{name}.csv"
+        write_csv(path, value)
+        h = bytes_hash(path)
+    elif kind == "xlsx":                      # value = {sheet name: table {column: 1-D array}}
+        path = ctx.out_dir / f"{name}.xlsx"
+        write_xlsx(path, value)
+        h = xlsx_hash(path)
     elif kind == "png":                       # value = path of a PNG written by the backend renderer
         path = ctx.out_dir / f"{name}.png"
         if Path(value) != path:
@@ -181,6 +189,24 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any) -> OutputRef
     else:
         raise ValueError(kind)
     return OutputRef(path=str(path.relative_to(ctx.project.root).as_posix()), kind=kind, content_hash=h)
+
+
+def _frame(table: dict):
+    import pandas as pd  # noqa: PLC0415
+
+    return pd.DataFrame({k: np.asarray(v) for k, v in table.items()})
+
+
+def write_csv(path: Path, table: dict) -> None:
+    _frame(table).to_csv(path, index=False, lineterminator="\n")
+
+
+def write_xlsx(path: Path, sheets: dict[str, dict]) -> None:
+    import pandas as pd  # noqa: PLC0415
+
+    with pd.ExcelWriter(path, engine="openpyxl") as xw:
+        for name, table in sheets.items():
+            _frame(table).to_excel(xw, sheet_name=name[:31], index=False)
 
 
 def _memory_GB() -> dict[str, float]:
@@ -281,6 +307,28 @@ def _compare_npz(a: Path, b: Path) -> tuple[bool, str]:
         return True, "; ".join(worst)
 
 
+def _compare_tables(a: Path, b: Path) -> tuple[bool, str]:
+    """CSV / XLSX tables: same sheets, columns and shapes; numbers within the npz float tolerance."""
+    import pandas as pd  # noqa: PLC0415
+
+    read = (lambda f: {"": pd.read_csv(f)}) if a.suffix == ".csv" else (lambda f: pd.read_excel(f, sheet_name=None))
+    ta, tb = read(a), read(b)
+    if list(ta) != list(tb):
+        return False, f"sheets {list(ta)} vs {list(tb)}"
+    for sh in ta:
+        x, y = ta[sh], tb[sh]
+        if list(x.columns) != list(y.columns) or x.shape != y.shape:
+            return False, f"{sh}: columns/shape differ"
+        for c in x.columns:
+            u, v = x[c].to_numpy(), y[c].to_numpy()
+            if np.issubdtype(u.dtype, np.number) and np.issubdtype(v.dtype, np.number):
+                if not np.allclose(u.astype(float), v.astype(float), rtol=1e-6, atol=1e-5, equal_nan=True):
+                    return False, f"{sh}/{c}: max |diff| {np.nanmax(np.abs(u.astype(float) - v.astype(float))):.3g}"
+            elif not (pd.Series(u).fillna("").astype(str).to_numpy() == pd.Series(v).fillna("").astype(str).to_numpy()).all():
+                return False, f"{sh}/{c}: values differ"
+    return True, ""
+
+
 def replay(project: Project, backend: str | None = None, into: Path | None = None,
            include_stale: bool = False) -> ReplayReport:
     """Re-run the recipe in a scratch project and compare every output with the recorded one.
@@ -310,8 +358,9 @@ def replay(project: Project, backend: str | None = None, into: Path | None = Non
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="missing"))
             elif nref.content_hash == ref.content_hash:
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="identical"))
-            elif ref.kind == "npz":
-                ok, detail = _compare_npz(project.root / ref.path, scratch.root / nref.path)
+            elif ref.kind in ("npz", "csv", "xlsx"):
+                cmp = _compare_npz if ref.kind == "npz" else _compare_tables
+                ok, detail = cmp(project.root / ref.path, scratch.root / nref.path)
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name,
                                           status="within_tolerance" if ok else "different", detail=detail))
             else:
@@ -364,6 +413,7 @@ def verify_outputs(project: Project) -> list[str]:
                 bad.append(f"{s.id}:{name} missing")
                 continue
             h = (npz_hash(p) if ref.kind == "npz" else png_hash(p) if ref.kind == "png"
+                 else bytes_hash(p) if ref.kind == "csv" else xlsx_hash(p) if ref.kind == "xlsx"
                  else json_hash(json.loads(p.read_text(encoding="utf-8"))))
             if h != ref.content_hash:
                 bad.append(f"{s.id}:{name} changed")
@@ -377,3 +427,4 @@ def ops_catalog() -> dict[str, dict]:
 
 from . import ops_ebsd  # noqa: E402,F401  (registers the EBSD operations)
 from . import ops_recon  # noqa: E402,F401  (registers the reconstruction operations)
+from . import ops_grainsize  # noqa: E402,F401  (registers the grain-size operations)

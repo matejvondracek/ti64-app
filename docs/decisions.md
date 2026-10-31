@@ -160,3 +160,57 @@
   orientation (EBSD_part2), boundaries > hagbAngle 10° between grain means.
 - pymtex smooths the alpha grains with smoothBoundary, MATLAB with smooth (old behaviour, as EBSD_part2);
   the results agree within the tolerances (conformance test_phase3.py).
+
+## D14 (2026-10-31) Grain size (phase 4): definitions, rules, engine differences
+- Split (user decision): each backend computes the MTEX parts - grain segmentation (grains.calc), perimeter and
+  longest / shortest caliper (`grain_geometry`), colony merge (`merge_colonies`); ONE Python module
+  (modules/grain_size.py) computes second-moment ellipses, line intercepts, statistics and tables on each
+  backend's partition. Conformance compares the end results (tests/conformance/test_phase4.py).
+- Alpha grains / laths (user decision): the lath partition is a grains.calc step, threshold configurable,
+  default 15 deg. Consequence: at 15 deg the two laths of one packet (10.53 deg about <0001>) are already one
+  grain, so the colony merge finds nothing and colonies = alpha grains (a warning says so). JU02 crop300:
+  15 deg -> 508 grains used, ECD 1.56 / 3.52 um (number / area-weighted); 5 deg -> 581 laths, 1.52 / 3.29 um,
+  merged to 524 colonies, 1.55 / 3.46 um. Use 5 deg for lath thickness and colony size if packets matter.
+- Colonies (user decision): neighbouring alpha grains merged (transitively) when their MEAN orientations are
+  within 3 deg of the Burgers type-1 alpha/alpha misorientation (10.53 deg about <0001>) = laths sharing one
+  {110}beta || (0001)alpha (Ti packet). No reconstruction needed. Identical partition in both engines.
+- Lath thickness: (1) minor axis 2b of the ellipse with the grain's second area moments (pixel centres + each
+  cell's own moment: square s^2/12, hexagon 5 s^2/72). For a w x L rectangle 2b = 2w/sqrt3 = 1.155 w, so the
+  minor axis overestimates the lath width; (2) linear intercept perpendicular to each lath's long axis: laths
+  (major/minor >= 2) grouped by long-axis angle in 5 deg bins, one family of test lines per bin, spacing = step,
+  sampling step/4; per lath the MEDIAN chord (the mean is lowered by short chords across the lath tips:
+  1.07 vs 1.2 um on a synthetic hex lath); chords cut by the map edge or by unassigned pixels are dropped.
+  Not stereologically corrected (2D section values).
+- Why not MTEX fitEllipse: MTEX 7.2 `principalComponents` weights the boundary vertices (Mulchrone &
+  Choudhury 2004, doi:10.1016/S0191-8141(03)00093-2) and scales the ellipse to the grain area; pymtex 1.0.0
+  returns the exact second-moment ellipse, unscaled. They differ by design, so the app uses its own pixel
+  moments in both.
+- Calipers (MTEX, each engine): perimeter and longest caliper equal to ~1e-6; the SHORTEST caliper differs by up
+  to 12 % on 2-4.5 % of (mostly < 60 px) grains (different minimum-width algorithms). The longest-caliper angle
+  differs on ties of equally long diagonals of small symmetric outlines. Ellipse and intercepts are equal except
+  for grains that took a different not-indexed pixel next to a void (D7; RI02 crop: 2 of 1767).
+- Prior beta (user decision): width = mean linear intercept across the in-plane BD, length = along BD, ASTM E112
+  convention: L = total chord length / (N_complete + 0.5 N_cut), chords cut by the map edge or ending at
+  unassigned pixels counted half; test lines 1 um apart. Chords are recorded only in prior-beta grains with
+  ECD >= histMinECD (5 um) and >= min_px; smaller fragments end chords like any boundary. Plus the per-grain
+  caliper along / across BD of D13 (interior grains). The reconstructed boundaries are ragged at lath scale, so
+  many short chords cross protrusions between two large grains (JU02 crop1000: 82 % of chords < 5 um lie
+  between two grains >= 5 um): the E112 mean (~22 um) is much smaller than the per-grain calipers (~80 um,
+  area-weighted). Chord histograms and fits are therefore LINE-LENGTH-weighted. Length along BD is a lower
+  bound when grains are longer than the map (warning).
+- Rules (ISO 13067 / ASTM E2627): grains < min_px (default 5, configurable) and grains touching the map edge
+  are excluded from per-grain statistics. ASSUMPTIONS to check against the standards (their texts are not in
+  C:\Claude\literature): min_px default 5; QA warnings below 100 px per grain on average and below 100 grains
+  (E2627 asks for a step small compared with the grain size). The 0.2 um step gives alpha grains of ~86-140 px
+  on average; lath thickness (~0.6 um = 3 steps) is at the resolution limit.
+- Statistics: number-weighted log-normal = MLE of ln d (KS test, p approximate because the parameters are fitted);
+  area-weighted = weighted MLE of ln d with weights = grain area (weighted KS distance). Histograms: bins from
+  0 to the 99.5th percentile, Freedman-Diaconis width, <= 40 bins.
+- Retained beta: indexed beta pixels / indexed pixels of the LOADED map and of the analysed (cleaned) map, plus
+  the reconstruction's retained-beta pixels. The noise cleanup removes much of it (D10): JU02 full map 0.047 %
+  loaded -> 0.031 % cleaned. EBSD at 0.2 um does not resolve beta ribs: a lower bound.
+- Validation against OIM: `grainsize.compare_oim` reads an OIM Analysis grain file ('# Column k: ...' header,
+  columns found by keywords), applies the same rules and compares means, log-normal fits and a two-sample KS
+  test. Tested on a synthetic file only; NOT verified against a real OIM export (none available yet).
+- MATLAB Engine + XLSX: importing the `matlab` package puts MATLAB's DLLs first on the search path, after which
+  Python's pyexpat (openpyxl) fails to load; backends/__init__.py imports xml.parsers.expat first.

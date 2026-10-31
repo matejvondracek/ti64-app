@@ -42,3 +42,21 @@ peak working set of the process so far). OIM-cleaned preset; grains at 15° / 2�
   both; boundary lengths per class within 0.3 % (α/β interface 287 vs 295 µm); KAM, GND per pixel
   identical (median rel. diff ≤ 2e-7). Differences come only from not-indexed pixels next to voids
   (decisions D7).
+
+## Phase 4 grain size on the full JU02 map
+
+`python scripts/run_phase4_full.py JU02 <backend> --angle 270 [--hagb 5]` (reconstruction with ideal Burgers,
+OIM-cleaned preset, laths at 15° unless --hagb).
+
+| Step | pymtex (s) | pymtex peak RAM (GB) | MATLAB (s) | MATLAB process RAM (GB) |
+| --- | --- | --- | --- | --- |
+| recon.run | 20.5 | 2.77 | 64.1 | 1.37 |
+| grains.calc | 4.1 | 3.54 | 18.8 | 1.80 |
+| grainsize.run (geometry, colonies, ellipses, ~36 lath-intercept passes, prior-beta intercepts, tables) | 31.2 | 3.54 | 37.6 | 1.81 (Python 1.22) |
+| grainsize.figure (histograms / colony map) | 0.2-0.6 / 7.9 | 3.73 | 1-3 | 2.50 |
+
+- Results: alpha grains used 16 326 / 16 322, ECD 1.758 / 1.758 um (area-weighted 9.228 / 9.230), lath thickness
+  intercept mean 0.640 / 0.640 um (median 0.55), minor axis mean 1.202 / 1.203 um; prior beta (>= 5 um) 27 / 26
+  grains, E112 width 21.90 / 21.91 um, length 20.83 / 20.84 um, calipers across / along BD 81.2 / 81.5 and
+  95.8 / 96.1 um (area-weighted); retained beta 0.047 % loaded, 0.031 % after cleanup (pymtex / MATLAB).
+- Laths at 5° (pymtex): 19 170 alpha grains used (ECD 1.70 um), 2 483 merged into 16 935 colonies (1.77 um).

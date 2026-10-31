@@ -120,6 +120,11 @@ def render_chart(spec, out_png: Path) -> Path:
     ax.bar(np.asarray(spec.centers, float), h, width=spec.bar_width, color=spec.color, edgecolor="none")
     if spec.log_y:
         ax.set_yscale("log")
+    cols = [(0.85, 0.33, 0.10), (0.10, 0.10, 0.10), (0.47, 0.67, 0.19)]     # same order as renderChart.m
+    for k, (cx, cy, lab) in enumerate(spec.curves):
+        ax.plot(np.asarray(cx, float), np.asarray(cy, float), "-", color=cols[k % 3], lw=1.5, label=lab)
+    if spec.curves:
+        ax.legend(fontsize=8, frameon=False)
     for x, lab in spec.vlines:
         ax.axvline(x, color="r", ls="--", lw=1.5)
         ax.text(x, 1.0, " " + lab, color="r", fontsize=8, va="top", ha="left",

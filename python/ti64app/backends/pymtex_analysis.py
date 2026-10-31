@@ -8,7 +8,8 @@ import uuid
 
 import numpy as np
 
-from .base import PHASE_NOT_INDEXED, GrainParams, GrainsData, GrainsHandle, MapParams, file_order
+from .base import (PHASE_NOT_INDEXED, ColonyParams, GrainParams, GrainsData, GrainsHandle, MapParams,
+                   file_order)
 
 
 def _arr(v):
@@ -155,6 +156,63 @@ class PymtexAnalysis:
                 "phase2": np.maximum(pid[:, 1], 0).astype(np.int16),
                 "grain1": gid[:, 0], "grain2": gid[:, 1], "mis_deg": mis,
                 "burgers_type": btype, "burgers_dist_deg": bdist, "inner": np.full(n, inner)}
+
+    # -- grain size (phase 4) -----------------------------------------------------------------
+    def grain_geometry(self, gh: GrainsHandle) -> dict[str, np.ndarray]:
+        """MTEX per-grain geometry (base.GEOMETRY_KEYS): perimeter of the outer loop, longest / shortest
+        caliper and the direction of the longest one (deg from +x toward +y, 0..180)."""
+        g = self._grains(gh)["grains"]
+        cl = g.caliper("longest")
+        cs = g.caliper("shortest")
+        ang = np.degrees(np.arctan2(_arr(cl.y).ravel(), _arr(cl.x).ravel())) % 180.0
+        return {"id": _arr(g.id).ravel().astype(np.int64),
+                "perimeter_um": _arr(g.perimeter).ravel().astype(float),
+                "caliper_long_um": _arr(cl.norm()).ravel().astype(float),
+                "caliper_short_um": _arr(cs.norm()).ravel().astype(float),
+                "caliper_long_angle_deg": ang.astype(float)}
+
+    def merge_colonies(self, gh: GrainsHandle, cp: ColonyParams) -> GrainsHandle:
+        """Alpha colonies (base.ColonyParams, decisions D14): neighbouring alpha grains whose mean
+        orientations are within burgers_tol_deg of the Burgers type-1 misorientation (10.53 deg about
+        <0001>) are merged (transitively, grain2d.merge by pairs of ids)."""
+        from mtex import degree  # noqa: PLC0415
+
+        st = self._grains(gh)
+        g, e = st["grains"], st["ebsd"]
+        csA = next((cs for pid, cs in enumerate(e.CSList) if pid and "alpha" in str(cs.mineral)), None)
+        csB = next((cs for pid, cs in enumerate(e.CSList) if pid and "beta" in str(cs.mineral)), None)
+        ids = _arr(g.id).ravel().astype(np.int64)
+        pairs = np.zeros((0, 2), np.int64)
+        if csA is not None and csB is not None:
+            pidA = e.CSList.phaseId(csA.mineral)
+            gid = _arr(g.boundary.grainId).astype(np.int64).reshape(-1, 2)
+            pid = _arr(g.boundary.phaseId).astype(np.int64).reshape(-1, 2)
+            m = (pid == pidA).all(axis=1) & (gid > 0).all(axis=1) & (gid[:, 0] != gid[:, 1])
+            cand = np.unique(np.sort(gid[m], axis=1), axis=0)
+            if cand.size:
+                t1 = burgers_types(csB, csA)[0][0]                 # 10.53 deg about <0001>
+                ga = g[csA.mineral]
+                aid = _arr(ga.id).ravel().astype(np.int64)
+                lut = np.full(int(ids.max()) + 1, -1, np.int64)
+                lut[aid] = np.arange(aid.size)
+                mo = ga.meanOrientation
+                o1, o2 = mo[lut[cand[:, 0]]], mo[lut[cand[:, 1]]]
+                d = _arr((o1.inv() * o2).angle(t1)).ravel() / degree
+                pairs = cand[d <= cp.burgers_tol_deg]
+        merged = g.merge(pairs=pairs) if len(pairs) else g
+        parent = np.zeros(int(ids.max(initial=0)) + 1, np.int64)
+        if merged is g:
+            parent[ids] = ids
+        else:
+            for new, kids in zip(_arr(merged.id).ravel(), merged.prop["childId"]):
+                parent[np.asarray(kids, np.int64)] = int(new)
+        e2 = e.copy()
+        old = _arr(e.prop["grainId"]).astype(np.int64)
+        e2.prop["grainId"] = np.where(old > 0, parent[np.clip(old, 0, None)], old)
+        hid = uuid.uuid4().hex[:12]
+        self._store[hid] = {"grains": merged, "ebsd": e2, "params": cp, "source": gh.id,
+                            "n_pairs": int(len(pairs))}
+        return GrainsHandle(self.name, hid, int(len(_arr(merged.id))))
 
     # -- per-pixel maps -----------------------------------------------------------------------
     def compute_map(self, gh: GrainsHandle, mp: MapParams) -> np.ndarray:
