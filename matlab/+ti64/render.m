@@ -3,7 +3,7 @@ function render(id, h5in, outPng, o)
 %   backend: hex-raster image (ti64.hexRaster), boundary overlay segments, colour bar, legend,
 %   scale bar, exported with exportgraphics. Map convention: east = +x, y down (setting 2).
 %   h5in: /rgb (n x 3, file order, NaN = white) or /values (n, file order); optional /seg (m x 4:
-%   x1 y1 x2 y2) and /seg_rgb (m x 3). o: struct cmap, clim, colorbar_label, seg_width, title,
+%   x1 y1 x2 y2), /seg_rgb (m x 3) and optional /seg_w (m, line widths). o: struct cmap, clim, colorbar_label, seg_width, title,
 %   width_cm, dpi, scale_bar, legend_labels (cell), legend_rgb (k x 3).
 
 S = ti64.store('get', id);
@@ -44,18 +44,21 @@ axis(ax, 'image'); set(ax, 'YDir', 'reverse');              % y down, as the map
 hold(ax, 'on');
 if ismember('seg', names)
   sg = h5read(h5in, '/seg')'; sc = h5read(h5in, '/seg_rgb')';
-  [u, ~, grp] = unique(sc, 'rows');
+  if ismember('seg_w', names), sw = h5read(h5in, '/seg_w'); sw = sw(:); else, sw = o.seg_width * ones(size(sg, 1), 1); end
+  [u, ~, grp] = unique([sc sw], 'rows', 'stable');     % keep the drawing order (first = bottom)
   for k = 1:size(u, 1)
     s = sg(grp == k, :);
     X = [s(:, 1) s(:, 3) nan(size(s, 1), 1)]'; Y = [s(:, 2) s(:, 4) nan(size(s, 1), 1)]';
-    plot(ax, X(:), Y(:), '-', 'Color', u(k, :), 'LineWidth', o.seg_width);
+    plot(ax, X(:), Y(:), '-', 'Color', u(k, 1:3), 'LineWidth', u(k, 4));
   end
 end
 if isfield(o, 'legend_labels') && ~isempty(o.legend_labels)
   lab = cellstr(o.legend_labels); lc = reshape(double(o.legend_rgb), 3, [])';
   hh = gobjects(numel(lab), 1);
   for k = 1:numel(lab), hh(k) = plot(ax, nan, nan, '-', 'Color', lc(k, :), 'LineWidth', 2); end
-  legend(ax, hh, lab, 'Location', 'southoutside', 'Orientation', 'horizontal', 'Box', 'off', 'FontSize', 7, ...
+  nc = min(numel(lab), 6);                                  % wrap long legends (as pymtex, ncol <= 6)
+  if sum(strlength(lab)) > 60, nc = min(nc, 3); end
+  legend(ax, hh, lab, 'Location', 'southoutside', 'NumColumns', nc, 'Box', 'off', 'FontSize', 7, ...
          'AutoUpdate', 'off');
 end
 if ~ismember('rgb', names) && strlength(string(o.colorbar_label)) > 0

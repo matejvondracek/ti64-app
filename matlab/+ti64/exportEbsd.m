@@ -7,7 +7,8 @@ function info = exportEbsd(id, h5file)
 %   info: struct with phaseNames (cell, index = file phase number + 1), stepUm, isHex, setting, n.
 %   Arrays are written transposed so h5py reads them as (n, cols).
 
-ebsd = ti64.store('get', id);
+S = ti64.store('get', id);
+if isstruct(S), ebsd = S.ebsd; else, ebsd = S; end
 oldId = ebsd.prop.oldId(:);
 real = ~isnan(oldId);
 [~, order] = sort(oldId(real));

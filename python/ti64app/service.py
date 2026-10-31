@@ -4,7 +4,8 @@
     report = replay(project)                   # re-runs all steps in a scratch project, compares outputs
 
 Operations: sample.set, ebsd.load, up2.header, bse.load (here) and the EBSD operations in
-ops_ebsd.py (cleanup, grains, maps, figures). Backend-dependent ops use the project's backend
+ops_ebsd.py (cleanup, grains, maps, figures) and ops_recon.py
+(prior-beta reconstruction, its figures, parameter sweep). Backend-dependent ops use the project's backend
 (Settings) unless `backend=` overrides it.
 
 Objects (maps, grains) stay inside the backend; SESSION remembers which backend object belongs to
@@ -375,3 +376,4 @@ def ops_catalog() -> dict[str, dict]:
 
 
 from . import ops_ebsd  # noqa: E402,F401  (registers the EBSD operations)
+from . import ops_recon  # noqa: E402,F401  (registers the reconstruction operations)

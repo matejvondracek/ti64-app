@@ -19,8 +19,8 @@ import numpy as np
 
 from .. import __version__
 from ..settings import REPO_ROOT, load_settings
-from .base import (BackendUnavailable, CleanupParams, CleanupReport, EBSDData, EBSDHandle, GrainParams,
-                   GrainsData, GrainsHandle, LoadParams, MapParams, RenderSpec)
+from .base import (BackendUnavailable, ChartSpec, CleanupParams, CleanupReport, EBSDData, EBSDHandle,
+                   GrainParams, GrainsData, GrainsHandle, LoadParams, MapParams, ReconData, RenderSpec)
 
 MATLAB_DIR = REPO_ROOT / "matlab"
 
@@ -196,6 +196,8 @@ class MatlabBackend:
                 if spec.seg is not None and len(spec.seg["x1"]):
                     f["seg"] = np.stack([spec.seg[k] for k in ("x1", "y1", "x2", "y2")], 1).astype(float)
                     f["seg_rgb"] = np.asarray(spec.seg_rgb, float).reshape(-1, 3)
+                    if spec.seg_widths is not None:
+                        f["seg_w"] = np.asarray(spec.seg_widths, float).ravel()
             o = {"cmap": spec.cmap, "clim": self._num(spec.clim if spec.clim else [float("nan")] * 2),
                  "colorbar_label": spec.colorbar_label, "seg_width": float(spec.seg_width), "title": spec.title,
                  "width_cm": float(spec.width_cm), "dpi": float(spec.dpi), "scale_bar": bool(spec.scale_bar),
@@ -213,6 +215,54 @@ class MatlabBackend:
         out_png.parent.mkdir(parents=True, exist_ok=True)
         self.call("ti64.renderKey", handle.id, phase, key, self._num(vec), str(out_png), float(dpi),
                   nargout=0)
+        return out_png
+
+    def reconstruct(self, handle: EBSDHandle, rp, log_file: str = "") -> tuple[EBSDHandle, dict]:
+        d = rp.model_dump()
+        sweep = d.pop("sweep")
+        d = {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in d.items()}
+        d.update(sweepModes=[m for m, _ in sweep], sweepThr=self._num([t for _, t in sweep]), logFile=log_file)
+        rid, res = self.call("ti64.reconstruct", handle.id, d, nargout=2)
+        out = {}
+        for k, v in dict(res).items():
+            a = np.asarray(v)
+            out[k] = v if isinstance(v, str) else (a.tolist() if a.size != 1 else float(a.ravel()[0]))
+        out["sweep"] = np.asarray(res["sweep"], float).reshape(-1, 4).tolist()
+        out["mis_share"] = np.asarray(res["mis_share"], float).ravel().tolist()
+        out["fit_quantiles"] = np.asarray(res["fit_quantiles"], float).ravel().tolist()
+        for k in ("n_noise_px", "n_child_grains", "n_grains_min_ecd", "n_grains_all"):
+            out[k] = int(out[k])
+        return EBSDHandle(self.name, str(rid), handle.n_points), out
+
+    def get_recon(self, handle: EBSDHandle) -> ReconData:
+        d = self._h5("ti64.exportRecon", handle.id)
+        for k in ("grain_id", "grain_n_px", "gb_grain1", "gb_grain2"):
+            d[k] = d[k].astype(np.int64)
+        d["grain_is_edge"] = d["grain_is_edge"].astype(bool)
+        d["grain_mean_quat"] = d["grain_mean_quat"].reshape(-1, 4)
+        return ReconData.from_arrays(d)
+
+    def ipf_colors_quat(self, handle: EBSDHandle, phase: str, quat: np.ndarray, key: str, vec) -> np.ndarray:
+        import h5py  # noqa: PLC0415
+
+        fd, tmp = tempfile.mkstemp(suffix=".h5", prefix="ti64_q_")
+        os.close(fd)
+        try:
+            with h5py.File(tmp, "w") as f:
+                f["quat"] = np.asarray(quat, float).reshape(-1, 4)
+            rgb = self._h5("ti64.ipfColorsQuat", handle.id, phase, key, self._num(vec), tmp)["rgb"]
+        finally:
+            os.remove(tmp)
+        return np.asarray(rgb, float).reshape(-1, 3)
+
+    def render_chart(self, spec: ChartSpec, out_png):
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        o = {"bar_width": float(spec.bar_width), "xlabel": spec.xlabel, "ylabel": spec.ylabel, "title": spec.title,
+             "log_y": bool(spec.log_y), "vline_x": self._num([x for x, _ in spec.vlines]),
+             "vline_labels": [lab for _, lab in spec.vlines], "color": self._num(spec.color),
+             "width_cm": float(spec.width_cm), "dpi": float(spec.dpi)}
+        self.call("ti64.renderChart", self._num(spec.centers), self._num(spec.heights), o, str(out_png), nargout=0)
         return out_png
 
     def release(self, handle: EBSDHandle) -> None:

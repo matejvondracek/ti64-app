@@ -75,7 +75,8 @@ def render(ebsd, spec: RenderSpec, out_png: Path, keep: np.ndarray, perm: np.nda
             p = np.stack([x, y], 1)
             return np.stack([p @ east, p @ north], 1)
         segs = np.stack([screen(spec.seg["x1"], spec.seg["y1"]), screen(spec.seg["x2"], spec.seg["y2"])], 1)
-        ax.add_collection(LineCollection(segs, colors=spec.seg_rgb, linewidths=spec.seg_width, zorder=5))
+        lw = spec.seg_widths if spec.seg_widths is not None else spec.seg_width
+        ax.add_collection(LineCollection(segs, colors=spec.seg_rgb, linewidths=lw, zorder=5))
     if spec.colorbar_label and len(fig.axes) > 1:
         fig.axes[-1].set_ylabel(spec.colorbar_label)
     if spec.legend:
@@ -103,4 +104,32 @@ def render_key(cs, key: str, vec, out_png: Path, dpi: int = 300) -> Path:
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.gcf().savefig(out_png, dpi=dpi, bbox_inches="tight", metadata={"Software": None})
     plt.close("all")
+    return out_png
+
+
+def render_chart(spec, out_png: Path) -> Path:
+    """Bar chart of a ChartSpec (base.py), matplotlib."""
+    import matplotlib  # noqa: PLC0415
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    w_in = spec.width_cm / 2.54
+    fig, ax = plt.subplots(figsize=(w_in, 0.62 * w_in))
+    h = np.asarray(spec.heights, float)
+    ax.bar(np.asarray(spec.centers, float), h, width=spec.bar_width, color=spec.color, edgecolor="none")
+    if spec.log_y:
+        ax.set_yscale("log")
+    for x, lab in spec.vlines:
+        ax.axvline(x, color="r", ls="--", lw=1.5)
+        ax.text(x, 1.0, " " + lab, color="r", fontsize=8, va="top", ha="left",
+                transform=ax.get_xaxis_transform())
+    ax.set_xlabel(spec.xlabel)
+    ax.set_ylabel(spec.ylabel)
+    if spec.title:
+        ax.set_title(spec.title, fontsize=9)
+    out_png = Path(out_png)
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_png, dpi=spec.dpi, bbox_inches="tight", metadata={"Software": None})
+    plt.close(fig)
     return out_png

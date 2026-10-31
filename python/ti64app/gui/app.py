@@ -1,5 +1,5 @@
 """NiceGUI front end (localhost). Pages: Project (/), Sample sheet (/sample), Maps (/maps),
-Settings (/settings).
+Prior-beta reconstruction (/recon), Settings (/settings).
 
 All actions go through ti64app.service (recorded in recipe.json), the same as the MCP tools.
 Run:  python -m ti64app.gui.app      -> http://127.0.0.1:8064
@@ -37,6 +37,7 @@ def _nav() -> None:
         ui.link("Project", "/").classes("text-white")
         ui.link("Sample sheet", "/sample").classes("text-white")
         ui.link("Maps", "/maps").classes("text-white")
+        ui.link("Reconstruction", "/recon").classes("text-white")
         ui.link("Settings", "/settings").classes("text-white")
         p = current_project()
         ui.label(f"project: {p.name} ({p.info().backend})" if p else "no project open").classes("ml-auto")
@@ -382,9 +383,159 @@ def maps_page() -> None:
         out
 
 
+# ---- Prior-beta reconstruction page ---------------------------------------------------------------
+def _floats(text: str) -> list[float]:
+    return [float(t) for t in str(text).replace(";", ",").split(",") if t.strip()]
+
+
+def _recon_summary(p: Project, step) -> None:
+    """Summary table of a recon.run step (numbers as in EBSD_part2's summary)."""
+    import json  # noqa: PLC0415
+
+    s = json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8"))
+    dev = s.get("or_dev_deg")
+    or_txt = (f"{s['or_used']} (refined OR deviates {dev:.2f}° from Burgers; {s['or_rule']})"
+              if dev is not None else f"{s['or_used']} ({s['or_rule']})")
+    rows = [("backend", s["backend"]), ("OR", or_txt),
+            ("prior β grains ≥ ECD min (all fragments)", f"{s['n_grains_min_ecd']} ({s['n_grains_all']})"),
+            ("reconstructed α area", f"{100 * s['rec_frac']:.1f} %"),
+            ("mean fit / fit > bad", f"{s['mean_fit_deg']:.2f}° / {100 * s['bad_fit_frac']:.1f} %"),
+            ("fit quantiles 10/25/50/75/90 %", ", ".join(f"{v:.2f}" for v in s["fit_quantiles"])),
+            ("area-weighted ECD", f"{s['ecd_aw_um']:.1f} µm"),
+            ("bridged steps / split noise", f"{s['bridged_pct']:.1f} % / {s['split_pct']:.1f} %")]
+    gs = s["grain_shape"]
+    if gs.get("aspect_along_across"):
+        rows.append(("caliper along / across BD (area-w., edge grains excluded)",
+                     f"{gs['along_bd_um']['area_weighted_mean']:.1f} / "
+                     f"{gs['across_bd_um']['area_weighted_mean']:.1f} µm, aspect "
+                     f"{gs['aspect_along_across']['area_weighted_mean']:.2f} (n = {gs['n_used']})"))
+    for w in gs.get("warnings", []):
+        rows.append(("warning", w))
+    ui.table(columns=[{"name": "k", "label": "", "field": "k", "align": "left"},
+                      {"name": "v", "label": "", "field": "v", "align": "left"}],
+             rows=[{"k": k, "v": str(v)} for k, v in rows]).props("dense flat").classes("w-full").mark("recon_summary")
+    cols = ["config"] + s["sweep_columns"]
+    ui.label("merge sweep").classes("font-bold mt-2")
+    ui.table(columns=[{"name": c, "label": c, "field": c} for c in cols],
+             rows=[{"config": f"{m} {t:g}°", **{c: (f"{v:.1f}" if isinstance(v, float) else v)
+                                                for c, v in zip(cols[1:], r)}}
+                   for (m, t), r in zip(s["sweep_configs"], s["sweep"])]).props("dense flat")
+
+
+RECON_FIG_KINDS = ["parent_ipf", "alpha_parent_gb", "fit", "variant", "packet", "mis_map", "parent_key",
+                   "mis_hist", "fit_hist", "ecd_hist", "n_variants_hist"]
+
+
+def recon_page() -> None:
+    _nav()
+    p = current_project()
+    with ui.column().classes("p-4 gap-3 w-full max-w-6xl"):
+        if p is None:
+            ui.label("Open a project first.")
+            return
+        sheets = {s.map_id: s for s in p.samples()}
+        if not sheets:
+            ui.label("Enter a sample sheet and load a map first.")
+            return
+        mid = ui.select(list(sheets), value=next(iter(sheets)), label="Map").classes("w-64").mark("recon_map")
+        res = ui.column().classes("w-full")
+        out = ui.column().classes("w-full")
+
+        async def do(op: str, params: dict, label: str):
+            n = ui.notification(f"{label} ({p.info().backend}) ...", spinner=True, timeout=None)
+            try:
+                step = await ng_run.io_bound(service.run, p, op, {"map_id": mid.value, **params})
+                ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
+                return step
+            except Exception as e:  # noqa: BLE001
+                _error(e)
+            finally:
+                n.dismiss()
+
+        with ui.expansion("1 Reconstruct (EBSD_part2.m method; input = loaded map)", value=True).classes("w-full"):
+            with ui.row().classes("items-end"):
+                method = ui.select(["variantGraph", "graph"], value="variantGraph", label="method").classes("w-36")
+                thr = ui.number("threshold [°]", value=5.0).classes("w-28").mark("vg_thr")
+                tol = ui.number("tolerance [°]", value=1.5).classes("w-28")
+                seg = ui.number("α grain angle [°]", value=1.5).classes("w-32")
+            with ui.row().classes("items-end"):
+                or_mode = ui.select({"limit": "refined OR if ≤ limit, else Burgers", "burgers": "ideal Burgers",
+                                     "refined": "refined OR always"}, value="limit", label="OR").classes("w-72")
+                or_max = ui.number("limit [°]", value=1.0).classes("w-24")
+                mmode = ui.select(["single", "progressive"], value="single", label="merge").classes("w-32")
+                mthr = ui.number("merge threshold [°]", value=3.0).classes("w-36")
+                incl = ui.number("inclusions < px", value=5).classes("w-32")
+
+            def rparams() -> dict:
+                d = {"method": method.value, "segAngle": seg.value, "orMode": or_mode.value,
+                     "orMaxDev": or_max.value, "mergeMode": mmode.value, "mergeThreshold": mthr.value,
+                     "inclusionMaxSize": int(incl.value)}
+                if method.value == "variantGraph":
+                    d.update(vgThreshold=thr.value, vgTolerance=tol.value)
+                else:
+                    d.update(graphThreshold=thr.value, graphTolerance=tol.value)
+                return d
+
+            async def run_recon():
+                step = await do("recon.run", {"params": rparams()}, "reconstruction")
+                if step:
+                    res.clear()
+                    with res:
+                        _recon_summary(p, step)
+            ui.button("Reconstruct", on_click=run_recon).mark("run_recon")
+        with ui.expansion("2 Figures", value=True).classes("w-full"):
+            with ui.row().classes("items-end"):
+                fk = ui.select(RECON_FIG_KINDS, value="parent_ipf", label="figure").classes("w-48").mark("recon_fig")
+                dirn = ui.select(["(Settings)", "X", "Y", "Z", "build"], value="(Settings)",
+                                 label="IPF direction").classes("w-36")
+
+            async def draw():
+                d = {"kind": fk.value}
+                if dirn.value != "(Settings)":
+                    d["direction"] = dirn.value
+                step = await do("recon.figure", d, f"figure {fk.value}")
+                if step:
+                    out.clear()
+                    with out:
+                        ui.image(str(p.root / step.outputs["figure"].path)).classes("w-full max-w-4xl")
+            ui.button("Draw", on_click=draw).mark("run_recon_fig")
+        with ui.expansion("3 Parameter sweep").classes("w-full"):
+            ui.label("Every combination is reconstructed with the settings above; numbers + thumbnails.").classes("text-sm")
+            with ui.row().classes("items-end"):
+                sw_thr = ui.input("thresholds [°]", value="5, 8").classes("w-40").mark("sweep_thr")
+                sw_merge = ui.input("merge thresholds [°]", value="0.5, 3, 6").classes("w-48").mark("sweep_merge")
+
+            async def sweep():
+                name = "vgThreshold" if method.value == "variantGraph" else "graphThreshold"
+                step = await do("recon.sweep", {"base": {**rparams(), "sweep": []},
+                                                "grid": {name: _floats(sw_thr.value),
+                                                         "mergeThreshold": _floats(sw_merge.value)}}, "sweep")
+                if not step:
+                    return
+                import json  # noqa: PLC0415
+
+                t = json.loads((p.root / step.outputs["table"].path).read_text(encoding="utf-8"))
+                out.clear()
+                with out:
+                    cols = ["run", "params", "grains", "all", "recFrac %", "fit p50", "fit p90", "ECDaw",
+                            "bridged %", "split %"]
+                    ui.table(columns=[{"name": c, "label": c, "field": c} for c in cols], rows=[{
+                        "run": r["run"], "params": ", ".join(f"{k} {v}" for k, v in r["params"].items()),
+                        "grains": r["n_grains_min_ecd"], "all": r["n_grains_all"],
+                        "recFrac %": f"{100 * r['rec_frac']:.1f}", "fit p50": f"{r['fit_quantiles'][2]:.2f}",
+                        "fit p90": f"{r['fit_quantiles'][4]:.2f}", "ECDaw": f"{r['ecd_aw_um']:.1f}",
+                        "bridged %": f"{r['bridged_pct']:.1f}", "split %": f"{r['split_pct']:.1f}"}
+                        for r in t["runs"]]).props("dense flat").mark("sweep_table")
+                    with ui.grid(columns=3).classes("w-full"):
+                        for k in sorted(o for o in step.outputs if o.startswith("thumb_")):
+                            ui.image(str(p.root / step.outputs[k].path))
+            ui.button("Run sweep", on_click=sweep).mark("run_sweep")
+
+
 def build() -> None:
     ui.page("/")(project_page)
     ui.page("/maps")(maps_page)
+    ui.page("/recon")(recon_page)
     ui.page("/sample")(sample_page)
     ui.page("/settings")(settings_page)
 

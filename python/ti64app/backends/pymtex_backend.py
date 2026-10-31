@@ -84,6 +84,45 @@ class PymtexBackend(PymtexAnalysis):
                         round(float(np.median(np.diff(np.unique(np.round(x[y == y.min()], 4))))), 6),
                         self._store[handle.id]["setting"])
 
+    def reconstruct(self, handle: EBSDHandle, rp, log_file: str = "") -> tuple[EBSDHandle, dict]:
+        from .pymtex_recon import reconstruct, write_log  # noqa: PLC0415
+
+        objs, res = reconstruct(self._get(handle), rp)
+        if log_file:
+            write_log(log_file, rp, res)
+        hid = uuid.uuid4().hex[:12]
+        self._store[hid] = {**objs, "recon": True, "setting": self._store[handle.id]["setting"]}
+        return EBSDHandle(self.name, hid, handle.n_points), res
+
+    def get_recon(self, handle: EBSDHandle):
+        st = self._store.get(handle.id)
+        if st is None or not st.get("recon"):
+            raise KeyError(f"no pymtex reconstruction {handle.id}")
+        return st["reconData"]
+
+    def ipf_colors_quat(self, handle: EBSDHandle, phase: str, quat: np.ndarray, key: str, vec) -> np.ndarray:
+        """IPF colours of arbitrary orientations (quaternions a b c d, crystal -> specimen) of one
+        phase of a stored map, e.g. parent grain mean orientations; NaN rows stay NaN."""
+        from mtex import orientation, quaternion  # noqa: PLC0415
+
+        from .pymtex_plot import make_key  # noqa: PLC0415
+
+        e = self._map_or_grains_ebsd(handle)
+        cs = e[phase].CS
+        quat = np.asarray(quat, float).reshape(-1, 4)
+        out = np.full((quat.shape[0], 3), np.nan)
+        ok = ~np.isnan(quat).any(axis=1)
+        if ok.any():
+            q = quat[ok]
+            o = orientation(quaternion(q[:, 0], q[:, 1], q[:, 2], q[:, 3]), cs)
+            out[ok] = np.asarray(make_key(cs, key, vec).orientation2color(o), float).reshape(-1, 3)
+        return out
+
+    def render_chart(self, spec, out_png):
+        from .pymtex_plot import render_chart  # noqa: PLC0415
+
+        return render_chart(spec, out_png)
+
     def release(self, handle: EBSDHandle) -> None:
         self._store.pop(handle.id, None)
 

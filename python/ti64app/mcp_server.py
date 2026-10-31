@@ -249,6 +249,62 @@ def compare_with_oim(project: str, map_id: str, image: str, kind: Literal["ipf",
 
 
 @server.tool()
+def reconstruct_beta(project: str, map_id: str, params: dict[str, Any] | None = None,
+                     backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Prior-beta reconstruction of the LOADED map (EBSD_part2.m method; Niessen 2022, Hielscher 2022).
+    params (ReconParams, degrees): method 'variantGraph'|'graph', vgThreshold 5, vgTolerance 1.5, vgNumIter 3,
+    vgInflation 1.05, segAngle 1.5, orMode 'limit'|'burgers'|'refined' with orMaxDev 1 (refined OR used only
+    if <= orMaxDev from Burgers), mergeMode 'single'|'progressive', mergeThreshold 3, inclusionMaxSize 5,
+    histMinECD 5, sweep [[mode, deg], ...]. Returns the summary: OR deviation and OR used, grains,
+    reconstructed fraction, fit, ECD, bridged steps / split noise, merge sweep, Ti variant/packet statistics,
+    grain size and caliper along/across the build direction."""
+    p = _project(project)
+    step = service.run(p, "recon.run", {"map_id": map_id, "params": params or {}}, backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "summary": json.loads((p.root / step.outputs["summary"].path).read_text())}
+
+
+def _recon_backend(p, map_id: str, recon: str | None) -> str | None:
+    s = p.recipe().step(recon) if recon else service.latest_step(p, ("recon.run",), map_id=map_id)
+    return s.backend if s else None
+
+
+@server.tool()
+def recon_figure(project: str, map_id: str,
+                 kind: Literal["parent_ipf", "alpha_parent_gb", "fit", "variant", "packet", "mis_map", "parent_key",
+                               "mis_hist", "fit_hist", "ecd_hist", "n_variants_hist"],
+                 recon: str | None = None, direction: Literal["X", "Y", "Z", "build", "custom"] | None = None,
+                 key: str | None = None) -> dict[str, Any]:
+    """Figure of the newest (or given) reconstruction, drawn by the backend that computed it: parent grain IPF
+    map, alpha IPF with prior-beta boundaries, fit / variant / packet maps, boundary misorientation map,
+    beta IPF key, histograms (neighbour misorientation, fit, ECD, variants per grain). Returns the PNG path."""
+    p = _project(project)
+    params = {"map_id": map_id, "kind": kind, "recon": recon, "direction": direction, "key": key}
+    step = service.run(p, "recon.figure", {k: v for k, v in params.items() if v is not None},
+                       backend=_recon_backend(p, map_id, recon))
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "png": str(p.root / step.outputs["figure"].path),
+            "meta": json.loads((p.root / step.outputs["meta"].path).read_text())}
+
+
+@server.tool()
+def recon_sweep(project: str, map_id: str, grid: dict[str, list[Any]], base: dict[str, Any] | None = None,
+                thumbnails: bool = True, backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Reconstruction-parameter sweep: every combination of `grid` (ReconParams names -> value lists, e.g.
+    {"vgThreshold": [5, 8], "mergeThreshold": [0.5, 3, 6]}) on top of `base`. Per run: reconstructed fraction,
+    parent-fit quantiles, beta grain count, area-weighted ECD, bridged steps, split noise, thumbnail PNG."""
+    p = _project(project)
+    params = {"map_id": map_id, "grid": grid, "thumbnails": thumbnails, "base": {"sweep": [], **(base or {})}}
+    step = service.run(p, "recon.sweep", params, backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "table": json.loads((p.root / step.outputs["table"].path).read_text()),
+            "thumbnails": [str(p.root / r.path) for k, r in sorted(step.outputs.items()) if k.startswith("thumb_")]}
+
+
+@server.tool()
 def replay_project(project: str, backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
     """Re-run the project's recipe in a scratch copy and compare all outputs with the recorded ones."""
     rep = service.replay(_project(project), backend=backend)

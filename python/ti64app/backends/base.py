@@ -208,6 +208,7 @@ class RenderSpec:
     seg: dict[str, np.ndarray] | None = None          # x1 y1 x2 y2 (um)
     seg_rgb: np.ndarray | None = None                 # (m, 3)
     seg_width: float = 0.75
+    seg_widths: np.ndarray | None = None              # (m,) per-segment widths (overrides seg_width)
     legend: list[tuple[str, tuple[float, float, float]]] = field(default_factory=list)
     title: str = ""
     width_cm: float = 12.0
@@ -232,3 +233,98 @@ class AnalysisBackend(Protocol):
     def release(self, handle: EBSDHandle) -> None: ...
 
     def handles(self) -> list[str]: ...
+
+    # prior-beta reconstruction (phase 3)
+    def reconstruct(self, handle: EBSDHandle, params: "ReconParams", log_file: str = "") -> tuple[EBSDHandle, dict]: ...
+
+    def get_recon(self, handle: EBSDHandle) -> "ReconData": ...
+
+    def ipf_colors_quat(self, handle: EBSDHandle, phase: str, quat: np.ndarray, key: str, vec) -> np.ndarray: ...
+
+    def render_chart(self, spec: "ChartSpec", out_png: Path) -> Path: ...
+
+
+# per-pixel reconstruction state (prop 'recon_state' of the parent map, same codes in both backends)
+RECON_NOT_INDEXED, RECON_REMOVED, RECON_TRANSFORMED, RECON_UNTRANSFORMED, RECON_RETAINED_BETA = 0, 1, 2, 3, 4
+
+
+@dataclass
+class ReconData:
+    """Backend-neutral reconstruction result besides the parent map itself.
+    The parent map (get_ebsd of the reconstruction handle) is the loaded map with parent (beta)
+    orientations on reconstructed pixels, the child orientation on untransformed alpha, removed noise
+    = not indexed; props: parent_grain (id, 0 = none), recon_fit (deg, NaN), recon_state (codes above).
+    grain: parent grains: id, n_px, area_um2, ecd_um, is_edge, mean_quat (n, 4).
+    boundary: segments of the parent grains: x1 y1 x2 y2 length_um grain1 grain2 (0 = map edge or not
+      a parent grain) mis_deg (between the two grains' MEAN parent orientations, NaN unless both sides
+      are parent grains; EBSD_part2.m).
+    pre_boundary: beta/beta boundaries between alpha grains BEFORE merging: x1 y1 x2 y2 length_um
+      mis_deg (neighbour beta misorientation, EBSD_part2 diagnostics)."""
+    grain: dict[str, np.ndarray]
+    boundary: dict[str, np.ndarray]
+    pre_boundary: dict[str, np.ndarray]
+
+    def to_arrays(self) -> dict[str, np.ndarray]:
+        out = {f"grain_{k}": v for k, v in self.grain.items()}
+        out.update({f"gb_{k}": v for k, v in self.boundary.items()})
+        out.update({f"pre_{k}": v for k, v in self.pre_boundary.items()})
+        return out
+
+    @classmethod
+    def from_arrays(cls, d: dict[str, np.ndarray]) -> "ReconData":
+        return cls({k[6:]: v for k, v in d.items() if k.startswith("grain_")},
+                   {k[3:]: v for k, v in d.items() if k.startswith("gb_")},
+                   {k[4:]: v for k, v in d.items() if k.startswith("pre_")})
+
+
+@dataclass
+class ChartSpec:
+    """A bar chart (histogram) drawn by the active backend (matplotlib / MATLAB bar).
+    Bin values are computed in Python, so both renderers show the same numbers."""
+    centers: np.ndarray
+    heights: np.ndarray
+    bar_width: float
+    xlabel: str = ""
+    ylabel: str = ""
+    title: str = ""
+    log_y: bool = False
+    vlines: list[tuple[float, str]] = field(default_factory=list)
+    color: tuple[float, float, float] = (0.3, 0.45, 0.7)
+    width_cm: float = 12.0
+    dpi: int = 300
+
+
+class ReconParams(BaseModel):
+    """Prior-beta reconstruction (docs/beta_reconstruction_method.md, EBSD_part2.m); angles in degrees.
+    Names follow EBSD_part2.m `par`; defaults = the final JU02 run."""
+    cleanAngle: float = 3.0
+    noiseMaxIndexed: int = 2
+    noiseMaxVoid: int = 4
+    segAngle: float = 1.5
+    smoothIter: int = 5
+    method: Literal["variantGraph", "graph"] = "variantGraph"
+    vgThreshold: float = 5.0
+    vgTolerance: float = 1.5
+    vgNumIter: int = 3
+    vgInflation: float = 1.05
+    graphThreshold: float = 2.0
+    graphTolerance: float = 1.5
+    graphInflation: float = 1.6
+    minProb: float = 0.0
+    orRefine: bool = True
+    orMaxDev: float = 1.0                     # refined OR used only if <= this from Burgers (visible setting)
+    orMode: Literal["limit", "burgers", "refined"] = "limit"
+    mergeMode: Literal["single", "progressive"] = "single"
+    mergeThreshold: float = 3.0
+    mergeStart: float = 1.0
+    mergeStep: float = 0.5
+    inclusionMaxSize: int = 5
+    badFit: float = 3.0
+    histMinECD: float = 5.0
+    stepAngle: float = 4.0
+    noiseAngle: float = 1.0
+    hagbAngle: float = 10.0                   # prior-beta boundaries drawn black in the parent grain map
+    misMapMin: float = 1.5                    # boundary misorientation map: shown from ...
+    misMapMax: float = 8.0                    # ... colour scale max
+    sweep: list[tuple[str, float]] = [("single", 0.5), ("single", 3.0), ("single", 6.0), ("single", 8.0),
+                                      ("progressive", 3.0)]

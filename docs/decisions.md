@@ -101,3 +101,62 @@
 - Not in the test data: Fit (constant 180) and PRIAS (declared, absent) -> clear "not available" errors.
   CI of OIM-cleaned maps is labelled "CI after OIM cleanup" with a warning; KAM/GND of OIM-cleaned maps
   carry a warning that grain dilation lowers them locally.
+
+## D12 (2026-10-31) Prior-beta reconstruction: MTEX 6.1 reference vs MTEX 7.2 vs pymtex (full JU02)
+- Port: matlab/+ti64/reconstruct.m and backends/pymtex_recon.py follow EBSD_part2.m step by step
+  (parameters = ReconParams in backends/base.py, names as in the script's `par`). Input by default = the
+  LOADED map with EBSD_part2's own noise cleanup (removed, not filled; user decision), noise grains with
+  alpha = 0 (D7). The OR rule is a visible setting: orMode 'limit' (refined OR kept if <= orMaxDev = 1°),
+  'burgers' or 'refined'. Run-log line format of EBSD_part2.m kept (`write_log` / `logFile`).
+- Results (default parameters, vgThr 5, single merge 3°, incl 5):
+  | run | OR dev | grains >= 5 um (all) | recFrac | meanFit | fit > 3° | ECDaw |
+  | MTEX 6.1 reference | 0.82 refined | 47 (701) | 100.0 % | 3.38 | 50.7 % | 93.9 |
+  | MATLAB MTEX 7.2, limit | 0.97 refined | 46 (708) | 100.0 % | 3.36 | 50.5 % | 94.4 |
+  | MATLAB, ideal Burgers | – | 52 (790) | 99.9 % | 3.568 | 55.2 % | 89.6 |
+  | pymtex, ideal Burgers | – | 53 (796) | 99.9 % | 3.566 | 55.1 % | 89.5 |
+  | pymtex, refined | 1.01 refined | 44 (708) | 100.0 % | 3.35 | 49.1 % | 99.9 |
+  | pymtex, limit (default) | 1.01 -> Burgers | 53 (796) | 99.9 % | 3.57 | 55.1 % | 89.5 |
+  MTEX 7.2 merge sweep: 0.5° 768 / 3° 46 / 6° 26 / 8° 22 / progressive 3° 126 grains (reference 762 / 47 / 28 /
+  23 / 134).
+- Differences: (1) MTEX 6.1 -> 7.2: OR refinement 0.82 -> 0.97°, grain counts within ±1-8 %; cleanup with
+  alpha = 0. (2) pymtex vs MATLAB with the SAME OR: equal within ~1 % (grains 53 vs 52, fit 3.566 vs 3.568).
+  (3) The refined ORs differ (1.01 vs 0.97°), so with the 1° rule pymtex falls back to Burgers while MATLAB
+  keeps its refined OR -> default results differ (53 vs 46 grains). Conformance is therefore judged with the
+  same OR mode in both (user decision).
+- MTEX's packet IDs assume {111}_p||{110}_c (steel); Ti packets ({110}beta || (0001)alpha) must be computed
+  separately (to do).
+
+## D13 (2026-10-31) Reconstruction outputs, Ti variants/packets, grain shape vs BD, figures
+- Parent map: the reconstruction returns the LOADED map (same grid, file order) with the parent EBSD put back
+  on the kept pixels; props parent_grain, recon_fit (deg), recon_state (0 not indexed, 1 removed noise,
+  2 reconstructed alpha, 3 untransformed alpha, 4 retained beta). Pixels not indexed in the input stay not
+  indexed (MTEX 7 / pymtex calcGrains index voids inside grains, D7). Both backends give identical states
+  and phases on the crops. Parent grains + boundaries + pre-merge boundaries: `ReconData` (base.py).
+- Beta symmetry from the map's phase list (the .ang header), not from indexed beta pixels: on small crops
+  all beta can be removed as noise. Fallback m-3m, a = 3.32 A as EBSD_part2.m (both backends).
+- Ti variant / packet IDs are computed in Python (modules/recon_analysis.py) against the 12 IDEAL Burgers
+  variants, (110)beta || (0001)alpha, [1-11]beta || [2-1-10]alpha: packet = which of 6 {110}beta is parallel to
+  the alpha c-axis (Ti packet convention, e.g. Stanford & Bate 2004 doi:10.1016/j.actamat.2004.08.034), variant
+  = which of the 2 <111>beta in that plane is parallel to an alpha <11-20>. NOT MTEX's packetId (steel
+  {111}_p || {110}_c) and not MTEX's variantId (24 IDs with a refined OR). Counted against the parent GRAIN mean
+  orientation: MTEX's per-pixel parent orientation is the symmetric equivalent that makes every child variant 1.
+  The grain mean is first reduced to a canonical cubic equivalent (largest |scalar quaternion part|), so the IDs
+  do not depend on which equivalent a backend returns: same variant ID in pymtex and MATLAB on >= 99.98 % of
+  reconstructed pixels of the three crop1000s (before this, the IDs were permuted per grain).
+  Hexagonal frame X || a (checked in both backends). Deviations reported: JU02 crop c-axis to {110} median 2.2°.
+- Conformance on the three crop1000s, ideal Burgers in both (test_phase3.py): reconstruction state and phase
+  identical on JU02 / RM02, 19 of 10^6 pixels differ on RI02; parent orientations within 2° on >= 99.76 % of
+  reconstructed pixels; grains 306/304, 308/305, 230/229 (pymtex/MATLAB); mean fit equal within 0.002°;
+  pre-merge boundary length 2-3 % shorter in pymtex (boundary geometry of the two engines).
+- Variant-selection statistics: per map share + mean fit per variant ID (EBSD_part2 summary); per grain number
+  of variants / packets above 1 % of the grain and the largest-variant share (IDs are relative to each grain).
+- Grain shape vs build direction (first choice, to confirm): caliper = extent of the pixel centres of a
+  prior-beta grain projected on the in-plane BD (along) and its normal (across) + one step; aspect = along /
+  across; edge grains excluded, ECD >= histMinECD (ISO 13067 / ASTM E2627 rules). Not computed if BD is
+  > 20° out of the map plane. JU02: aspect (area-weighted) 1.22 pymtex / 1.29 MATLAB (different OR, D12).
+- Figures of a reconstruction come from the backend that computed it (refused otherwise). Histogram bins are
+  computed in Python and drawn by the backend (`ChartSpec`); discrete variant/packet colours = MATLAB hsv(n)
+  computed in Python, so both renderers use the same colours. Parent grain map coloured by grain MEAN
+  orientation (EBSD_part2), boundaries > hagbAngle 10° between grain means.
+- pymtex smooths the alpha grains with smoothBoundary, MATLAB with smooth (old behaviour, as EBSD_part2);
+  the results agree within the tolerances (conformance test_phase3.py).
