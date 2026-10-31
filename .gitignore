@@ -71,3 +71,6 @@ desktop.ini
 # Local settings and secrets
 .env
 .claude/settings.local.json
+
+# Machine-specific settings (MTEX folder, MATLAB, literature path)
+settings.local.toml

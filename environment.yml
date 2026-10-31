@@ -1,0 +1,31 @@
+# conda env for ti64app, exact versions of the working env (2026-10-31).
+#   conda env create -f environment.yml   then   python -m pip install -e . --no-deps
+# MATLAB R2025b + MTEX 7.2.0 are optional and installed separately; matlabengine must match the
+# MATLAB release (25.2.* for R2025b). pyopencl (Intel Arc GPU indexing) is optional and not pinned.
+name: ti64
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.16
+  - pip=26.2.2
+  - pip:
+      - mtex==1.0.0
+      - numpy==2.5.4
+      - scipy==1.18.1
+      - matplotlib==3.11.2
+      - h5py==3.16.0
+      - pandas==3.1.0
+      - pydantic==2.14.2
+      - psutil==7.2.2
+      - orix==0.15.0
+      - kikuchipy==0.13.1
+      - pyebsdindex==0.3.10.1
+      - scikit-image==0.26.0
+      - dask==2026.8.0
+      - tifffile==2026.10.15
+      - pillow==13.0.0
+      - nicegui==3.18.0
+      - mcp==2.3.0
+      - pytest==9.2.0
+      - setuptools==84.2.1
+      - matlabengine==25.2.2

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ti64app"
+version = "0.0.1"
+description = "EBSD + BSE microstructure analysis of EBM Ti-6Al-4V (pymtex and MATLAB/MTEX backends)"
+readme = "CLAUDE.md"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "Matěj Vondráček" }]
+dependencies = [
+  "mtex==1.0.0",
+  "numpy>=2.5",
+  "scipy>=1.18",
+  "matplotlib>=3.11",
+  "h5py>=3.16",
+  "pandas>=3.1",
+  "pydantic>=2.14",
+  "psutil>=7.2",
+  "orix>=0.15",
+  "tifffile>=2026.10",
+  "pillow>=13.0",
+]
+
+[project.optional-dependencies]
+matlab = ["matlabengine==25.2.*"]          # MATLAB R2025b + MTEX 7.2
+patterns = ["pyebsdindex>=0.3.10", "kikuchipy>=0.13"]
+gui = ["nicegui>=3.18"]
+mcp = ["mcp>=2.3"]
+dev = ["pytest>=9.2"]
+
+[project.scripts]
+ti64 = "ti64app.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["python"]
+addopts = "-ra --strict-markers"
+markers = [
+  "slow: full maps / long runs (deselect with -m 'not slow')",
+  "matlab: needs MATLAB R2025b + MTEX 7.2 through the MATLAB Engine",
+]

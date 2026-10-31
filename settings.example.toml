@@ -1,0 +1,7 @@
+# Copy to settings.local.toml (git-ignored, repo root) or to %APPDATA%\ti64app\settings.toml
+# and adjust. Machine-specific paths only; analysis settings live in each project's recipe.
+[paths]
+mtex_path = 'C:\tools\mtex\mtex-7.2.0'          # MTEX 7.2 folder (contains startup_mtex.m)
+matlab_root = 'C:\Program Files\MATLAB\R2025b'   # optional, informational
+literature_dir = 'C:\Claude\literature'
+cache_dir = ''                                   # empty = projects/<name>/cache
