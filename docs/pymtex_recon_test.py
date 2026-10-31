@@ -1,8 +1,12 @@
 # pymtex 1.0.0 port of the EBSD_part2.m reconstruction core (no figures, no merge sweep).
 # Test run on JU02, 2026-10-31: see chat. pip install "mtex[all]"  (Python >= 3.12)
-import time, numpy as np, resource, sys
+import time, numpy as np, sys
+try:
+    import resource  # not available on Windows
+except ImportError:
+    resource = None
 from mtex import *
-def rss(): return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1e6,2)
+def rss(): return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss/1e6,2) if resource else float('nan')
 from pathlib import Path
 f = str(Path(__file__).resolve().parents[1] / "data" / "test" / "EBM_Ti64_JU02_C_Area 3_OIM Map 1_Rescan_Rescan_cleaned.ang")
 T=time.time(); t=time.time()

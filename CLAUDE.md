@@ -63,6 +63,8 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   y-down (set how2plot explicitly, as the script does), EBSD.load returns grid-ordered data (map to file
   rows via ebsd.oldId; check hexRaster's use of ids), calcGrains is tuned by 'angle', 'minPixel', 'alpha'.
   See the MTEX changelog ("Technical Changes").
+- In MTEX 7.2 ebsd.how2plot is read-only, so `ebsd.how2plot.east = xvector` from EBSD_part2.m fails;
+  set the convention through MTEX 7's plottingConvention API instead (check the 7.2 docs).
 
 ## IPF colour key (setting)
 - Per phase, stored in the project recipe: key type ipfHKLKey (default, as in the Research Assignment),
@@ -83,7 +85,10 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   Load with EDAX setting 2 in both backends (MATLAB: EBSD.load(f,'setting',2); pymtex:
   loadEBSD(f, setting=2)) and use the same plotting convention in both (east = x, out of screen = -z).
   Verify the IPF map against an OIM screenshot before trusting any reference-frame-dependent result.
-- pymtex 1.0 does not load PRIAS columns; read them from the .ang text in Python.
+- The test .ang files declare PRIAS columns in the header but every data row has only 10 columns:
+  there is no PRIAS data. Fit is constant 180 and SEM is 0, so only CI and IQ are usable. Use the IQ map
+  as the reference image for BSE registration; virtual BSE exists only where patterns exist (.up2).
+  If a future export does contain PRIAS columns, read them from the .ang text (pymtex 1.0 ignores them).
 - .up2 = EDAX pattern file. Never load fully; stream in chunks (PyEBSDIndex or kikuchipy lazy=True).
   Neither MTEX version reads it.
 - BSE images: JEOL JSM-IT500HR; metadata from the accompanying .txt (stage X/Y/Z/T/R, WD, kV, mag, pixel size).
@@ -93,6 +98,9 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
 - Cite methods by DOI in code comments and docs/decisions.md.
 
 ## Environment and performance
+- Always run Python, pip and pytest from the ti64 env: C:\Users\matej\miniforge3\envs\ti64\python.exe
+  (e.g. `...\python.exe -m pytest`), never the system Python 3.10. Sessions started from the Claude
+  desktop app do not activate conda.
 - Windows, 16 GB RAM, conda env `ti64` with Python 3.12; mtex==1.0.0 pinned; MATLAB R2025b + MTEX 7.2
   optional. GPU optional (Intel Arc B580 via OpenCL), used only for .up2 indexing; everything else must
   run on CPU. Keep peak RAM < 8 GB.
@@ -100,7 +108,9 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   projects/ or a cache folder, never next to the raw data; keyed by file, input state and cleanup parameters.
 - matlab backend: keep large objects in the MATLAB session; move per-pixel arrays to Python through
   temporary HDF5/.mat files (h5py), not element-wise engine conversion.
-- Unit tests use the crops; full maps only in integration tests (marked slow).
+- Unit tests use the 300x300 crops (about 60 x 52 um, smaller than one prior-beta grain). Reconstruction
+  tests use a larger crop (about 1000x1000 points, ~200 um) that contains whole prior-beta grains; the JU02 reference numbers are checked
+  on the full map only, in slow integration tests.
 
 ## Science defaults (cite in code comments)
 - Burgers OR beta->alpha: orientation.Burgers(csBeta, csAlpha), parent-to-child direction.
