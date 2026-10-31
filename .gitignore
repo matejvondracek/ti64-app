@@ -1,0 +1,73 @@
+# ---------------------------------------------------------------
+# PUBLIC REPOSITORY: no measurement data, literature or results.
+# ---------------------------------------------------------------
+
+# Measurement and reference data (test maps, crops, earlier results)
+data/
+
+# EBSD / pattern / microscope files anywhere in the tree
+*.ang
+*.ctf
+*.osc
+*.up1
+*.up2
+*.h5
+*.hdf5
+*.edaxh5
+*.oh5
+*.cpr
+*.crc
+*.xrdml
+
+# BSE / SEM images (screenshots for docs can go in docs/img/ as .png)
+*.tif
+*.tiff
+*.bmp
+*.dm3
+*.dm4
+
+# Literature (kept outside the repo, ignored here in case it is copied in)
+literature/
+*.pdf
+
+# App outputs and caches
+projects/
+results/
+output/
+cache/
+figures_prior_beta/
+*_mtexcache.mat
+*.npz
+*.fig
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
+
+# MATLAB
+*.asv
+*.mex*
+slprj/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local settings and secrets
+.env
+.claude/settings.local.json
