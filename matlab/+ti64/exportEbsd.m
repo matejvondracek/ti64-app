@@ -3,7 +3,7 @@ function info = exportEbsd(id, h5file)
 %   info = ti64.exportEbsd(id, h5file)
 %   Datasets: x, y (um), phase (file phase numbers, 0 = not indexed), quat (n x 4, a b c d,
 %   NaN if not indexed), prop_ci, prop_iq, prop_fit, prop_sem (neutral names, as in the pymtex
-%   backend). Padding pixels of the hex grid are dropped; rows are sorted by prop.oldId.
+%   backend; plus prop_<name> for every prop ti64_<name>). Padding pixels of the hex grid are dropped; rows are sorted by prop.oldId.
 %   info: struct with phaseNames (cell, index = file phase number + 1), stepUm, isHex, setting, n.
 %   Arrays are written transposed so h5py reads them as (n, cols).
 
@@ -30,6 +30,12 @@ for k = 1:numel(f)
     v = ebsd.prop.(names.(f{k}))(:);
     data(end+1:end+2) = {['prop_' f{k}], v(idx)};    %#ok<AGROW>
   end
+end
+extra = fieldnames(ebsd.prop);
+extra = extra(startsWith(extra, 'ti64_'));             % app-specific per-pixel flags
+for k = 1:numel(extra)
+  v = ebsd.prop.(extra{k})(:);
+  data(end+1:end+2) = {['prop_' extra{k}(6:end)], v(idx)};    %#ok<AGROW>
 end
 if isfile(h5file), delete(h5file); end
 for k = 1:2:numel(data)

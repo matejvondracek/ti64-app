@@ -39,7 +39,7 @@ def test_load_and_replay_reproduce(project, crop300_ju02):
     assert meta["input_state"] == "oim_cleaned" and meta["grid"] == "hex"
     with np.load(project.root / step.outputs["ebsd"].path) as z:
         assert z["quat"].shape == (90000, 4)
-    assert (str(project.root), step.id) in service.SESSION      # object kept in the backend
+    assert (str(project.root), step.id, "pymtex") in service.SESSION      # object kept in the backend
     rep = service.replay(project)
     assert rep.ok, rep
     assert {c.status for c in rep.checks} == {"identical"}

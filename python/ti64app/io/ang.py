@@ -72,6 +72,23 @@ def read_header(path: str | Path) -> AngHeader:
     return h
 
 
+class PriasUnavailable(ValueError):
+    """The .ang declares PRIAS columns (or not) but the data rows do not contain them."""
+
+
+def read_prias(path: str | Path, column: int = 0):
+    """PRIAS column (0 bottom strip, 1 centre square, 2 top strip) in FILE order.
+    pymtex 1.0 does not load PRIAS, so it is read from the .ang text here."""
+    import numpy as np  # noqa: PLC0415
+
+    h = read_header(path)
+    cols = data_column_count(path)
+    if max(cols) < 13 or "PRIAS" not in ",".join(h.declared_columns):
+        raise PriasUnavailable(f"{Path(path).name}: no PRIAS data in the rows "
+                               f"({max(cols)} columns; header declares {len(h.declared_columns)})")
+    return np.loadtxt(path, comments="#", usecols=(10 + column,), dtype=float)
+
+
 def data_column_count(path: str | Path, n_rows: int = 1000) -> set[int]:
     """Set of column counts in the first n_rows data rows."""
     counts: set[int] = set()

@@ -33,6 +33,15 @@ def npz_hash(path: Path) -> str:
         return array_hash({k: z[k] for k in z.files})
 
 
+def png_hash(path: Path) -> str:
+    """Hash of the decoded pixels (RGBA) of an image, independent of PNG metadata/compression."""
+    from PIL import Image  # noqa: PLC0415
+
+    with Image.open(path) as im:
+        a = np.asarray(im.convert("RGBA"))
+    return array_hash({"rgba": a})
+
+
 def file_fingerprint(path: Path) -> str:
     """Cheap fingerprint of an input file: size + first and last 4 MB (full hash below 8 MB).
     Enough to notice a replaced or edited file without reading 43 GB .up2 files."""

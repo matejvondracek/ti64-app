@@ -19,7 +19,8 @@ import numpy as np
 
 from .. import __version__
 from ..settings import REPO_ROOT, load_settings
-from .base import BackendUnavailable, EBSDData, EBSDHandle, LoadParams
+from .base import (BackendUnavailable, CleanupParams, CleanupReport, EBSDData, EBSDHandle, GrainParams,
+                   GrainsData, GrainsHandle, LoadParams, MapParams, RenderSpec)
 
 MATLAB_DIR = REPO_ROOT / "matlab"
 
@@ -120,6 +121,99 @@ class MatlabBackend:
         return EBSDData(d["x"], d["y"], phase, d["quat"], props, phase_names,
                         "hex" if bool(info["isHex"]) else "square", float(info["stepUm"]),
                         int(info["setting"]))
+
+    def cleanup(self, handle: EBSDHandle, p: CleanupParams) -> tuple[EBSDHandle, CleanupReport]:
+        d = p.model_dump()
+        d["ci_threshold"] = float("nan") if p.ci_threshold is None else float(p.ci_threshold)
+        d = {k: (float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in d.items()}
+        new_id, rep = self.call("ti64.cleanup", handle.id, d, nargout=2)
+        rep = {k: int(v) for k, v in dict(rep).items()}
+        return EBSDHandle(self.name, str(new_id), rep["n_points"]), CleanupReport(**rep, params=p)
+
+    def _h5(self, fn: str, *args) -> dict:
+        """Call a MATLAB exporter that writes an HDF5 file; return its datasets (1-D squeezed)."""
+        import h5py  # noqa: PLC0415
+
+        fd, tmp = tempfile.mkstemp(suffix=".h5", prefix="ti64_")
+        os.close(fd)
+        os.remove(tmp)
+        try:
+            self.call(fn, *args, tmp, nargout=0)
+            with h5py.File(tmp, "r") as f:
+                d = {k: f[k][()] for k in f.keys()}
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        return {k: (v.ravel() if v.ndim == 2 and min(v.shape) == 1 else v) for k, v in d.items()}
+
+    def calc_grains(self, handle: EBSDHandle, gp: GrainParams) -> GrainsHandle:
+        p = {k: float(v) for k, v in gp.model_dump().items()}
+        gid, n = self.call("ti64.calcGrains", handle.id, p, nargout=2)
+        return GrainsHandle(self.name, str(gid), int(n))
+
+    def get_grains(self, gh: GrainsHandle) -> GrainsData:
+        d = self._h5("ti64.exportGrains", gh.id)
+        ints = {"id", "phase", "n_px", "grain1", "grain2", "phase1", "phase2", "burgers_type"}
+        conv = {"is_edge": bool, "inner": bool}
+
+        def cast(k, v):
+            base = k.split("_", 1)[1] if k.startswith(("grain_", "gb_")) else k
+            if base in conv:
+                return v.astype(bool)
+            if base in ints:
+                return v.astype(np.int64)
+            return v
+        grain = {k[6:]: cast(k, v) for k, v in d.items() if k.startswith("grain_")}
+        gb = {k[3:]: cast(k, v) for k, v in d.items() if k.startswith("gb_")}
+        return GrainsData(d["pixel_grain_id"].astype(np.int64), grain, gb)
+
+    def compute_map(self, gh: GrainsHandle, mp: MapParams) -> np.ndarray:
+        p = {k: (float(v) if isinstance(v, (int, float)) else v) for k, v in mp.model_dump().items()}
+        return self._h5("ti64.computeMap", gh.id, p)["values"].astype(float)
+
+    @staticmethod
+    def _num(values) -> object:
+        """Python list -> MATLAB numeric row (a plain list would arrive as a cell array)."""
+        import matlab  # noqa: PLC0415
+
+        return matlab.double([float(c) for c in values])
+
+    def ipf_colors(self, handle, phase: str, key: str, vec) -> np.ndarray:
+        v = self._num(vec)
+        return self._h5("ti64.ipfColors", handle.id, phase, key, v)["rgb"].astype(float).reshape(-1, 3)
+
+    def render(self, handle, spec: RenderSpec, out_png):
+        import h5py  # noqa: PLC0415
+
+        fd, tmp = tempfile.mkstemp(suffix=".h5", prefix="ti64_r_")
+        os.close(fd)
+        try:
+            with h5py.File(tmp, "w") as f:
+                if spec.rgb is not None:
+                    f["rgb"] = np.asarray(spec.rgb, float)          # (n,3); MATLAB reads (3,n) -> transposes
+                else:
+                    f["values"] = np.asarray(spec.values, float)
+                if spec.seg is not None and len(spec.seg["x1"]):
+                    f["seg"] = np.stack([spec.seg[k] for k in ("x1", "y1", "x2", "y2")], 1).astype(float)
+                    f["seg_rgb"] = np.asarray(spec.seg_rgb, float).reshape(-1, 3)
+            o = {"cmap": spec.cmap, "clim": self._num(spec.clim if spec.clim else [float("nan")] * 2),
+                 "colorbar_label": spec.colorbar_label, "seg_width": float(spec.seg_width), "title": spec.title,
+                 "width_cm": float(spec.width_cm), "dpi": float(spec.dpi), "scale_bar": bool(spec.scale_bar),
+                 "legend_labels": [l for l, _ in spec.legend],
+                 "legend_rgb": self._num([c for _, rgb in spec.legend for c in rgb])}
+            out_png = Path(out_png)
+            out_png.parent.mkdir(parents=True, exist_ok=True)
+            self.call("ti64.render", handle.id, tmp, str(out_png), o, nargout=0)
+        finally:
+            os.remove(tmp)
+        return out_png
+
+    def render_key(self, handle, phase: str, key: str, vec, out_png, dpi: int = 300):
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        self.call("ti64.renderKey", handle.id, phase, key, self._num(vec), str(out_png), float(dpi),
+                  nargout=0)
+        return out_png
 
     def release(self, handle: EBSDHandle) -> None:
         if self.running:

@@ -3,8 +3,13 @@
     step = run(project, op, params)            # executes, writes outputs, appends to recipe.json
     report = replay(project)                   # re-runs all steps in a scratch project, compares outputs
 
-Operations (phase 1): sample.set, ebsd.load, up2.header, bse.load.
-Backend-dependent ops use the project's backend (Settings) unless `backend=` overrides it.
+Operations: sample.set, ebsd.load, up2.header, bse.load (here) and the EBSD operations in
+ops_ebsd.py (cleanup, grains, maps, figures). Backend-dependent ops use the project's backend
+(Settings) unless `backend=` overrides it.
+
+Objects (maps, grains) stay inside the backend; SESSION remembers which backend object belongs to
+which recipe step. If it is gone (new process, other backend), materialize() rebuilds it by re-running
+the steps it depends on, without recording them again.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ from pydantic import BaseModel
 from . import __version__
 from .backends import get_backend
 from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, LoadParams
-from .hashing import array_hash, file_fingerprint, json_hash, npz_hash
+from .hashing import array_hash, file_fingerprint, json_hash, npz_hash, png_hash
 from .io import bse as bse_io
 from .io import up2 as up2_io
 from .project import Project, write_json
@@ -49,6 +54,17 @@ class OpContext:
     def output(self, name: str, kind: str, value: Any) -> None:
         self.outputs[name] = (kind, value)
 
+    def remember(self, handle: Any) -> None:
+        """Keep the backend object produced by this step for later steps."""
+        SESSION[(str(self.project.root), self.step.id, self.backend.name)] = handle
+
+    def use(self, step_id: str, output: str = "ebsd") -> Any:
+        """Backend object of an earlier step (rebuilt if needed); recorded as an input."""
+        ref = f"{step_id}:{output}"
+        if ref not in self.step.inputs:
+            self.step.inputs.append(ref)
+        return materialize(self.project, step_id, self.backend.name)
+
 
 @dataclass
 class OpSpec:
@@ -68,8 +84,8 @@ def op(name: str, params: type[BaseModel], uses_backend: bool):
     return deco
 
 
-# handles of objects that are still alive in a backend session: (project root, step id) -> handle
-SESSION: dict[tuple[str, str], EBSDHandle] = {}
+# backend objects still alive: (project root, step id, backend) -> handle
+SESSION: dict[tuple[str, str, str], Any] = {}
 
 
 # ---- operations -------------------------------------------------------------------------------
@@ -106,7 +122,7 @@ def _ebsd_load(ctx: OpContext) -> None:
     t1 = time.perf_counter()
     data = ctx.backend.get_ebsd(h)
     t2 = time.perf_counter()
-    SESSION[(str(ctx.project.root), ctx.step.id)] = h
+    ctx.remember(h)
     ctx.metrics.update(load_s=round(t1 - t0, 2), transfer_s=round(t2 - t1, 2), n_points=data.n)
     ctx.output("ebsd", "npz", data)
     ctx.output("meta", "json", {**data.meta(), "input_state": sheet.input_state, "map_id": p.map_id})
@@ -156,6 +172,11 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any) -> OutputRef
         path = ctx.out_dir / f"{name}.json"
         write_json(path, value)
         h = json_hash(json.loads(path.read_text(encoding="utf-8")))
+    elif kind == "png":                       # value = path of a PNG written by the backend renderer
+        path = ctx.out_dir / f"{name}.png"
+        if Path(value) != path:
+            shutil.move(str(value), path)
+        h = png_hash(path)
     else:
         raise ValueError(kind)
     return OutputRef(path=str(path.relative_to(ctx.project.root).as_posix()), kind=kind, content_hash=h)
@@ -169,27 +190,36 @@ def _memory_GB() -> dict[str, float]:
     return out
 
 
+def _backend(project: Project, spec: OpSpec, backend: str | None):
+    if not spec.uses_backend:
+        return None
+    name = backend or project.info().backend
+    be = get_backend(name)
+    reason = be.unavailable_reason()
+    if reason:
+        raise BackendUnavailable(f"{name} backend unavailable: {reason}")
+    return be
+
+
 def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
-        backend: str | None = None, record: bool = True) -> RecipeStep:
-    """Execute one operation, write its outputs and (by default) append it to the recipe."""
+        backend: str | None = None, record: bool = True, step_id: str | None = None) -> RecipeStep:
+    """Execute one operation, write its outputs and (by default) append it to the recipe.
+    `step_id` is only given by replay, so references between steps stay valid."""
     if op_name not in OPS:
         raise KeyError(f"unknown operation {op_name!r}; known: {sorted(OPS)}")
     spec = OPS[op_name]
     params = params.model_dump(mode="json") if isinstance(params, BaseModel) else dict(params)
     params = spec.params.model_validate(params).model_dump(mode="json")
-    be = None
-    if spec.uses_backend:
-        name = backend or project.info().backend
-        be = get_backend(name)
-        reason = be.unavailable_reason()
-        if reason:
-            raise BackendUnavailable(f"{name} backend unavailable: {reason}")
+    be = _backend(project, spec, backend)
     step = RecipeStep(op=op_name, params=params, backend=be.name if be else None,
                       versions=be.versions() if be else {"app": __version__})
+    if step_id:
+        step.id = step_id
     ctx = OpContext(project, step, params, be, project.outputs_dir / step.id)
     t0 = time.perf_counter()
     try:
         spec.func(ctx)
+        step.params = ctx.params                 # ops record resolved values (e.g. source step, preset)
         step.outputs = {n: _write_output(ctx, n, k, v) for n, (k, v) in ctx.outputs.items()}
     except Exception:
         shutil.rmtree(ctx.out_dir, ignore_errors=True)
@@ -272,7 +302,7 @@ def replay(project: Project, backend: str | None = None, into: Path | None = Non
                 elif file_fingerprint(p) != inp.fingerprint:
                     changes.append(f"{s.id}: input changed: {p}")
         be = (backend or s.backend) if s.backend else None
-        new = run(scratch, s.op, s.params, backend=be)
+        new = run(scratch, s.op, s.params, backend=be, step_id=s.id)
         for name, ref in s.outputs.items():
             nref = new.outputs.get(name)
             if nref is None:
@@ -293,6 +323,36 @@ def replay(project: Project, backend: str | None = None, into: Path | None = Non
                         input_changes=changes)
 
 
+def materialize(project: Project, step_id: str, backend: str) -> Any:
+    """Backend object produced by an earlier step; rebuilt by re-running that step (and, through
+    ctx.use, its own sources) without recording it or writing outputs."""
+    key = (str(project.root), step_id, backend)
+    be = get_backend(backend)
+    h = SESSION.get(key)
+    if h is not None and h.id in be.handles():
+        return h
+    s = project.recipe().step(step_id)
+    ctx = OpContext(project, RecipeStep(op=s.op, params=dict(s.params), backend=backend), dict(s.params),
+                    be, project.cache_dir / "rebuild")
+    ctx.step.id = step_id
+    OPS[s.op].func(ctx)
+    if key not in SESSION:
+        raise RuntimeError(f"step {step_id} ({s.op}) does not produce a backend object")
+    return SESSION[key]
+
+
+def latest_step(project: Project, ops: tuple[str, ...], **match) -> RecipeStep | None:
+    """Most recent non-stale step whose op is in `ops` (earlier entries preferred) and whose params
+    contain the given values."""
+    steps = [s for s in project.recipe().steps if not s.stale
+             and all(s.params.get(k) == v for k, v in match.items())]
+    for o in ops:
+        hits = [s for s in steps if s.op == o]
+        if hits:
+            return hits[-1]
+    return None
+
+
 def verify_outputs(project: Project) -> list[str]:
     """Check that the stored output files still have their recorded content hashes."""
     bad = []
@@ -302,7 +362,8 @@ def verify_outputs(project: Project) -> list[str]:
             if not p.is_file():
                 bad.append(f"{s.id}:{name} missing")
                 continue
-            h = npz_hash(p) if ref.kind == "npz" else json_hash(json.loads(p.read_text(encoding="utf-8")))
+            h = (npz_hash(p) if ref.kind == "npz" else png_hash(p) if ref.kind == "png"
+                 else json_hash(json.loads(p.read_text(encoding="utf-8"))))
             if h != ref.content_hash:
                 bad.append(f"{s.id}:{name} changed")
     return bad
@@ -311,3 +372,6 @@ def verify_outputs(project: Project) -> list[str]:
 def ops_catalog() -> dict[str, dict]:
     return {n: {"doc": s.doc, "uses_backend": s.uses_backend, "params": s.params.model_json_schema()}
             for n, s in OPS.items()}
+
+
+from . import ops_ebsd  # noqa: E402,F401  (registers the EBSD operations)

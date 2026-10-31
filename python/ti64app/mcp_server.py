@@ -171,6 +171,84 @@ def load_bse(project: str, image: str, txt: str | None = None) -> dict[str, Any]
 
 
 @server.tool()
+def cleanup_map(project: str, map_id: str, overrides: dict[str, Any] | None = None,
+                backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Cleanup with the preset of the map's input state (raw: CI < 0.1 removed; OIM-cleaned: no CI
+    filter; both: EBSD_part2 noise removal at 3°, indexed grains <= 2 px and voids <= 4 px refilled).
+    overrides: ci_threshold, spike_removal, spike_angle_deg, noise_angle_deg, noise_max_indexed_px,
+    noise_max_void_px, fill, hq_filter, hq_alpha, hq_threshold_deg. The loaded map is not changed."""
+    p = _project(project)
+    step = service.run(p, "ebsd.cleanup", {"map_id": map_id, "overrides": overrides or {}}, backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "report": json.loads((p.root / step.outputs["report"].path).read_text())}
+
+
+@server.tool()
+def calc_grains(project: str, map_id: str, hagb_deg: float = 15.0, lagb_deg: float = 2.0,
+                burgers_tol_deg: float = 3.0, backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Alpha grains bounded by HAGB >= hagb_deg (LAGB lagb_deg..hagb_deg inside grains) on the newest
+    cleaned map; boundary lengths per class (LAGB, HAGB, alpha/beta interface, Burgers types 10.53 /
+    60 / 60.83 / 63.26 / 90° within burgers_tol_deg)."""
+    p = _project(project)
+    step = service.run(p, "grains.calc", {"map_id": map_id, "grains": {"hagb_deg": hagb_deg, "lagb_deg": lagb_deg},
+                                          "boundaries": {"burgers_tol_deg": burgers_tol_deg}}, backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "summary": json.loads((p.root / step.outputs["summary"].path).read_text())}
+
+
+@server.tool()
+def compute_map(project: str, map_id: str, kind: Literal["kam", "grod", "gos", "gnd"], kam_order: int = 1,
+                kam_threshold_deg: float = 5.0, gnd_stencil: Literal["1hop", "oneSided", "full"] = "1hop",
+                backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
+    """Per-pixel KAM (kernel order 1-3, cutoff in deg), GROD, GOS (deg) or GND (1/m^2, alpha:
+    basal/prismatic/pyramidal <a> + pyramidal <c+a>) inside the newest grains of the map."""
+    p = _project(project)
+    step = service.run(p, "map.compute", {"map_id": map_id, "kind": kind, "kam_order": kam_order,
+                                          "kam_threshold_deg": kam_threshold_deg, "gnd_stencil": gnd_stencil},
+                       backend=backend)
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "stats": json.loads((p.root / step.outputs["stats"].path).read_text())}
+
+
+@server.tool()
+def make_figure(project: str, map_id: str,
+                kind: Literal["ipf", "phase", "ci", "iq", "fit", "prias", "kam", "grod", "gos", "gnd",
+                              "boundaries", "burgers", "ipf_key"],
+                overlays: list[Literal["hagb", "lagb", "interface", "burgers"]] | None = None,
+                phases: list[str] | None = None,
+                direction: Literal["X", "Y", "Z", "build", "custom"] | None = None,
+                custom_vector: list[float] | None = None, key: str | None = None,
+                clim: list[float] | None = None) -> dict[str, Any]:
+    """Draw a map with the project backend; returns the PNG path. IPF key and direction default to
+    Settings per phase ('build' = build direction from the sample sheet). Fit/PRIAS report clearly
+    when the file does not contain them."""
+    p = _project(project)
+    params = {"map_id": map_id, "kind": kind, "overlays": overlays or [], "phases": phases,
+              "direction": direction, "custom_vector": custom_vector, "key": key, "clim": clim}
+    step = service.run(p, "figure", {k: v for k, v in params.items() if v is not None})
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "png": str(p.root / step.outputs["figure"].path),
+            "meta": json.loads((p.root / step.outputs["meta"].path).read_text())}
+
+
+@server.tool()
+def compare_with_oim(project: str, map_id: str, image: str, kind: Literal["ipf", "ci"] = "ipf",
+                     key: str = "ipfTSLKey", direction: Literal["X", "Y", "Z", "build"] = "Z") -> dict[str, Any]:
+    """Compare our IPF/CI map (from the LOADED, not cleaned, data) with an OIM image; all 8
+    flips/rotations are scored so a reference-frame mismatch is reported."""
+    p = _project(project)
+    step = service.run(p, "compare.oim", {"map_id": map_id, "image": image, "kind": kind, "key": key,
+                                          "direction": direction})
+    import json  # noqa: PLC0415
+
+    return {**_step_summary(step), "result": json.loads((p.root / step.outputs["result"].path).read_text())}
+
+
+@server.tool()
 def replay_project(project: str, backend: Literal["pymtex", "matlab"] | None = None) -> dict[str, Any]:
     """Re-run the project's recipe in a scratch copy and compare all outputs with the recorded ones."""
     rep = service.replay(_project(project), backend=backend)

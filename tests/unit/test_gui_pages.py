@@ -58,3 +58,22 @@ async def test_create_project_and_enter_sample_sheet(crop300_ju02):
     s = p.sample("JU02_c300")
     assert s.input_state == "oim_cleaned" and s.build_direction.unit_vector == (0.0, -1.0, 0.0)
     assert [st.op for st in p.recipe().steps] == ["sample.set"]
+
+
+@pytest.mark.anyio
+async def test_maps_page_runs_cleanup(crop300_ju02):
+    from ti64app import service
+    from tests.conftest import sample_params
+
+    p = Project.open_or_create("gui_maps")
+    service.run(p, "sample.set", sample_params(crop300_ju02))
+    service.run(p, "ebsd.load", {"map_id": "JU02_c300"})
+    async with user_simulation(main_file=MAIN) as user:
+        import sys
+        sys.modules["ti64app.gui.app"].STATE["project"] = "gui_maps"
+        await user.open("/maps")
+        await user.should_see("1 Cleanup")
+        await user.should_see("noise at 3°")
+        user.find("run_cleanup").click()
+        await user.should_see("cleanup done", retries=200)
+    assert [s.op for s in p.recipe().steps][-1] == "ebsd.cleanup"

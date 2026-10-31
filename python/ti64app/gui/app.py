@@ -1,4 +1,5 @@
-"""NiceGUI front end (localhost). Pages: Project (/), Sample sheet (/sample), Settings (/settings).
+"""NiceGUI front end (localhost). Pages: Project (/), Sample sheet (/sample), Maps (/maps),
+Settings (/settings).
 
 All actions go through ti64app.service (recorded in recipe.json), the same as the MCP tools.
 Run:  python -m ti64app.gui.app      -> http://127.0.0.1:8064
@@ -35,6 +36,7 @@ def _nav() -> None:
         ui.label("Ti64 EBSD/BSE").classes("text-lg font-bold")
         ui.link("Project", "/").classes("text-white")
         ui.link("Sample sheet", "/sample").classes("text-white")
+        ui.link("Maps", "/maps").classes("text-white")
         ui.link("Settings", "/settings").classes("text-white")
         p = current_project()
         ui.label(f"project: {p.name} ({p.info().backend})" if p else "no project open").classes("ml-auto")
@@ -284,8 +286,105 @@ def settings_page() -> None:
         ui.button("Save settings", on_click=save).mark("save_settings")
 
 
+# ---- Maps page (cleanup, grains, per-pixel maps, figures) -------------------------------------
+FIG_KINDS = ["ipf", "phase", "ci", "iq", "fit", "prias", "kam", "grod", "gos", "gnd", "boundaries", "burgers", "ipf_key"]
+
+
+def maps_page() -> None:
+    _nav()
+    p = current_project()
+    with ui.column().classes("p-4 gap-3 w-full max-w-6xl"):
+        if p is None:
+            ui.label("Open a project first.")
+            return
+        sheets = {s.map_id: s for s in p.samples()}
+        if not sheets:
+            ui.label("Enter a sample sheet and load a map first.")
+            return
+        mid = ui.select(list(sheets), value=next(iter(sheets)), label="Map").classes("w-64").mark("map")
+        out = ui.column()
+
+        async def do(op: str, params: dict, label: str):
+            n = ui.notification(f"{label} ({p.info().backend}) ...", spinner=True, timeout=None)
+            try:
+                step = await ng_run.io_bound(service.run, p, op, {"map_id": mid.value, **params})
+                ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
+                if "figure" in step.outputs or "comparison" in step.outputs:
+                    k = "figure" if "figure" in step.outputs else "comparison"
+                    out.clear()
+                    with out:
+                        ui.image(str(p.root / step.outputs[k].path)).classes("w-full max-w-4xl")
+                return step
+            except Exception as e:  # noqa: BLE001
+                _error(e)
+            finally:
+                n.dismiss()
+
+        with ui.expansion("1 Cleanup (preset from the input state)", value=True).classes("w-full"):
+            sh = sheets[mid.value]
+            ui.label(f"input state: {sh.input_state} — preset "
+                     f"{'CI < 0.1 removed, ' if sh.input_state == 'raw' else 'no CI filter, '}"
+                     "noise at 3°: indexed grains ≤ 2 px and voids ≤ 4 px refilled").classes("text-sm")
+            with ui.row().classes("items-end"):
+                ci = ui.number("CI threshold (empty = preset)", value=None).classes("w-48")
+                spike = ui.checkbox("wild-spike removal")
+                hq = ui.checkbox("halfQuadraticFilter")
+
+            def cleanup_params():
+                ov = {}
+                if ci.value is not None:
+                    ov["ci_threshold"] = float(ci.value)
+                if spike.value:
+                    ov["spike_removal"] = True
+                if hq.value:
+                    ov["hq_filter"] = True
+                return {"overrides": ov}
+            ui.button("Run cleanup", on_click=lambda: do("ebsd.cleanup", cleanup_params(), "cleanup")).mark("run_cleanup")
+        with ui.expansion("2 Grains and boundaries").classes("w-full"):
+            with ui.row().classes("items-end"):
+                hagb = ui.number("HAGB [°]", value=15).classes("w-28")
+                lagb = ui.number("LAGB [°]", value=2).classes("w-28")
+                tol = ui.number("Burgers tolerance [°]", value=3).classes("w-40")
+            ui.button("Compute grains", on_click=lambda: do(
+                "grains.calc", {"grains": {"hagb_deg": hagb.value, "lagb_deg": lagb.value},
+                                "boundaries": {"burgers_tol_deg": tol.value}}, "grains")).mark("run_grains")
+        with ui.expansion("3 Orientation maps (KAM, GROD, GOS, GND)").classes("w-full"):
+            with ui.row().classes("items-end"):
+                kind = ui.select(["kam", "grod", "gos", "gnd"], value="kam", label="map").classes("w-28")
+                order = ui.select([1, 2, 3], value=1, label="KAM order").classes("w-28")
+                cut = ui.number("KAM cutoff [°]", value=5).classes("w-32")
+            ui.button("Compute", on_click=lambda: do(
+                "map.compute", {"kind": kind.value, "kam_order": order.value, "kam_threshold_deg": cut.value},
+                kind.value.upper())).mark("run_map")
+        with ui.expansion("4 Figure", value=True).classes("w-full"):
+            with ui.row().classes("items-end"):
+                fk = ui.select(FIG_KINDS, value="ipf", label="figure").classes("w-32").mark("fig_kind")
+                ov = ui.select(["hagb", "lagb", "interface", "burgers"], multiple=True, value=[],
+                               label="overlays").classes("w-64")
+                dirn = ui.select(["(Settings)", "X", "Y", "Z", "build"], value="(Settings)",
+                                 label="IPF direction").classes("w-36")
+                ph = ui.select(["Ti (alpha)", "Ti (beta)"], multiple=True, value=[], label="phases").classes("w-56")
+
+            def fig_params():
+                d = {"kind": fk.value, "overlays": ov.value or []}
+                if dirn.value != "(Settings)":
+                    d["direction"] = dirn.value
+                if ph.value:
+                    d["phases"] = ph.value
+                return d
+            ui.button("Draw", on_click=lambda: do("figure", fig_params(), f"figure {fk.value}")).mark("run_figure")
+        with ui.expansion("5 Compare with an OIM image").classes("w-full"):
+            with ui.row().classes("items-end"):
+                img = ui.input("OIM image (data/reference/...)").classes("w-96")
+                ck = ui.select(["ipf", "ci"], value="ipf", label="kind").classes("w-24")
+            ui.button("Compare", on_click=lambda: do("compare.oim", {"image": img.value, "kind": ck.value},
+                                                     "OIM comparison"))
+        out
+
+
 def build() -> None:
     ui.page("/")(project_page)
+    ui.page("/maps")(maps_page)
     ui.page("/sample")(sample_page)
     ui.page("/settings")(settings_page)
 

@@ -16,7 +16,8 @@ def test_mcp_tools_registered():
 
     names = {t.name for t in asyncio.run(mcp_server.server.list_tools())}
     assert {"list_backends", "set_backend", "create_project", "set_sample_sheet", "get_sample_sheet",
-            "load_map", "read_up2_header", "load_bse", "replay_project"} <= names
+            "load_map", "read_up2_header", "load_bse", "replay_project", "cleanup_map", "calc_grains",
+            "compute_map", "make_figure", "compare_with_oim"} <= names
 
 
 def test_mcp_sample_sheet_and_load(projects_dir, crop300_ju02):
