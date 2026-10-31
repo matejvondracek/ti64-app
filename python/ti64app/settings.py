@@ -8,6 +8,7 @@ See settings.example.toml. Missing files are not an error; paths are then empty.
 """
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from pathlib import Path
@@ -69,11 +70,34 @@ def find_settings_file() -> Path | None:
     return next((p for p in settings_file_candidates() if p.is_file()), None)
 
 
+def preferences_path() -> Path:
+    """User preferences written by the Settings page (default backend, figure style), JSON.
+    TI64_PREFS overrides the location (tests)."""
+    if os.environ.get("TI64_PREFS"):
+        return Path(os.environ["TI64_PREFS"])
+    base = os.environ.get("APPDATA") or str(Path.home() / ".config")
+    return Path(base) / "ti64app" / "preferences.json"
+
+
 def load_settings(path: Path | None = None) -> Settings:
-    """Load machine settings; returns defaults if no settings file exists."""
+    """Machine paths from the TOML settings file + preferences saved by the Settings page.
+    Returns defaults if neither exists."""
     path = path or find_settings_file()
-    if path is None:
-        return Settings()
-    with open(path, "rb") as fh:
-        data = tomllib.load(fh)
+    data: dict = {}
+    if path is not None:
+        with open(path, "rb") as fh:
+            data = tomllib.load(fh)
+    prefs = preferences_path()
+    if prefs.is_file():
+        p = json.loads(prefs.read_text(encoding="utf-8"))
+        data.update({k: v for k, v in p.items() if k in ("backend", "figure")})
     return Settings.model_validate(data)
+
+
+def save_preferences(settings: Settings) -> Path:
+    """Save the user-editable part (backend, figure style); machine paths stay in the TOML file."""
+    p = preferences_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(settings.model_dump(mode="json", include={"backend", "figure"}), indent=1),
+                 encoding="utf-8")
+    return p

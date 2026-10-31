@@ -44,3 +44,22 @@ def full_map(request) -> Path:
 @pytest.fixture
 def up2_file() -> Path:
     return _one(DATA, "*.up2")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_user_state(tmp_path_factory, monkeypatch):
+    """Never write the user's real preferences or projects/ from tests."""
+    monkeypatch.setenv("TI64_PREFS", str(tmp_path_factory.mktemp("prefs") / "preferences.json"))
+    monkeypatch.setenv("TI64_PROJECTS_DIR", str(tmp_path_factory.mktemp("projects")))
+
+
+@pytest.fixture
+def project(tmp_path):
+    from ti64app.project import Project
+
+    return Project.create("t", base=tmp_path)
+
+
+def sample_params(map_file: Path, map_id: str = "JU02_c300", angle: float = 270.0) -> dict:
+    return {"map_id": map_id, "specimen_id": "EBMX-1", "map_file": str(map_file),
+            "input_state": "oim_cleaned", "build_direction": {"angle_deg": angle}}

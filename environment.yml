@@ -27,5 +27,8 @@ dependencies:
       - nicegui==3.18.0
       - mcp==2.3.0
       - pytest==9.2.0
+      - anyio==4.15.1            # pytest plugin for the NiceGUI page tests
+      - httpx==0.28.1
+      - numba==0.68.1
       - setuptools==84.2.1
       - matlabengine==25.2.2

@@ -14,10 +14,32 @@
 - Microstructure: um and deg; stress: MPa (CLAUDE.md). Specimen geometry for 4-point bending is entered in mm
   and the load in N, because that is how bend specimens and test machines report them. Field names
   carry the unit (`outer_span_mm`, `load_N`, ...) so nothing is converted silently.
-- Status: assumption, change it if you prefer um everywhere.
+- Status: **confirmed by the user** (2026-10-31).
 
 ## D3 (2026-10-31) Machine-specific paths
 - MTEX folder, MATLAB root and the literature folder are machine settings, read from `TI64_SETTINGS`,
   `settings.local.toml` (git-ignored) or `%APPDATA%\ti64app\settings.toml`, in that order
   (template: `settings.example.toml`). MATLAB uses the same lookup in `ti64.readSettings`; `ti64.setupMtex`
   adds MTEX to the path from it. Analysis settings stay in each project's recipe.
+
+## D4 (2026-10-31) Build direction: required, map frame, angle convention
+- Every map needs a sample sheet with a build direction before it can be loaded; the app never guesses it.
+- Given either as a 3-vector in MAP coordinates or as an in-plane angle measured from map +x toward map +y
+  (map loaded with setting 2: x right, y down, so positive angles turn clockwise on screen). Confirmed by
+  the user. Example: JU02 (thesis EBMX), S = −y → 270°.
+
+## D5 (2026-10-31) JEOL BSE metadata: parser not yet verified
+- No JSM-IT500HR image + .txt pair is available yet. `io/bse.py` follows the JEOL `$CM_…/$SM_…` text format,
+  accepts common key aliases, takes the pixel size from an explicit pixel-size key or from
+  SM_MICRON_MARKER / SM_MICRON_BAR (rescaled by CM_FULL_SIZE / image width), and records which keys
+  were used. Tested on a synthetic file only (`verified_format = False`). Check against a real file
+  before using pixel size or stage coordinates for registration.
+
+## D6 (2026-10-31) Recipe reproducibility
+- Outputs carry a CONTENT hash (array names/dtypes/shapes/bytes, canonical JSON), not a file hash, so
+  container details (zip timestamps) do not matter. Inputs carry a fingerprint (size + first/last 4 MB).
+- `replay` re-runs all non-stale steps in a scratch project (projects/<name>/cache/replay_*): same backend →
+  outputs must be identical; with a backend override, arrays are accepted within tolerance (floats
+  rtol 1e-6 / atol 1e-5, orientations ≤ 1e-3° up to quaternion sign).
+- Changing a sample sheet marks all steps of that map stale; switching the project backend marks all
+  backend steps stale.
