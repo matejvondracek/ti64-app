@@ -263,3 +263,35 @@
 - Prior-β boundaries are drawn black at 2x the boundary line width (EBSD_part2 draws them black); HAGB black 1x.
 - Playwright: `scripts/gui_screenshots.py` clicks through every page and panel (44 screenshots);
   `tests/integration/test_gui_playwright.py` (slow) runs it. NiceGUI markers are mirrored to `data-testid`.
+
+## D16 (2026-11-01) MCP tools, `ti64 run`, compare backends (phase 6)
+
+- **Tool surface.** One dedicated tool per service operation (map `TOOL_FOR_OP`, the test fails when an op has no
+  tool) plus `run_operation(op, params)` for anything by name. Nested inputs reuse the service-layer pydantic models
+  or are derived from them at import time (all fields optional for overrides; same fields minus `map_id` for
+  options), so defaults and types are defined once. Fields the caller did not set are not sent on (`exclude_unset`),
+  so the op's preset / defaults still apply and the recipe records only what was chosen.
+- **Stdio safety.** mcp 2.3 diverts fd 1 while serving, but only best effort; when it falls back it serves the wire
+  through `sys.stdout`. pymtex's `calcParent2Child` prints its OR scan with `print()` in cp1252 ("124.40°"), which
+  broke one demo run (`UnicodeDecodeError` in the client). The server now owns the wire: private duplicates of fd 0/1
+  carry the protocol; fd 1 and `sys.stdout` go to stderr, fd 0 / `sys.stdin` to NUL (a child process inheriting the
+  wire's stdin pipe hangs on Windows while the reader thread blocks in `ReadFile`). Tested with print, raw fd writes
+  and child-process output over real stdio.
+- **Compare backends runs in a scratch copy** (`cache/compare_<step>/`: state files copied, step outputs
+  hard-linked), not in the project itself: two backends' steps in one recipe would change the "newest step"
+  defaults, and recon / grain-size figures refuse a backend that did not compute the result (D13). The second engine
+  uses the step references the first one resolved. Backend objects of the scratch project are released and the
+  folder is deleted unless `keep_scratch`. The project recipe gets one `compare.backends` step (recorded, replayable).
+- **What is compared.** Every number (and short string) of the op's JSON outputs, flattened (lists of at most 12
+  values), with abs / rel difference; no pass / fail here (tolerances live in the conformance tests); > 1 % flagged
+  in GUI / MCP. Run time / RAM go to the step metrics (not compared on replay). Figures: each engine's own PNG (data
+  ops get a quick-look figure: IPF / parent IPF / value map / ECD histogram, `figure_kind` to choose); the montage
+  scales the two to equal height for display only and uses matplotlib's bundled DejaVu Sans (the system font lookup
+  depended on the environment and made replays differ).
+- **`ti64 run recipe.json`** = `service.run_recipe` (replay is the same function into a scratch project): step ids
+  kept so references stay valid; ids already in the target are refused; hand-written steps need only op + params
+  (backend = project backend); stale steps skipped unless `--include-stale`; recorded content hashes compared
+  (tolerance checks when the recorded project folder is next to the recipe). Relative map paths in `sample.set`
+  are resolved against the working directory and recorded absolute.
+- **Registration** in Claude Code is machine-local (`claude mcp add ti64 --scope local ...`): the command contains
+  this machine's env path and the repository is public, so no `.mcp.json` is committed.

@@ -1,5 +1,6 @@
 """GUI pages added in phase 5: project browser (/), recipe history with undo / redo / replay (/recipe),
 parameter panels for every operation (/ops) and the full Settings page (/settings).
+Phase 6: compare backends (/compare) and running a recipe file (on /recipe).
 The analysis pages (sample sheet, maps, reconstruction, grain size) stay in app.py, the viewer in viewer.py."""
 from __future__ import annotations
 
@@ -219,6 +220,27 @@ def recipe_page(current_project, nav, error) -> None:
                 finally:
                     n.dismiss()
             ui.button("Replay", icon="replay", on_click=do_replay).mark("replay")
+        with ui.row().classes("items-end gap-2"):
+            rfile = ui.input("run a recipe file into this project (path to recipe.json)").classes(
+                "w-[36rem]").mark("run_recipe_file")
+
+            async def do_run_file():
+                n = ui.notification("running recipe ...", spinner=True, timeout=None)
+                try:
+                    from pathlib import Path  # noqa: PLC0415
+
+                    f = Path(rfile.value.strip().strip('"'))
+                    steps = service.load_recipe_file(f)
+                    rec = f.parent if (f.parent / "project.json").is_file() else None
+                    rep = await ng_run.io_bound(service.run_recipe, p, steps, be.value or None, stale.value, None, rec)
+                    ui.notify(f"{len(rep.steps)} steps run" + ("" if rep.ok else " (some outputs differ from the recorded ones)"),
+                              type="positive" if rep.ok else "warning")
+                    ui.navigate.to("/recipe")
+                except Exception as e:  # noqa: BLE001
+                    error(e)
+                finally:
+                    n.dismiss()
+            ui.button("Run recipe file", icon="playlist_play", on_click=do_run_file).mark("run_recipe")
 
 
 # ---- generic parameter panels -------------------------------------------------------------------------
@@ -338,6 +360,105 @@ def ops_page(current_project, nav, error) -> None:
             finally:
                 n.dismiss()
         ui.button("Run", icon="play_arrow", on_click=run_op).mark("ops_run")
+
+
+# ---- compare backends ---------------------------------------------------------------------------------
+def compare_table_rows(table: dict, only_diff: bool = False) -> list[dict]:
+    """Rows of a compare.backends table for display (numbers rounded, > 1 % flagged)."""
+    def f(v):
+        return f"{v:.6g}" if isinstance(v, float) else ("" if v is None else str(v))
+    rows = []
+    for r in table["rows"]:
+        flag = (r["rel_diff"] or 0) > 0.01 or (r["rel_diff"] is None and not r["same"])
+        if only_diff and r["same"]:
+            continue
+        rows.append({"key": r["key"], "a": f(r["a"]), "b": f(r["b"]), "abs_diff": f(r["abs_diff"]),
+                     "rel_diff": "" if r["rel_diff"] is None else f"{100 * r['rel_diff']:.3g} %",
+                     "flag": "> 1 %" if flag else ""})
+    return rows
+
+
+def compare_page(current_project, nav, error) -> None:
+    """Run one operation on both backends: numbers side by side and both figures (each from its own engine)."""
+    from ..ops_compare import comparable_ops  # noqa: PLC0415
+
+    nav()
+    p = current_project()
+    with ui.column().classes("p-4 gap-3 w-full max-w-7xl"):
+        if p is None:
+            ui.label("Open a project first.")
+            return
+        status = backend_status()
+        if any(status.values()):
+            ui.label("compare needs both backends: " + "; ".join(f"{k}: {v}" for k, v in status.items() if v)
+                     ).classes("text-orange-700")
+        ui.label("Compare backends: one step on pymtex and MATLAB (scratch copy; the project recipe gets one "
+                 "compare step). Numbers are compared, figures shown side by side.").classes("text-md font-bold")
+        maps = [s.map_id for s in p.samples()]
+        with ui.row().classes("items-end gap-2"):
+            sel = ui.select(comparable_ops(), value="recon.run", label="operation").classes("w-56").mark("cmp_op")
+            mid = ui.select(maps, value=maps[0] if maps else None, label="map").classes("w-56").mark("cmp_map")
+            fk = ui.input("figure kind (optional)").classes("w-48").mark("cmp_figkind")
+            only = ui.checkbox("only differing values")
+        form = ui.column().classes("w-full gap-1").mark("cmp_form")
+        out = ui.column().classes("w-full")
+        state = {"collect": None, "table": None, "files": {}, "metrics": {}}
+
+        def build():
+            spec = service.OPS[sel.value]
+            form.clear()
+            with form:
+                ui.label(spec.doc).classes("text-xs text-gray-600 whitespace-pre-wrap")
+                state["collect"] = param_form(spec.params, {"map_id": mid.value} if mid.value else {})
+        sel.on_value_change(lambda _: build())
+        mid.on_value_change(lambda _: build())
+        build()
+
+        def show():
+            out.clear()
+            t = state["table"]
+            if not t:
+                return
+            a, b = t["backends"]
+            with out:
+                ui.label(f"{t['op']} on {t['map_id']}: {t['n_identical']}/{t['n_values']} values identical, "
+                         f"max relative difference {100 * t['max_rel_diff']:.3g} %").classes("font-bold").mark("cmp_result")
+                cols = [{"name": "key", "label": "value", "field": "key", "align": "left"},
+                        {"name": "a", "label": a, "field": "a"}, {"name": "b", "label": b, "field": "b"},
+                        {"name": "abs_diff", "label": f"{b} - {a}", "field": "abs_diff"},
+                        {"name": "rel_diff", "label": "rel.", "field": "rel_diff"},
+                        {"name": "flag", "label": "", "field": "flag"}]
+                ui.table(columns=cols, rows=compare_table_rows(t, only.value), pagination=25).props(
+                    "dense flat").classes("w-full").mark("cmp_table")
+                ui.label("run time / memory: " + ", ".join(f"{k} {v}" for k, v in state["metrics"].items())).classes("text-xs")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    for be in (a, b):
+                        f = state["files"].get(f"figure_{be}")
+                        with ui.column().classes("w-1/2"):
+                            ui.label(f"{be}: " + ", ".join(f"{k} {v}" for k, v in t["versions"][be].items())).classes("text-xs")
+                            if f:
+                                ui.image(f).classes("w-full")
+        only.on_value_change(lambda _: show())
+
+        async def do():
+            try:
+                params = state["collect"]()
+            except Exception as e:  # noqa: BLE001
+                error(e)
+                return
+            n = ui.notification(f"{sel.value} on both backends ...", spinner=True, timeout=None)
+            try:
+                step = await ng_run.io_bound(service.run, p, "compare.backends",
+                                             {"op": sel.value, "params": params, "figure_kind": fk.value or None})
+                state["table"] = json.loads((p.root / step.outputs["table"].path).read_text(encoding="utf-8"))
+                state["files"] = {k: str(p.root / r.path) for k, r in step.outputs.items()}
+                state["metrics"] = step.metrics
+                show()
+            except Exception as e:  # noqa: BLE001
+                error(e)
+            finally:
+                n.dismiss()
+        ui.button("Compare", icon="compare", on_click=do).mark("cmp_run")
 
 
 # ---- settings -------------------------------------------------------------------------------------------

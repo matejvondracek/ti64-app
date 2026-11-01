@@ -24,8 +24,9 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 | GUI | `python -m ti64app.gui` → http://127.0.0.1:8064 (or `ti64 gui [--project <name>] [--port <n>]`) |
 | Demo project / GUI click-through | `python scripts/make_demo_project.py [--map crop1000\|full] [--no-recon]`; `python scripts/gui_screenshots.py --project phase5_demo` (Playwright: `pip install playwright` + `python -m playwright install chromium`; screenshots in `projects/<p>/screenshots/`) |
 | Viewer / export timings | `python scripts/bench_viewer.py --project phase5_full --map JU02_full` |
-| MCP server | `python -m ti64app.mcp_server` (stdio) |
-| CLI | `ti64 backends`, `ti64 replay <project>` |
+| MCP server | `ti64 mcp` (stdio). Register in Claude Code (machine-local, not committed): `claude mcp add ti64 --scope local -- C:\Users\matej\miniforge3\envs\ti64\Scripts\ti64.exe mcp`; check with `claude mcp get ti64`; new tools appear in the next Claude Code session |
+| MCP demo (stdio client, both backends) | `python scripts/mcp_demo.py <map.ang> --angle <BD deg> [--map-id ID] [--prefix demo_mcp]` → projects `<prefix>_pymtex`, `<prefix>_matlab`, log `projects/<prefix>_log.json` |
+| CLI | `ti64 backends`, `ti64 ops`, `ti64 run <recipe.json> [--project P] [--backend B] [--include-stale] [--until ID] [--no-compare] [--json]`, `ti64 replay <project>` |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
 | Test crops | `python scripts/make_crops.py` (300×300 and 1000×1000 points, into `data/test/crops/`) |
 | Full-map check | `python scripts/run_phase2_full.py JU02 pymtex --angle 270`; reconstruction: `python scripts/run_phase3_full.py JU02 pymtex --angle 270 [--or-mode burgers] [--sweep]`; grain size: `python scripts/run_phase4_full.py JU02 pymtex --angle 270 [--hagb 5]` |
@@ -113,6 +114,25 @@ Machine paths (MTEX folder, MATLAB, literature) go in `settings.local.toml` (git
 | MCP | `get_annotations`, `set_annotations`, `crop_map`, `export_map`, `undo`, `redo`, `recipe_history`, `viewer_layers` |
 | Tests | `tests/unit/test_raster.py` (synthetic hex / square grids), `test_ops_export.py` (JU02 crop1000: layers, all export modes and formats, crop, undo / redo, replay, MCP), `test_gui_phase5.py` (simulated user: browser, viewer events, export, recipe undo / redo, op panels, settings), `tests/conformance/test_phase5.py` (colours, pixel-exact geometry, figure widths, SVG / PDF in both backends), `matlab/tests/ExportTest.m`, `tests/integration/test_gui_playwright.py` (slow, Playwright click-through) |
 
+### Phase 6 – MCP tools, resources, CLI, compare backends
+| Feature | Implementation |
+| --- | --- |
+| Every service operation has a dedicated MCP tool (`TOOL_FOR_OP`, test-checked) plus `run_operation` / `list_operations` for any op by name; 39 tools | `mcp_server.py` |
+| Typed inputs: nested params are the service-layer pydantic models (`ReconParams`, `LayerParams`) or models derived from them without copying fields (`CleanupOverrides`, `GrainSizeOptions`, `ExportOptions`, `FigurePatch`, `AnnotationIn`); only the generic `params` of `run_operation` / `compare_backends` stay dicts (validated by the op's model) | `mcp_server._options`, `_partial`, `_set` |
+| New tools: `compare_backends`, `run_recipe`, `run_operation`, `list_operations`, `get_step`, `verify_outputs`, `set_figure_settings`; tools refuse unknown projects instead of creating them (except `set_sample_sheet`, `run_recipe`) | `mcp_server.py` |
+| Resources: `ti64://settings`, `ti64://backends`, `ti64://operations`, `ti64://projects`, `ti64://projects/{project}` (state + undo / redo), `.../recipe` (recipe.json), `.../steps/{step_id}`, `.../samples/{map_id}` | `mcp_server.py` |
+| Stdio safety: protocol on private duplicates of fd 0 / 1; fd 1 and `sys.stdout` → stderr, fd 0 → NUL (pymtex prints the OR scan in cp1252, which corrupted the stream) | `mcp_server._private_wire` (decisions D16) |
+| `ti64 run recipe.json`: runs a project's recipe.json or a hand-written list of `{op, params[, backend]}` steps into a (new) project, keeps step ids, compares recorded outputs; relative map paths resolved against the working directory and recorded absolute. Replay is the same function into a scratch project | `service.run_recipe`, `load_recipe_file`, `replay`; `cli.py`; GUI `/recipe` "Run recipe file"; MCP `run_recipe` |
+| Compare backends: one backend op on pymtex AND MATLAB in a scratch copy of the project, every number of its JSON outputs side by side (abs / rel difference, > 1 % flagged), both figures (each from its own engine) + side-by-side montage; one `compare.backends` step in the project recipe | op `compare.backends` (`ops_compare.py`); GUI `/compare`; MCP `compare_backends` |
+| Tests | `tests/unit/test_phase6.py` (tool coverage, typed schemas, protocol chain + resources via in-memory client, `ti64 run` of project and hand-written recipes, compare helpers), `test_mcp_stdio.py` (stray stdout over real stdio), `test_gui_phase6.py`, `tests/conformance/test_phase6.py` (compare cleanup via MCP, reconstruction on the three crop1000s) |
+
+Demo (2026-11-01, full JU02 map, BD 270°, OIM-cleaned, default parameters, `scripts/mcp_demo.py` over stdio):
+load → cleanup → `reconstruct_beta` → `recon_figure` → `export_map` (prior-β IPF + β GB, 120 mm, 300 dpi; native
+IPF ∥ BD) on both backends, then `compare_backends` on `recon.run`. Results reproduce D12: pymtex OR dev 1.01° →
+Burgers, 53 (796) grains, fit 3.57°, ECDaw 89.5 µm; MATLAB 0.97° → refined OR, 46 (708) grains, 3.36°, 94.4 µm;
+the compare table flags `or_used` burgers vs refined as the cause. Times: pymtex recon 20 s, MATLAB 78 s, compare
+109 s. `ti64 run projects/demo_mcp_pymtex/recipe.json` reproduced 21/21 recorded outputs (incl. the compare step).
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -149,9 +169,9 @@ Decisions to make:
 Technical:
 - [ ] Remove the pymtex GND workaround once pymtex fixes `fitDislocationSystems` (D9).
 - [ ] Cache loaded + cleaned maps per backend (CLAUDE.md; objects are currently rebuilt from the recipe).
-- [ ] "Compare backends" tool (one step on both backends, numbers and figures side by side).
 - [ ] MATLAB halfQuadraticFilter (`l1TVFilter`) is slow (~40× pymtex).
-- [ ] Phases 6–10 (MCP/CLI, 4PB, crack, .up2 re-indexing, packaging).
+- [ ] Phases 7–10 (4PB, crack, .up2 re-indexing, packaging).
+- [ ] Renderer scale bars differ (pymtex 25 µm vs MATLAB 50 µm on the same full-map recon figure); harmonise the scale-bar length rule.
 
 Phase 5 open points:
 - [ ] Pixel-exact exports: colours come from the backend, the pixel layout and line rasterisation from shared Python

@@ -52,7 +52,8 @@ def _nav() -> None:
 
 
 NAV = [("Projects", "/"), ("Viewer", "/viewer"), ("Sample sheet", "/sample"), ("Maps", "/maps"),
-       ("Reconstruction", "/recon"), ("Grain size", "/grainsize"), ("Operations", "/ops"), ("Recipe", "/recipe"),
+       ("Reconstruction", "/recon"), ("Grain size", "/grainsize"), ("Operations", "/ops"),
+       ("Compare backends", "/compare"), ("Recipe", "/recipe"),
        ("Settings", "/settings")]
 
 
@@ -546,6 +547,7 @@ def build() -> None:
     ui.page("/sample")(sample_page)
     ui.page("/ops")(lambda: pages.ops_page(current_project, _nav, _error))
     ui.page("/recipe")(lambda: pages.recipe_page(current_project, _nav, _error))
+    ui.page("/compare")(lambda: pages.compare_page(current_project, _nav, _error))
     ui.page("/settings")(lambda: pages.settings_page(current_project, _nav, _error))
 
 

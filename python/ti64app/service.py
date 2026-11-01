@@ -100,6 +100,10 @@ def _sample_set(ctx: OpContext) -> None:
     """Store the sample sheet of one map (build direction, input state, 4PB, position)."""
     sheet = SampleSheet.model_validate(ctx.params)
     f = Path(sheet.map_file)
+    if not f.is_absolute():                  # recipes may use paths relative to the working directory
+        f = f.absolute()
+        sheet.map_file = str(f)
+        ctx.params["map_file"] = str(f)
     if not f.is_file():
         raise FileNotFoundError(f"map file not found: {f}")
     ctx.add_input(f)
@@ -304,16 +308,34 @@ class OutputCheck(BaseModel):
     detail: str = ""
 
 
-class ReplayReport(BaseModel):
-    replay_root: str
+class StepRun(BaseModel):
+    step_id: str
+    op: str
+    map_id: str | None = None
+    backend: str | None = None
+    seconds: float = 0.0
+
+
+class RunReport(BaseModel):
+    """Result of running a recipe into a project (ti64 run, MCP run_recipe) or of a replay."""
+    project_root: str
     backend_override: str | None
-    checks: list[OutputCheck]
-    input_changes: list[str]
+    steps: list[StepRun] = []
+    skipped: list[str] = []      # stale steps not run
+    checks: list[OutputCheck] = []
+    input_changes: list[str] = []
 
     @property
     def ok(self) -> bool:
         return not self.input_changes and all(c.status in ("identical", "within_tolerance", "not_compared")
                                               for c in self.checks)
+
+    @property
+    def replay_root(self) -> str:
+        return self.project_root
+
+
+ReplayReport = RunReport
 
 
 def _compare_npz(a: Path, b: Path) -> tuple[bool, str]:
@@ -363,53 +385,103 @@ def _compare_tables(a: Path, b: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def replay(project: Project, backend: str | None = None, into: Path | None = None,
-           include_stale: bool = False, until: str | None = None) -> ReplayReport:
-    """Re-run the recipe in a scratch project and compare every output with the recorded one.
-    Backend steps use the recorded backend unless `backend` overrides it; `until` stops after that step."""
-    recipe = project.recipe()
-    root = into or project.cache_dir / f"replay_{datetime.now():%Y%m%d_%H%M%S}"
-    if root.exists():
-        shutil.rmtree(root)
-    scratch = Project.create(root.name, base=root.parent, backend=project.info().backend)
-    checks: list[OutputCheck] = []
-    changes: list[str] = []
-    for s in recipe.steps:
-        if s.stale and not include_stale:
-            continue
+def load_recipe_file(path: str | Path) -> list[RecipeStep]:
+    """Steps of a recipe file: a project's recipe.json ({"steps": [...]}) or a bare list of steps. A hand-written
+    step needs only op and params; id, backend and recorded outputs are optional."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    steps = data["steps"] if isinstance(data, dict) else data
+    if not isinstance(steps, list):
+        raise ValueError(f"{path}: expected a recipe ({{'steps': [...]}}) or a list of steps")
+    return [RecipeStep.model_validate(st) for st in steps]
+
+
+def _check_output(name: str, ref: OutputRef, new: RecipeStep, s: RecipeStep, recorded_root: Path | None,
+                  root: Path) -> OutputCheck:
+    nref = new.outputs.get(name)
+    c = dict(step_id=s.id, op=s.op, output=name)
+    if nref is None:
+        return OutputCheck(**c, status="missing")
+    if nref.content_hash == ref.content_hash:
+        return OutputCheck(**c, status="identical")
+    if ref.kind in ("svg", "pdf"):
+        return OutputCheck(**c, status="not_compared",
+                           detail="vector file regenerated (renderer timestamps); its sidecar is compared")
+    old = recorded_root / ref.path if recorded_root else None
+    if old is None or not old.is_file():
+        return OutputCheck(**c, status="different", detail="content hash differs (recorded file not available)")
+    if ref.kind in ("npz", "csv", "xlsx"):
+        cmp = _compare_npz if ref.kind == "npz" else _compare_tables
+        ok, detail = cmp(old, root / nref.path)
+        return OutputCheck(**c, status="within_tolerance" if ok else "different", detail=detail)
+    if ref.kind == "json":
+        a = json.loads(old.read_text(encoding="utf-8"))
+        b = json.loads((root / nref.path).read_text(encoding="utf-8"))
+        diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) if isinstance(a, dict) else []
+        return OutputCheck(**c, status="different", detail=f"keys: {diff}")
+    return OutputCheck(**c, status="different", detail="content hash differs")
+
+
+def run_recipe(target: Project, steps: list[RecipeStep], backend: str | None = None,
+               include_stale: bool = False, until: str | None = None, recorded_root: Path | None = None,
+               compare: bool = True, on_step: Callable[[int, int, RecipeStep], None] | None = None) -> RunReport:
+    """Run recipe steps in order into `target` (each recorded there with its original id, so references between
+    steps stay valid). Backend steps use the recorded backend (or the target project's backend for hand-written
+    steps without one) unless `backend` overrides it. Recorded outputs (content hashes) are compared with the new
+    ones; `recorded_root` = the project the steps came from (for tolerance checks of differing arrays / tables).
+    Stale steps are skipped unless include_stale; `until` stops after that step id."""
+    known = {s.id for s in target.recipe().steps}
+    todo = [s for s in steps if include_stale or not s.stale]
+    clash = sorted(known & {s.id for s in todo})
+    if clash:
+        raise ValueError(f"step ids already in project {target.root.name}: {clash}; run into a new project")
+    for s in todo:
+        if s.op not in OPS:
+            raise KeyError(f"step {s.id}: unknown operation {s.op!r}")
+    rep = RunReport(project_root=str(target.root), backend_override=backend,
+                    skipped=[s.id for s in steps if s.stale and not include_stale])
+    for k, s in enumerate(todo):
         for inp in s.inputs:
             if isinstance(inp, FileInput):
                 p = Path(inp.path)
                 if not p.is_file():
-                    changes.append(f"{s.id}: input missing: {p}")
+                    rep.input_changes.append(f"{s.id}: input missing: {p}")
                 elif file_fingerprint(p) != inp.fingerprint:
-                    changes.append(f"{s.id}: input changed: {p}")
-        be = (backend or s.backend) if s.backend else None
-        new = run(scratch, s.op, s.params, backend=be, step_id=s.id)
-        for name, ref in s.outputs.items():
-            nref = new.outputs.get(name)
-            if nref is None:
-                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="missing"))
-            elif nref.content_hash == ref.content_hash:
-                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="identical"))
-            elif ref.kind in ("svg", "pdf"):
-                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="not_compared",
-                                          detail="vector file regenerated (renderer timestamps); its sidecar is compared"))
-            elif ref.kind in ("npz", "csv", "xlsx"):
-                cmp = _compare_npz if ref.kind == "npz" else _compare_tables
-                ok, detail = cmp(project.root / ref.path, scratch.root / nref.path)
-                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name,
-                                          status="within_tolerance" if ok else "different", detail=detail))
-            else:
-                a = json.loads((project.root / ref.path).read_text(encoding="utf-8"))
-                b = json.loads((scratch.root / nref.path).read_text(encoding="utf-8"))
-                diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) if isinstance(a, dict) else []
-                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="different",
-                                          detail=f"keys: {diff}"))
+                    rep.input_changes.append(f"{s.id}: input changed: {p}")
+        if on_step:
+            on_step(k, len(todo), s)
+        new = run(target, s.op, s.params, backend=backend or s.backend, step_id=s.id)
+        rep.steps.append(StepRun(step_id=new.id, op=new.op, map_id=new.params.get("map_id"), backend=new.backend,
+                                 seconds=new.metrics.get("seconds", 0.0)))
+        if compare:
+            rep.checks += [_check_output(n, ref, new, s, recorded_root, target.root) for n, ref in s.outputs.items()]
         if until and s.id == until:
             break
-    return ReplayReport(replay_root=str(scratch.root), backend_override=backend, checks=checks,
-                        input_changes=changes)
+    return rep
+
+
+def replay(project: Project, backend: str | None = None, into: Path | None = None,
+           include_stale: bool = False, until: str | None = None) -> RunReport:
+    """Re-run the recipe in a scratch project and compare every output with the recorded one.
+    Backend steps use the recorded backend unless `backend` overrides it; `until` stops after that step."""
+    root = into or project.cache_dir / f"replay_{datetime.now():%Y%m%d_%H%M%S}"
+    if root.exists():
+        shutil.rmtree(root)
+    scratch = Project.create(root.name, base=root.parent, backend=project.info().backend)
+    return run_recipe(scratch, project.recipe().steps, backend=backend, include_stale=include_stale, until=until,
+                      recorded_root=project.root)
+
+
+def release_project(project: Project) -> int:
+    """Forget (and release in the backends) all backend objects of a project, e.g. a scratch project. Returns how many."""
+    root = str(project.root)
+    keys = [k for k in SESSION if k[0] == root]
+    for k in keys:
+        h = SESSION.pop(k)
+        try:
+            get_backend(k[2]).release(h)
+        except Exception:  # noqa: BLE001  (already gone / engine restarted)
+            pass
+    return len(keys)
 
 
 def materialize(project: Project, step_id: str, backend: str) -> Any:
@@ -468,3 +540,4 @@ from . import ops_ebsd  # noqa: E402,F401  (registers the EBSD operations)
 from . import ops_recon  # noqa: E402,F401  (registers the reconstruction operations)
 from . import ops_grainsize  # noqa: E402,F401  (registers the grain-size operations)
 from . import ops_export  # noqa: E402,F401  (registers annotations, crop and export, phase 5)
+from . import ops_compare  # noqa: E402,F401  (registers compare.backends, phase 6)
