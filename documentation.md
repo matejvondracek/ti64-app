@@ -1,6 +1,6 @@
 # Ti64 EBSD/BSE analysis app – documentation
 
-State after phase 4 (2026-10-31). Details of decisions: `docs/decisions.md`; data facts:
+State after phase 5 (2026-11-01). Details of decisions: `docs/decisions.md`; data facts:
 `docs/data_audit.md`; timings and RAM: `docs/performance.md`; reconstruction method (phase 3):
 `docs/beta_reconstruction_method.md`.
 
@@ -21,7 +21,9 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 
 | What | Command (ti64 env: `C:\Users\matej\miniforge3\envs\ti64\python.exe`) |
 | --- | --- |
-| GUI | `python -m ti64app.gui` → http://127.0.0.1:8064 (or `ti64 gui`) |
+| GUI | `python -m ti64app.gui` → http://127.0.0.1:8064 (or `ti64 gui [--project <name>] [--port <n>]`) |
+| Demo project / GUI click-through | `python scripts/make_demo_project.py [--map crop1000\|full] [--no-recon]`; `python scripts/gui_screenshots.py --project phase5_demo` (Playwright: `pip install playwright` + `python -m playwright install chromium`; screenshots in `projects/<p>/screenshots/`) |
+| Viewer / export timings | `python scripts/bench_viewer.py --project phase5_full --map JU02_full` |
 | MCP server | `python -m ti64app.mcp_server` (stdio) |
 | CLI | `ti64 backends`, `ti64 replay <project>` |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
@@ -94,6 +96,23 @@ Machine paths (MTEX folder, MATLAB, literature) go in `settings.local.toml` (git
 | GUI / MCP | `gui/app.py` Grain size page (`/grainsize`); MCP tools `grain_size`, `grain_size_figure`, `compare_oim_grain_size` |
 | Tests | `tests/unit/test_grain_size.py` (synthetic rectangles / ellipses on square + hex grids, E112, log-normal), `test_ops_grainsize.py` (crop300 + crop1000 with reconstruction, tables, figures, OIM, MCP, replay), `test_gui_pages.py`, `tests/conformance/test_phase4.py` (3 crop300s + JU02 crop1000), `matlab/tests/GrainSizeTest.m` |
 
+### Phase 5 – GUI, map viewer, export
+| Feature | Implementation |
+| --- | --- |
+| Project browser (all projects: backend, maps, steps, stale, last change; per map the pipeline status and Load / View) | `gui/pages.py` `project_page` (`/`) |
+| Map viewer: zoom / pan (whole zoom levels), tiles for 2.6 M-point maps, scale bar, probe (point, phase, CI, IQ, quaternion, colour), distance / angle measurement | `gui/viewer.py` (`/viewer`), Vue component `gui/map_viewer.js` (NiceGUI's bundled Leaflet, flat CRS in µm, y down), tile routes `gui/tiles.py` (`/api/ti64/tiles`, `/api/ti64/overlay`, LRU cache) |
+| Pixel geometry shared by both backends: brick cell layout of hex / square grids, nearest-neighbour sampling, tiles with averaging, line rasterisation, segment index, PNG / TIFF with physical pixel size | `raster.py` (decisions D15) |
+| Layers coloured by the active backend: IPF (key + reference direction per phase), phase, CI, IQ, Fit, PRIAS, KAM, GROD, GOS, GND, prior-β IPF, reconstruction fit, variant / packet ID; colour key (backend IPF key image, colour bar, legend); cached on disk | `layers.py` (`LayerParams`, `get_layer`, `available`); backend method `measurement_colors` (pymtex `pymtex_plot.measurement_colors`; MATLAB `+ti64/valueColors.m`) |
+| Overlays HAGB / LAGB / α/β interface / Burgers types / prior-β GB / crack, line width | `ops_ebsd.overlay_segments` (also used by the `figure` op: new overlays `beta_gb`, `crack`), `layers.get_overlay` |
+| Annotations and ROIs (text, arrow, line, polyline, point, crack path, ROI rectangle / polygon) drawn on the map, recorded and undoable | `annotations.py`; op `annotations.set` |
+| Crop to an ROI → new map (`.ang` rows inside the ROI, coordinates kept, sample sheet copied) | op `ebsd.crop` (`ops_export.crop_ang`) |
+| Export: native (1 px / measurement), 2× / 4× / 8× nearest neighbour (PNG / TIFF, pixel size in tags + sidecar), or a figure exactly *w* mm wide at a DPI (PNG / TIFF / SVG / PDF, drawn by the backend), whole map / current view / ROI, overlays, annotations, scale bar, title, colour bar, legend, background; JSON sidecar with every parameter | op `export.map` (`ops_export.py`); `RenderSpec.exact / xlim / ylim / prims`; pymtex `pymtex_plot._save_exact`; MATLAB `+ti64/render.m` (`printExact`, `drawPrims`) |
+| Recipe history: step table, parameters / inputs / outputs, re-run with edited parameters, undo / redo (also in the header), replay (all / up to a step / other backend / incl. stale) | `gui/pages.py` `recipe_page` (`/recipe`); `history.py`; `service.undo / redo / switch_backend`, `replay(until=)` |
+| Parameter panels for every operation, generated from the op's pydantic model | `gui/pages.py` `ops_page` (`/ops`, `param_form`) |
+| Settings: backend, IPF key / direction / custom vector / key-in-figure per phase, figure style (colour maps, line width, colour, scale bar, width, DPI), machine paths (override the TOML file) | `gui/pages.py` `settings_page`; `settings.save_preferences(paths=)` |
+| MCP | `get_annotations`, `set_annotations`, `crop_map`, `export_map`, `undo`, `redo`, `recipe_history`, `viewer_layers` |
+| Tests | `tests/unit/test_raster.py` (synthetic hex / square grids), `test_ops_export.py` (JU02 crop1000: layers, all export modes and formats, crop, undo / redo, replay, MCP), `test_gui_phase5.py` (simulated user: browser, viewer events, export, recipe undo / redo, op panels, settings), `tests/conformance/test_phase5.py` (colours, pixel-exact geometry, figure widths, SVG / PDF in both backends), `matlab/tests/ExportTest.m`, `tests/integration/test_gui_playwright.py` (slow, Playwright click-through) |
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -132,4 +151,13 @@ Technical:
 - [ ] Cache loaded + cleaned maps per backend (CLAUDE.md; objects are currently rebuilt from the recipe).
 - [ ] "Compare backends" tool (one step on both backends, numbers and figures side by side).
 - [ ] MATLAB halfQuadraticFilter (`l1TVFilter`) is slow (~40× pymtex).
-- [ ] Phases 5–10 (GUI/export, MCP/CLI, 4PB, crack, .up2 re-indexing, packaging).
+- [ ] Phases 6–10 (MCP/CLI, 4PB, crack, .up2 re-indexing, packaging).
+
+Phase 5 open points:
+- [ ] Pixel-exact exports: colours come from the backend, the pixel layout and line rasterisation from shared Python
+      code (D15). Confirm, or port the layout to +ti64 so MATLAB draws them end to end.
+- [ ] Native export of a hex map has non-square pixels (0.2 × 0.1732 µm, declared in the file) and the shifted
+      rows half a pixel to the left (D15). Confirm this definition of "1 px per measurement".
+- [ ] Probe shows the quaternion, not Euler angles (convention to be checked against OIM before showing Euler).
+- [ ] Viewer: per-phase IPF keys of the view are passed to exports; the backend IPF key image shows one phase
+      at a time.

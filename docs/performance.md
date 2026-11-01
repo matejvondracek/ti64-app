@@ -60,3 +60,25 @@ OIM-cleaned preset, laths at 15° unless --hagb).
   grains, E112 width 21.90 / 21.91 um, length 20.83 / 20.84 um, calipers across / along BD 81.2 / 81.5 and
   95.8 / 96.1 um (area-weighted); retained beta 0.047 % loaded, 0.031 % after cleanup (pymtex / MATLAB).
 - Laths at 5° (pymtex): 19 170 alpha grains used (ECD 1.70 um), 2 483 merged into 16 935 colonies (1.77 um).
+
+## Phase 5 map viewer and export on the full JU02 map (2.6 M points)
+
+`python scripts/make_demo_project.py --name phase5_full --map full --no-recon`, then
+`python scripts/bench_viewer.py` (pymtex). MATLAB rows: same project, `backend="matlab"`.
+
+| Step | s | peak RAM (GB) |
+| --- | --- | --- |
+| layer IPF: backend colours + cell layout (first time) | 2.6 | 1.28 |
+| layer IPF again (disk cache, cache/viewer/) | 0.01 | 1.28 |
+| layer KAM | 0.28 | 1.28 |
+| base tile 256 x 256, overview (16 cells / px, 4 x 4 averaging) | 0.06 | |
+| base tile 1:1 / 8x zoomed in | 0.003 / 0.002 | |
+| HAGB overlay: segment index / tile at overview / tile at 1:1 | 0.15 / 0.21 / 0.004 | |
+| export native PNG + HAGB (1501 x 1733 px) | 1.6 | 1.29 |
+| export 2x TIFF + HAGB | 1.8 | 1.29 |
+| export figure 120 mm @ 600 DPI PNG + HAGB (2835 px wide) | 9.9 | 2.02 |
+| export figure 120 mm PDF + HAGB (vector boundary lines) | 32.2 | 2.52 |
+| MATLAB: layer IQ (valueColors) / layer IPF (incl. loading the map in MATLAB) | 4.1 / 8.6 | 0.67 (Python) |
+| MATLAB: export native PNG / figure 120 mm @ 600 DPI PNG | 2.2 / 9.7 | 0.67 (Python) |
+
+Tiles are cached (LRU, 3000 tiles); layer colours are cached on disk per layer, recipe state and figure style.

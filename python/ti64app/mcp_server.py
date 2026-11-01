@@ -60,7 +60,7 @@ def set_backend(backend: Literal["pymtex", "matlab"], project: str | None = None
     save_preferences(s)
     out: dict[str, Any] = {"ok": True, "default_backend": backend}
     if project:
-        out["stale_steps"] = _project(project).set_backend(backend)
+        out["stale_steps"] = service.switch_backend(_project(project), backend)
     return out
 
 
@@ -356,6 +356,98 @@ def replay_project(project: str, backend: Literal["pymtex", "matlab"] | None = N
     """Re-run the project's recipe in a scratch copy and compare all outputs with the recorded ones."""
     rep = service.replay(_project(project), backend=backend)
     return {"ok": rep.ok, **rep.model_dump(mode="json")}
+
+
+# ---- phase 5: annotations, crop, export, undo / redo ---------------------------------------------
+@server.tool()
+def get_annotations(project: str, map_id: str) -> list[dict[str, Any]]:
+    """Annotations and ROIs of a map (coordinates in um, map frame x right / y down)."""
+    from .annotations import load_annotations  # noqa: PLC0415
+
+    return [a.model_dump(mode="json") for a in load_annotations(_project(project), map_id)]
+
+
+@server.tool()
+def set_annotations(project: str, map_id: str, items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Replace the annotations / ROIs of a map (recorded, undoable). Each item: type (text, arrow, line,
+    polyline, point, crack, roi_rect, roi_poly), xy [[x, y], ...] in um, optional text (label / ROI name),
+    color '#rrggbb', width_pt, size_pt, export (bool). Crack paths are shown by the 'crack' overlay."""
+    items = [{**it, "map_id": map_id} for it in items]
+    step = service.run(_project(project), "annotations.set", {"map_id": map_id, "items": items})
+    return _step_summary(step)
+
+
+@server.tool()
+def crop_map(project: str, map_id: str, new_map_id: str, roi: list[float] | None = None,
+             roi_id: str | None = None) -> dict[str, Any]:
+    """Crop a map to an ROI (x0, y0, x1, y1 in um, or the id / name of an ROI annotation): writes the .ang rows
+    inside it to maps/<new_map_id>.ang in the project and a sample sheet copied from the parent. Then load_map it."""
+    params = {"map_id": map_id, "new_map_id": new_map_id, "roi": roi, "roi_id": roi_id}
+    step = service.run(_project(project), "ebsd.crop", {k: v for k, v in params.items() if v is not None})
+    return _step_summary(step)
+
+
+@server.tool()
+def export_map(project: str, map_id: str, kind: str = "ipf", overlays: list[str] | None = None,
+               mode: Literal["native", "scale", "width"] = "native", scale: Literal[2, 4, 8] = 2,
+               width_mm: float = 120.0, dpi: int = 600, format: Literal["png", "tiff", "svg", "pdf"] = "png",
+               roi: list[float] | None = None, roi_id: str | None = None, layer: dict[str, Any] | None = None,
+               options: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Export a map layer (kind: ipf, phase, ci, iq, kam, grod, gos, gnd, parent_ipf, recon_fit, variant, packet)
+    with overlays (hagb, lagb, interface, burgers, beta_gb, crack) and the map's annotations.
+    mode native = one pixel per measurement, scale = 2/4/8x nearest neighbour (PNG / TIFF, pixel size in the file
+    and the sidecar); width = figure width_mm wide at dpi drawn by the backend (PNG / TIFF / SVG / PDF).
+    layer: further LayerParams (direction, key, ipf_keys, clim, source steps); options: annotations, roi_outlines,
+    scale_bar, title, colorbar, legend, line_px, background, name. Returns the file, the JSON sidecar and its content."""
+    import json  # noqa: PLC0415
+
+    p = _project(project)
+    params = {"map_id": map_id, "layer": {"kind": kind, **(layer or {})}, "overlays": overlays or [], "mode": mode,
+              "scale": scale, "width_mm": width_mm, "dpi": dpi, "format": format, **(options or {})}
+    if roi is not None:
+        params["roi"] = roi
+    if roi_id is not None:
+        params["roi_id"] = roi_id
+    step = service.run(p, "export.map", params)
+    side = p.root / step.outputs["sidecar"].path
+    return {**_step_summary(step), "file": str(p.root / step.outputs["export"].path), "sidecar": str(side),
+            "meta": json.loads(side.read_text(encoding="utf-8"))}
+
+
+@server.tool()
+def undo(project: str) -> dict[str, Any]:
+    """Undo the last recorded action of a project (recipe step, annotation change, backend switch)."""
+    from . import history  # noqa: PLC0415
+
+    p = _project(project)
+    return {"undone": service.undo(p), **history.status(p)}
+
+
+@server.tool()
+def redo(project: str) -> dict[str, Any]:
+    """Redo the last undone action."""
+    from . import history  # noqa: PLC0415
+
+    p = _project(project)
+    return {"redone": service.redo(p), **history.status(p)}
+
+
+@server.tool()
+def recipe_history(project: str) -> dict[str, Any]:
+    """Recipe steps (id, op, map, backend, stale, time) and the undo / redo stacks."""
+    from . import history  # noqa: PLC0415
+
+    p = _project(project)
+    return {"steps": [{"id": s.id, "op": s.op, "map_id": s.params.get("map_id"), "backend": s.backend,
+                       "stale": s.stale, "time": s.timestamp} for s in p.recipe().steps], **history.status(p)}
+
+
+@server.tool()
+def viewer_layers(project: str, map_id: str) -> dict[str, Any]:
+    """Map types and overlays the viewer / export_map can show for a map (depends on the steps run so far)."""
+    from . import layers  # noqa: PLC0415
+
+    return layers.available(_project(project), map_id)
 
 
 def main() -> None:

@@ -26,7 +26,7 @@ import numpy as np
 import psutil
 from pydantic import BaseModel
 
-from . import __version__
+from . import __version__, history
 from .backends import get_backend
 from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, LoadParams
 from .hashing import array_hash, bytes_hash, file_fingerprint, json_hash, npz_hash, png_hash, xlsx_hash
@@ -45,15 +45,16 @@ class OpContext:
     params: dict[str, Any]
     backend: Any = None
     out_dir: Path = Path()
-    outputs: dict[str, tuple[str, Any]] = field(default_factory=dict)   # name -> (kind, value)
+    outputs: dict[str, tuple] = field(default_factory=dict)   # name -> (kind, value[, file stem])
     metrics: dict[str, float] = field(default_factory=dict)
 
     def add_input(self, path: str | Path) -> None:
         p = Path(path)
         self.step.inputs.append(FileInput(path=str(p), fingerprint=file_fingerprint(p)))
 
-    def output(self, name: str, kind: str, value: Any) -> None:
-        self.outputs[name] = (kind, value)
+    def output(self, name: str, kind: str, value: Any, stem: str | None = None) -> None:
+        """Register an output; `stem` names the file (default: the output name)."""
+        self.outputs[name] = (kind, value, stem or name)
 
     def remember(self, handle: Any) -> None:
         """Keep the backend object produced by this step for later steps."""
@@ -162,8 +163,12 @@ def _bse_load(ctx: OpContext) -> None:
 
 
 # ---- running ------------------------------------------------------------------------------------
-def _write_output(ctx: OpContext, name: str, kind: str, value: Any) -> OutputRef:
+EXTENSIONS = {"tiff": ".tif", "svg": ".svg", "pdf": ".pdf"}
+
+
+def _write_output(ctx: OpContext, name: str, kind: str, value: Any, stem: str | None = None) -> OutputRef:
     ctx.out_dir.mkdir(parents=True, exist_ok=True)
+    name = stem or name
     if kind == "npz":
         arrays = value.to_arrays() if isinstance(value, EBSDData) else value
         path = ctx.out_dir / f"{name}.npz"
@@ -181,11 +186,16 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any) -> OutputRef
         path = ctx.out_dir / f"{name}.xlsx"
         write_xlsx(path, value)
         h = xlsx_hash(path)
-    elif kind == "png":                       # value = path of a PNG written by the backend renderer
-        path = ctx.out_dir / f"{name}.png"
+    elif kind in ("png", "tiff"):             # value = path of an image written by a renderer
+        path = ctx.out_dir / f"{name}{EXTENSIONS.get(kind, '.png')}"
         if Path(value) != path:
             shutil.move(str(value), path)
         h = png_hash(path)
+    elif kind in ("svg", "pdf"):              # vector exports: bytes (renderers write fixed metadata if they can)
+        path = ctx.out_dir / f"{name}{EXTENSIONS[kind]}"
+        if Path(value) != path:
+            shutil.move(str(value), path)
+        h = bytes_hash(path)
     else:
         raise ValueError(kind)
     return OutputRef(path=str(path.relative_to(ctx.project.root).as_posix()), kind=kind, content_hash=h)
@@ -243,13 +253,16 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
     if step_id:
         step.id = step_id
     ctx = OpContext(project, step, params, be, project.outputs_dir / step.id)
+    before = history.snapshot(project) if record else None     # undo point (state files only)
     t0 = time.perf_counter()
     try:
         spec.func(ctx)
         step.params = ctx.params                 # ops record resolved values (e.g. source step, preset)
-        step.outputs = {n: _write_output(ctx, n, k, v) for n, (k, v) in ctx.outputs.items()}
+        step.outputs = {n: _write_output(ctx, n, *o) for n, o in ctx.outputs.items()}
     except Exception:
         shutil.rmtree(ctx.out_dir, ignore_errors=True)
+        if before:
+            history.discard(project, before)
         raise
     step.metrics = {**ctx.metrics, "seconds": round(time.perf_counter() - t0, 2), **_memory_GB()}
     if record:
@@ -259,7 +272,27 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
             r.mark_stale(lambda s: s.params.get("map_id") == mid)
         r.add(step)
         project.save_recipe(r)
+        history.commit(project, f"{op_name} {step.params.get('map_id', '')} ({step.id})".replace("  ", " "), before)
     return step
+
+
+def switch_backend(project: Project, backend: str) -> int:
+    """Change the project's backend (undoable); marks results of the other backend stale. Returns how many."""
+    if project.info().backend == backend:
+        return 0
+    before = history.snapshot(project)
+    n = project.set_backend(backend)
+    history.commit(project, f"backend -> {backend} ({n} steps stale)", before)
+    return n
+
+
+def undo(project: Project) -> str | None:
+    """Undo the last recorded action (recipe step or backend switch); returns its label."""
+    return history.undo(project)
+
+
+def redo(project: Project) -> str | None:
+    return history.redo(project)
 
 
 # ---- replay -------------------------------------------------------------------------------------
@@ -267,7 +300,7 @@ class OutputCheck(BaseModel):
     step_id: str
     op: str
     output: str
-    status: str                 # identical | within_tolerance | different | missing
+    status: str                 # identical | within_tolerance | not_compared | different | missing
     detail: str = ""
 
 
@@ -279,7 +312,8 @@ class ReplayReport(BaseModel):
 
     @property
     def ok(self) -> bool:
-        return not self.input_changes and all(c.status in ("identical", "within_tolerance") for c in self.checks)
+        return not self.input_changes and all(c.status in ("identical", "within_tolerance", "not_compared")
+                                              for c in self.checks)
 
 
 def _compare_npz(a: Path, b: Path) -> tuple[bool, str]:
@@ -330,9 +364,9 @@ def _compare_tables(a: Path, b: Path) -> tuple[bool, str]:
 
 
 def replay(project: Project, backend: str | None = None, into: Path | None = None,
-           include_stale: bool = False) -> ReplayReport:
+           include_stale: bool = False, until: str | None = None) -> ReplayReport:
     """Re-run the recipe in a scratch project and compare every output with the recorded one.
-    Backend steps use the recorded backend unless `backend` overrides it."""
+    Backend steps use the recorded backend unless `backend` overrides it; `until` stops after that step."""
     recipe = project.recipe()
     root = into or project.cache_dir / f"replay_{datetime.now():%Y%m%d_%H%M%S}"
     if root.exists():
@@ -358,6 +392,9 @@ def replay(project: Project, backend: str | None = None, into: Path | None = Non
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="missing"))
             elif nref.content_hash == ref.content_hash:
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="identical"))
+            elif ref.kind in ("svg", "pdf"):
+                checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="not_compared",
+                                          detail="vector file regenerated (renderer timestamps); its sidecar is compared"))
             elif ref.kind in ("npz", "csv", "xlsx"):
                 cmp = _compare_npz if ref.kind == "npz" else _compare_tables
                 ok, detail = cmp(project.root / ref.path, scratch.root / nref.path)
@@ -369,6 +406,8 @@ def replay(project: Project, backend: str | None = None, into: Path | None = Non
                 diff = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k)) if isinstance(a, dict) else []
                 checks.append(OutputCheck(step_id=s.id, op=s.op, output=name, status="different",
                                           detail=f"keys: {diff}"))
+        if until and s.id == until:
+            break
     return ReplayReport(replay_root=str(scratch.root), backend_override=backend, checks=checks,
                         input_changes=changes)
 
@@ -412,8 +451,8 @@ def verify_outputs(project: Project) -> list[str]:
             if not p.is_file():
                 bad.append(f"{s.id}:{name} missing")
                 continue
-            h = (npz_hash(p) if ref.kind == "npz" else png_hash(p) if ref.kind == "png"
-                 else bytes_hash(p) if ref.kind == "csv" else xlsx_hash(p) if ref.kind == "xlsx"
+            h = (npz_hash(p) if ref.kind == "npz" else png_hash(p) if ref.kind in ("png", "tiff")
+                 else bytes_hash(p) if ref.kind in ("csv", "svg", "pdf") else xlsx_hash(p) if ref.kind == "xlsx"
                  else json_hash(json.loads(p.read_text(encoding="utf-8"))))
             if h != ref.content_hash:
                 bad.append(f"{s.id}:{name} changed")
@@ -428,3 +467,4 @@ def ops_catalog() -> dict[str, dict]:
 from . import ops_ebsd  # noqa: E402,F401  (registers the EBSD operations)
 from . import ops_recon  # noqa: E402,F401  (registers the reconstruction operations)
 from . import ops_grainsize  # noqa: E402,F401  (registers the grain-size operations)
+from . import ops_export  # noqa: E402,F401  (registers annotations, crop and export, phase 5)

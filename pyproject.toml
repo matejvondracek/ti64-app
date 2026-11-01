@@ -29,7 +29,7 @@ matlab = ["matlabengine==25.2.*"]          # MATLAB R2025b + MTEX 7.2
 patterns = ["pyebsdindex>=0.3.10", "kikuchipy>=0.13"]
 gui = ["nicegui>=3.18"]
 mcp = ["mcp>=2.3"]
-dev = ["pytest>=9.2", "anyio>=4.15", "httpx>=0.28"]
+dev = ["pytest>=9.2", "anyio>=4.15", "httpx>=0.28", "playwright>=1.64"]
 
 [project.scripts]
 ti64 = "ti64app.cli:main"

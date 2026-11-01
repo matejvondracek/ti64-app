@@ -227,6 +227,36 @@ class RenderSpec:
     width_cm: float = 12.0
     dpi: int = 300
     scale_bar: bool = True
+    # phase 5 (export): exact figure width (no tight crop), ROI limits, vector annotations
+    exact: bool = False                               # figure exactly width_cm wide; map fills it if no decorations
+    xlim: tuple[float, float] | None = None           # ROI in map coordinates (um)
+    ylim: tuple[float, float] | None = None
+    prims: list[dict] = field(default_factory=list)   # drawing primitives, see annotations.to_primitives:
+    #   {"type": "line", "xy": (k,2) um, "rgb", "width": pt}   {"type": "poly", "xy": (k,2), "rgb"}
+    #   {"type": "text", "xy": (x, y), "text", "rgb", "size": pt}
+
+
+def rgb_to_rgba8(rgb: np.ndarray) -> np.ndarray:
+    """(n,3) colours 0..1 (NaN = no value) -> (n,4) uint8, alpha 0 where there is no value."""
+    rgb = np.asarray(rgb, float).reshape(-1, 3)
+    ok = np.all(np.isfinite(rgb), axis=1)
+    out = np.zeros((rgb.shape[0], 4), np.uint8)
+    out[ok, :3] = np.round(255 * np.clip(rgb[ok], 0, 1)).astype(np.uint8)
+    out[ok, 3] = 255
+    return out
+
+
+def value_clim(values: np.ndarray, clim) -> tuple[float, float]:
+    """Colour limits as both renderers use them: given clim, else [min, max] of the finite values."""
+    if clim is not None and all(np.isfinite(clim)):
+        lo, hi = float(clim[0]), float(clim[1])
+    else:
+        v = np.asarray(values, float)
+        v = v[np.isfinite(v)]
+        lo, hi = (float(v.min()), float(v.max())) if v.size else (0.0, 1.0)
+    if hi <= lo:
+        hi = lo + 1.0
+    return lo, hi
 
 
 @runtime_checkable
@@ -255,6 +285,14 @@ class AnalysisBackend(Protocol):
     def ipf_colors_quat(self, handle: EBSDHandle, phase: str, quat: np.ndarray, key: str, vec) -> np.ndarray: ...
 
     def render_chart(self, spec: "ChartSpec", out_png: Path) -> Path: ...
+
+    # map viewer + pixel-exact export (phase 5)
+    def measurement_colors(self, spec: RenderSpec) -> tuple[np.ndarray, dict]:
+        """(n, 4) uint8 RGBA colour of every measurement (file order) as this backend draws `spec`:
+        spec.rgb as given, or spec.values through the backend's colour map `spec.cmap` (MATLAB colormaps
+        in MATLAB, matplotlib equivalents in pymtex, 256 levels, k = round(255 t)). Alpha 0 = no value.
+        Info: {"clim": (lo, hi), "cmap": name, "colorbar": (256, 4) uint8 or None}."""
+        ...
 
     # grain size (phase 4)
     def grain_geometry(self, gh: GrainsHandle) -> dict[str, np.ndarray]:

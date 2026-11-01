@@ -209,17 +209,66 @@ class MatlabBackend:
                     f["seg_rgb"] = np.asarray(spec.seg_rgb, float).reshape(-1, 3)
                     if spec.seg_widths is not None:
                         f["seg_w"] = np.asarray(spec.seg_widths, float).ravel()
+                texts = self._write_prims(f, spec.prims)
             o = {"cmap": spec.cmap, "clim": self._num(spec.clim if spec.clim else [float("nan")] * 2),
                  "colorbar_label": spec.colorbar_label, "seg_width": float(spec.seg_width), "title": spec.title,
                  "width_cm": float(spec.width_cm), "dpi": float(spec.dpi), "scale_bar": bool(spec.scale_bar),
                  "legend_labels": [l for l, _ in spec.legend],
-                 "legend_rgb": self._num([c for _, rgb in spec.legend for c in rgb])}
+                 "legend_rgb": self._num([c for _, rgb in spec.legend for c in rgb]),
+                 "exact": bool(spec.exact),
+                 "xlim": self._num(spec.xlim if spec.xlim else [float("nan")] * 2),
+                 "ylim": self._num(spec.ylim if spec.ylim else [float("nan")] * 2),
+                 "text_str": [t["text"] for t in texts] or [""],
+                 "text_ha": [t.get("ha", "left") for t in texts] or ["left"]}
             out_png = Path(out_png)
             out_png.parent.mkdir(parents=True, exist_ok=True)
             self.call("ti64.render", handle.id, tmp, str(out_png), o, nargout=0)
         finally:
             os.remove(tmp)
         return out_png
+
+    @staticmethod
+    def _write_prims(f, prims: list[dict]) -> list[dict]:
+        """Annotation primitives into the render HDF5 (layout in +ti64/render.m); returns the texts."""
+        lines = [p for p in prims if p["type"] == "line"]
+        polys = [p for p in prims if p["type"] == "poly"]
+        texts = [p for p in prims if p["type"] == "text"]
+
+        def joined(items):                                   # (N, 2), NaN rows between items
+            parts = []
+            for it in items:
+                parts += [np.asarray(it["xy"], float).reshape(-1, 2), np.full((1, 2), np.nan)]
+            return np.concatenate(parts)
+        if lines:
+            f["pl_xy"] = joined(lines)
+            f["pl_style"] = np.array([[*p.get("rgb", (0, 0, 0)), p.get("width", 1.0)] for p in lines], float)
+        if polys:
+            f["pg_xy"] = joined(polys)
+            f["pg_rgb"] = np.array([p.get("rgb", (0, 0, 0)) for p in polys], float).reshape(-1, 3)
+        if texts:
+            f["tx_xy"] = np.array([p["xy"] for p in texts], float).reshape(-1, 2)
+            f["tx_style"] = np.array([[*p.get("rgb", (0, 0, 0)), p.get("size", 8.0)] for p in texts], float)
+        return texts
+
+    def measurement_colors(self, spec: RenderSpec) -> tuple[np.ndarray, dict]:
+        import h5py  # noqa: PLC0415
+
+        from .base import rgb_to_rgba8  # noqa: PLC0415
+
+        if spec.rgb is not None:
+            return rgb_to_rgba8(spec.rgb), {"clim": None, "cmap": None, "colorbar": None}
+        fd, tmp = tempfile.mkstemp(suffix=".h5", prefix="ti64_v_")
+        os.close(fd)
+        try:
+            with h5py.File(tmp, "w") as f:
+                f["values"] = np.asarray(spec.values, float).ravel()
+            d = self._h5("ti64.valueColors", tmp, spec.cmap,
+                         self._num(spec.clim if spec.clim else [float("nan")] * 2))
+        finally:
+            os.remove(tmp)
+        lo, hi = (float(c) for c in np.asarray(d["clim"]).ravel())
+        return (np.asarray(d["rgba"]).astype(np.uint8).reshape(-1, 4),
+                {"clim": (lo, hi), "cmap": spec.cmap, "colorbar": np.asarray(d["lut"]).astype(np.uint8).reshape(-1, 4)})
 
     def render_key(self, handle, phase: str, key: str, vec, out_png, dpi: int = 300):
         out_png = Path(out_png)

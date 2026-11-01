@@ -91,13 +91,18 @@ def load_settings(path: Path | None = None) -> Settings:
     if prefs.is_file():
         p = json.loads(prefs.read_text(encoding="utf-8"))
         data.update({k: v for k, v in p.items() if k in ("backend", "figure")})
+        # paths edited on the Settings page override the TOML file, field by field (empty = keep TOML)
+        data["paths"] = {**data.get("paths", {}), **{k: v for k, v in p.get("paths", {}).items() if v}}
     return Settings.model_validate(data)
 
 
-def save_preferences(settings: Settings) -> Path:
-    """Save the user-editable part (backend, figure style); machine paths stay in the TOML file."""
+def save_preferences(settings: Settings, paths: dict[str, str] | None = None) -> Path:
+    """Save the user-editable part (backend, figure style). Machine paths stay in the TOML file unless
+    `paths` is given (Settings page): those fields are stored here and override the TOML file."""
     p = preferences_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(settings.model_dump(mode="json", include={"backend", "figure"}), indent=1),
-                 encoding="utf-8")
+    old = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
+    d = settings.model_dump(mode="json", include={"backend", "figure"})
+    d["paths"] = old.get("paths", {}) if paths is None else {k: v for k, v in paths.items() if k in Paths.model_fields}
+    p.write_text(json.dumps(d, indent=1), encoding="utf-8")
     return p

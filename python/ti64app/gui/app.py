@@ -1,5 +1,6 @@
-"""NiceGUI front end (localhost). Pages: Project (/), Sample sheet (/sample), Maps (/maps),
-Prior-beta reconstruction (/recon), Settings (/settings).
+"""NiceGUI front end (localhost). Pages: project browser (/), map viewer (/viewer, gui/viewer.py), sample sheet
+(/sample), maps (/maps), prior-beta reconstruction (/recon), grain size (/grainsize), parameter panels for every
+operation (/ops), recipe history with undo / redo / replay (/recipe) and Settings (/settings) (gui/pages.py).
 
 All actions go through ti64app.service (recorded in recipe.json), the same as the MCP tools.
 Run:  python -m ti64app.gui.app      -> http://127.0.0.1:8064
@@ -7,17 +8,14 @@ Run:  python -m ti64app.gui.app      -> http://127.0.0.1:8064
 from __future__ import annotations
 
 import traceback
-from pathlib import Path
 
 from nicegui import run as ng_run
 from nicegui import ui
 
 from .. import service
-from ..backends import backend_status, get_backend
-from ..project import Project, list_projects, projects_dir
+from ..project import Project, projects_dir
 from ..sample import (BuildDirection, FourPointBending, MapPosition, SampleSheet, map_id_from_file,
                       suggest_input_state)
-from ..settings import IpfKeySetting, load_settings, save_preferences
 
 AXES = ["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
 STATE: dict = {"project": None}
@@ -32,108 +30,35 @@ def current_project() -> Project | None:
 
 
 def _nav() -> None:
-    with ui.header().classes("items-center gap-4"):
+    with ui.header().classes("items-center gap-3 py-2"):
         ui.label("Ti64 EBSD/BSE").classes("text-lg font-bold")
-        ui.link("Project", "/").classes("text-white")
-        ui.link("Sample sheet", "/sample").classes("text-white")
-        ui.link("Maps", "/maps").classes("text-white")
-        ui.link("Reconstruction", "/recon").classes("text-white")
-        ui.link("Grain size", "/grainsize").classes("text-white")
-        ui.link("Settings", "/settings").classes("text-white")
+        for label, path in NAV:
+            ui.link(label, path).classes("text-white").mark(f"nav_{path.strip('/') or 'projects'}")
         p = current_project()
-        ui.label(f"project: {p.name} ({p.info().backend})" if p else "no project open").classes("ml-auto")
+        ui.space()
+        if p:
+            async def undo():
+                lab = service.undo(p)
+                ui.notify(f"undone: {lab}" if lab else "nothing to undo", type="positive" if lab else "warning")
+                ui.navigate.reload()
+
+            async def redo():
+                lab = service.redo(p)
+                ui.notify(f"redone: {lab}" if lab else "nothing to redo", type="positive" if lab else "warning")
+                ui.navigate.reload()
+            ui.button(icon="undo", on_click=undo).props("flat dense color=white").tooltip("undo the last action").mark("hdr_undo")
+            ui.button(icon="redo", on_click=redo).props("flat dense color=white").tooltip("redo").mark("hdr_redo")
+        ui.label(f"project: {p.name} ({p.info().backend})" if p else "no project open")
+
+
+NAV = [("Projects", "/"), ("Viewer", "/viewer"), ("Sample sheet", "/sample"), ("Maps", "/maps"),
+       ("Reconstruction", "/recon"), ("Grain size", "/grainsize"), ("Operations", "/ops"), ("Recipe", "/recipe"),
+       ("Settings", "/settings")]
 
 
 def _error(e: Exception) -> None:
     ui.notify(f"{type(e).__name__}: {e}", type="negative", multi_line=True, timeout=10000)
     traceback.print_exc()
-
-
-# ---- Project page -----------------------------------------------------------------------------
-def project_page() -> None:
-    _nav()
-    with ui.column().classes("p-4 gap-4 w-full max-w-5xl"):
-        with ui.row().classes("items-end gap-2"):
-            names = list_projects(projects_dir())
-            sel = ui.select(names, label="Open project", value=STATE["project"]).classes("w-64")
-            ui.button("Open", on_click=lambda: (STATE.update(project=sel.value), ui.navigate.to("/")))
-            new = ui.input("New project name").classes("w-64").mark("new_project")
-
-            def create():
-                try:
-                    Project.create(new.value.strip(), base=projects_dir(),
-                                   backend=load_settings().backend)
-                    STATE["project"] = new.value.strip()
-                    ui.navigate.to("/")
-                except Exception as e:  # noqa: BLE001
-                    _error(e)
-            ui.button("Create", on_click=create).mark("create_project")
-
-        p = current_project()
-        if p is None:
-            ui.label("Open or create a project.")
-            return
-        info = p.info()
-        ui.label(f"{info.name} — backend {info.backend} — {p.root}").classes("text-gray-600")
-
-        ui.label("Maps (sample sheets)").classes("text-md font-bold")
-        sheets = p.samples()
-        if not sheets:
-            ui.label("No sample sheet yet: enter one on the Sample sheet page.")
-        for s in sheets:
-            with ui.row().classes("items-center gap-4"):
-                ui.label(f"{s.map_id}: {s.specimen_id}, {s.input_state}, BD {tuple(round(c, 3) for c in s.build_direction.unit_vector)}")
-
-                async def load(map_id=s.map_id):
-                    n = ui.notification(f"loading {map_id} with {p.info().backend} ...", spinner=True, timeout=None)
-                    try:
-                        step = await ng_run.io_bound(service.run, p, "ebsd.load", {"map_id": map_id})
-                        ui.notify(f"{map_id}: {step.metrics.get('n_points')} points, "
-                                  f"load {step.metrics.get('load_s')} s", type="positive")
-                        ui.navigate.to("/")
-                    except Exception as e:  # noqa: BLE001
-                        _error(e)
-                    finally:
-                        n.dismiss()
-                ui.button("Load map", on_click=load).props("dense")
-
-        ui.label("Other files").classes("text-md font-bold")
-        with ui.row().classes("items-end gap-2"):
-            up2 = ui.input(".up2 file").classes("w-96")
-            ui.button("Read .up2 header", on_click=lambda: _run_simple(p, "up2.header", {"file": up2.value}))
-        with ui.row().classes("items-end gap-2"):
-            img = ui.input("BSE image (.tif/.bmp)").classes("w-96")
-            txt = ui.input("JEOL .txt (optional)").classes("w-64")
-            ui.button("Load BSE", on_click=lambda: _run_simple(p, "bse.load", {"image": img.value, "txt": txt.value or None}))
-
-        ui.label("Recipe").classes("text-md font-bold")
-        rows = [{"id": s.id, "op": s.op, "backend": s.backend or "-", "stale": "stale" if s.stale else "",
-                 "time": s.timestamp, "metrics": ", ".join(f"{k}={v}" for k, v in s.metrics.items())}
-                for s in p.recipe().steps]
-        ui.table(columns=[{"name": k, "label": k, "field": k, "align": "left"} for k in
-                          ("id", "op", "backend", "stale", "time", "metrics")], rows=rows).classes("w-full")
-
-        async def do_replay():
-            n = ui.notification("replaying ...", spinner=True, timeout=None)
-            try:
-                rep = await ng_run.io_bound(service.replay, p)
-                bad = [c for c in rep.checks if c.status not in ("identical", "within_tolerance")]
-                ui.notify("replay reproduced all outputs" if rep.ok else f"replay: {len(bad)} differences, "
-                          f"{len(rep.input_changes)} input changes", type="positive" if rep.ok else "warning")
-            except Exception as e:  # noqa: BLE001
-                _error(e)
-            finally:
-                n.dismiss()
-        ui.button("Replay recipe", on_click=do_replay)
-
-
-def _run_simple(p: Project, op: str, params: dict) -> None:
-    try:
-        step = service.run(p, op, params)
-        ui.notify(f"{op} done ({step.id})", type="positive")
-        ui.navigate.to("/")
-    except Exception as e:  # noqa: BLE001
-        _error(e)
 
 
 # ---- Sample sheet page ------------------------------------------------------------------------
@@ -235,57 +160,6 @@ def sheet_from_form(v: dict) -> SampleSheet:
                        specimen_id=(v.get("specimen_id") or "").strip(), map_file=v.get("map_file") or "",
                        input_state=v["input_state"], build_direction=bd, bending=bend, position=pos,
                        notes=v.get("notes") or "")
-
-
-# ---- Settings page ----------------------------------------------------------------------------
-def settings_page() -> None:
-    _nav()
-    s = load_settings()
-    status = backend_status()
-    with ui.column().classes("p-4 gap-3 w-full max-w-3xl"):
-        ui.label("Analysis backend").classes("text-md font-bold")
-        avail = {n: n for n, r in status.items() if not r}
-        radio = ui.radio(avail, value=s.backend if s.backend in avail else next(iter(avail), None)).props("inline").mark("backend")
-        for n, r in status.items():
-            if r:
-                ui.label(f"{n}: unavailable — {r}").classes("text-orange-700")
-            else:
-                running = n == "matlab" and getattr(get_backend(n), "running", False)
-                ui.label(f"{n}: available" + (" (engine running)" if running else "")).classes("text-green-700")
-        p = current_project()
-        if p:
-            ui.label(f"Project {p.name} uses {p.info().backend}. Changing it marks backend results stale.")
-
-        ui.label("IPF colour key (shared by both renderers)").classes("text-md font-bold")
-        keys = {}
-        for phase, k in s.figure.ipf.items():
-            with ui.row().classes("items-center"):
-                ui.label(phase).classes("w-24")
-                keys[phase] = (ui.select(["ipfHKLKey", "ipfTSLKey", "ipfHSVKey", "ipfSpotKey"], value=k.key).classes("w-36"),
-                               ui.select(["X", "Y", "Z", "build", "custom"], value=k.direction).classes("w-28"))
-        with ui.row():
-            dpi = ui.number("DPI", value=s.figure.dpi).classes("w-24")
-            width = ui.number("width [cm]", value=s.figure.width_cm).classes("w-24")
-            lw = ui.number("boundary line width", value=s.figure.boundary_line_width).classes("w-36")
-
-        def save():
-            try:
-                st = load_settings()
-                st.backend = radio.value
-                for phase, (k, d) in keys.items():
-                    st.figure.ipf[phase] = IpfKeySetting(key=k.value, direction=d.value)
-                st.figure.dpi, st.figure.width_cm = int(dpi.value), float(width.value)
-                st.figure.boundary_line_width = float(lw.value)
-                path = save_preferences(st)
-                msg = f"saved to {path}"
-                pr = current_project()
-                if pr:
-                    n = pr.set_backend(radio.value)
-                    msg += f"; project backend {radio.value}" + (f", {n} steps marked stale" if n else "")
-                ui.notify(msg, type="positive")
-            except Exception as e:  # noqa: BLE001
-                _error(e)
-        ui.button("Save settings", on_click=save).mark("save_settings")
 
 
 # ---- Maps page (cleanup, grains, per-pixel maps, figures) -------------------------------------
@@ -661,12 +535,18 @@ def grainsize_page() -> None:
 
 
 def build() -> None:
-    ui.page("/")(project_page)
+    from . import pages, tiles  # noqa: F401, PLC0415  (tiles registers the tile routes)
+    from .viewer import viewer_page  # noqa: PLC0415
+
+    ui.page("/")(lambda: pages.project_page(STATE, current_project, _nav, _error))
+    ui.page("/viewer")(lambda: viewer_page(current_project, _nav, _error))
     ui.page("/maps")(maps_page)
     ui.page("/recon")(recon_page)
     ui.page("/grainsize")(grainsize_page)
     ui.page("/sample")(sample_page)
-    ui.page("/settings")(settings_page)
+    ui.page("/ops")(lambda: pages.ops_page(current_project, _nav, _error))
+    ui.page("/recipe")(lambda: pages.recipe_page(current_project, _nav, _error))
+    ui.page("/settings")(lambda: pages.settings_page(current_project, _nav, _error))
 
 
 def main(port: int = 8064, project: str | None = None) -> None:

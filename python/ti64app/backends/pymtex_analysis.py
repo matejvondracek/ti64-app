@@ -285,6 +285,11 @@ class PymtexAnalysis:
         keep, perm = _file_perm(e)
         return render(e, spec, out_png, keep, perm)
 
+    def measurement_colors(self, spec):
+        from .pymtex_plot import measurement_colors  # noqa: PLC0415
+
+        return measurement_colors(spec)
+
     def render_key(self, handle, phase: str, key: str, vec, out_png, dpi: int = 300):
         from .pymtex_plot import render_key  # noqa: PLC0415
 

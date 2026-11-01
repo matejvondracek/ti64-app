@@ -214,3 +214,52 @@
   test. Tested on a synthetic file only; NOT verified against a real OIM export (none available yet).
 - MATLAB Engine + XLSX: importing the `matlab` package puts MATLAB's DLLs first on the search path, after which
   Python's pyexpat (openpyxl) fails to load; backends/__init__.py imports xml.parsers.expat first.
+
+## D15 (2026-11-01) Map viewer and export (phase 5)
+
+- **What is drawn by whom.** The colour of every measurement comes from the active backend: IPF colours from its
+  IPF key (`ipf_colors`, `ipf_colors_quat`), value maps through its colour map (`measurement_colors`: MATLAB
+  `parula`/`turbo`/`gray` in MATLAB via `+ti64/valueColors.m`, matplotlib equivalents in pymtex; 256 levels,
+  k = round(255 t), same rule as `+ti64/render.m`). Which measurement a pixel shows is pure geometry, done once in
+  `ti64app/raster.py` for both backends (brick cell layout of `+ti64/hexRaster.m` / EBSD_part2.m: a hex cell is
+  dx x dy, shifted rows by dx/2). This is used by (1) the viewer tiles and (2) pixel-exact exports (native,
+  2x/4x/8x), so both backends give the same pixel geometry (conformance: phase map pixel-identical).
+  **Figure exports** (width in mm at a DPI; PNG/TIFF/SVG/PDF) are drawn entirely by the backend renderer
+  (matplotlib / MATLAB `print`), with overlays and annotations as vectors (CLAUDE.md: one renderer per figure).
+  *Check:* if pixel-exact exports must also be drawn end-to-end by MATLAB, the layout (`index_image`) and line
+  rasterisation (`rasterize_segments`) would have to be ported to +ti64 (~60 lines); not done.
+- **Viewer overlays** (HAGB, LAGB, α/β interface, Burgers types, prior-β GB, crack) are the same vector segments
+  as in figures and exports, rasterised per tile by the tile server (constant screen width, 1 px default).
+  Annotations and ROIs are vectors drawn by Leaflet in the browser. Exported files never come from the browser.
+- **pymtex raster shortcut** (CLAUDE.md allows it): pymtex's native hex map picture samples at a quarter of the
+  step (42 M pixels for a 2.6 M map) and is never 1 px per measurement, so the viewer and pixel-exact exports use
+  the shared brick layout. pymtex figure exports still use its own `ebsd.plot` (forced to its raster style with
+  enough pixels for the output resolution of the shown region, because one polygon per cell makes 24 MB SVGs).
+- **"1 px per measurement" on a hex grid.** A hex map cannot be shown 1:1 with square pixels: native exports have
+  one pixel per measurement, pixel = dx x dy = 0.2 x 0.1732 um (NOT square; written to the PNG pHYs / TIFF
+  X/YResolution tags and the sidecar), and the shifted rows are drawn dx/2 to the LEFT of their true position
+  (half a pixel cannot be shifted). At 2x/4x/8x the shift is exact (k/2 pixels). For correct geometry with square
+  pixels use the width-in-mm mode. Width: native = number of measurement columns; even scales include the
+  half column of the shifted rows.
+- **Texts in pixel-exact exports** are not drawn (no font renderer shared by both backends); lines, arrows, points
+  and ROI outlines are. The sidecar lists the skipped texts; the width mode draws everything.
+- **Exact physical size**: figure exports are exactly round(width_mm / 25.4 * dpi) pixels wide (pymtex: figure
+  width snapped to whole pixels, no tight crop; MATLAB: `print` with a fixed paper size). Without title, colour bar
+  and legend the map fills the figure edge to edge. ROI = axis limits (pymtex raster resolution raised to keep
+  the output resolution).
+- **Sidecar** (`<name>.json` next to the file, also a recipe output): map file + fingerprint, input state, BD,
+  resolved layer and source steps, IPF keys, colour limits, overlays with boundary lengths, annotations, ROI,
+  grid, step, pixel size, image size, notes, backend + versions, figure style, recipe step id. PNG/TIFF also carry
+  a short JSON description. SVG/PDF from MATLAB contain a creation date: replay reports them `not_compared`
+  and compares the sidecar.
+- **Crop** (`ebsd.crop`): copies the .ang rows inside the ROI's bounding box to `projects/<p>/maps/<id>.ang`
+  (text unchanged, ORIGINAL coordinates kept so annotations and overlays line up with the parent map; hex crops
+  start on an OIM odd row; NCOLS_ODD = NCOLS_EVEN). Both backends load the same file (no backend-specific crop).
+- **Undo / redo** (`history.py`): snapshots of the small state files (project.json, recipe.json, samples,
+  annotations.json) around every recorded action, 50 deep. Outputs of undone steps stay on disk until a new
+  action discards the redo stack, then they are deleted. Cropped .ang files are not deleted.
+- **Viewer zoom** uses whole zoom levels (factor 2): tiles are then rendered pixel-exact; fractional zoom left
+  hairline seams between tiles in Chromium. Zoomed out, a tile pixel averages up to 4 x 4 samples.
+- Prior-β boundaries are drawn black at 2x the boundary line width (EBSD_part2 draws them black); HAGB black 1x.
+- Playwright: `scripts/gui_screenshots.py` clicks through every page and panel (44 screenshots);
+  `tests/integration/test_gui_playwright.py` (slow) runs it. NiceGUI markers are mirrored to `data-testid`.
