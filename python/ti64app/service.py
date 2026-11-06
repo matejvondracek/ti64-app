@@ -3,7 +3,7 @@
     step = run(project, op, params)            # executes, writes outputs, appends to recipe.json
     report = replay(project)                   # re-runs all steps in a scratch project, compares outputs
 
-Operations: sample.set, ebsd.load, up2.header, bse.load (here) and the EBSD operations in
+Operations: sample.set, ebsd.load, up2.header, bse.load (here), sem.stitch (ops_stitch.py, SEM image mosaics) and the EBSD operations in
 ops_ebsd.py (cleanup, grains, maps, figures), ops_recon.py
 (prior-beta reconstruction, its figures, parameter sweep) and ops_grainsize.py (grain size, phase 4). Backend-dependent ops use the project's backend
 (Settings) unless `backend=` overrides it.
@@ -167,7 +167,7 @@ def _bse_load(ctx: OpContext) -> None:
 
 
 # ---- running ------------------------------------------------------------------------------------
-EXTENSIONS = {"tiff": ".tif", "svg": ".svg", "pdf": ".pdf"}
+EXTENSIONS = {"tiff": ".tif", "svg": ".svg", "pdf": ".pdf", "mosaic": ".tif"}
 
 
 def _write_output(ctx: OpContext, name: str, kind: str, value: Any, stem: str | None = None) -> OutputRef:
@@ -195,6 +195,11 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any, stem: str | 
         if Path(value) != path:
             shutil.move(str(value), path)
         h = png_hash(path)
+    elif kind == "mosaic":                    # large TIFF (tifffile, deterministic bytes): hashed without decoding
+        path = ctx.out_dir / f"{name}{EXTENSIONS[kind]}"
+        if Path(value) != path:
+            shutil.move(str(value), path)
+        h = bytes_hash(path)
     elif kind in ("svg", "pdf"):              # vector exports: bytes (renderers write fixed metadata if they can)
         path = ctx.out_dir / f"{name}{EXTENSIONS[kind]}"
         if Path(value) != path:
@@ -524,7 +529,7 @@ def verify_outputs(project: Project) -> list[str]:
                 bad.append(f"{s.id}:{name} missing")
                 continue
             h = (npz_hash(p) if ref.kind == "npz" else png_hash(p) if ref.kind in ("png", "tiff")
-                 else bytes_hash(p) if ref.kind in ("csv", "svg", "pdf") else xlsx_hash(p) if ref.kind == "xlsx"
+                 else bytes_hash(p) if ref.kind in ("csv", "svg", "pdf", "mosaic") else xlsx_hash(p) if ref.kind == "xlsx"
                  else json_hash(json.loads(p.read_text(encoding="utf-8"))))
             if h != ref.content_hash:
                 bad.append(f"{s.id}:{name} changed")
@@ -541,3 +546,4 @@ from . import ops_recon  # noqa: E402,F401  (registers the reconstruction operat
 from . import ops_grainsize  # noqa: E402,F401  (registers the grain-size operations)
 from . import ops_export  # noqa: E402,F401  (registers annotations, crop and export, phase 5)
 from . import ops_compare  # noqa: E402,F401  (registers compare.backends, phase 6)
+from . import ops_stitch  # noqa: E402,F401  (registers sem.stitch, phase 6.5)

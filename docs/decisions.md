@@ -34,6 +34,12 @@
   SM_MICRON_MARKER / SM_MICRON_BAR (rescaled by CM_FULL_SIZE / image width), and records which keys
   were used. Tested on a synthetic file only (`verified_format = False`). Check against a real file
   before using pixel size or stage coordinates for registration.
+- **Update 2026-11-06 (verified on 197 real pairs in data/, see D17):** the real key is `$CM_STAGE_POSITION`
+  (the alias `CM_STAGE_POS` never matched, so stage values were not read before) with the order X Y Z [mm] R T
+  [deg] (4th value 241.12 = rotation; the parser had read it as tilt). The detector is `$SM_DETECTOR`. The pixel size
+  now comes from `$CM_FIELD_OF_VIEW` / image width (µm or mm); it agrees with SM_MICRON_MARKER / SM_MICRON_BAR, whose
+  bar length is in file pixels. Files are UTF-8 with a BOM (µ = 2 bytes); Latin-1 is the fallback.
+  `verified_format = True` when the field of view is present.
 
 ## D6 (2026-10-31) Recipe reproducibility
 - Outputs carry a CONTENT hash (array names/dtypes/shapes/bytes, canonical JSON), not a file hash, so
@@ -295,3 +301,68 @@
   are resolved against the working directory and recorded absolute.
 - **Registration** in Claude Code is machine-local (`claude mcp add ti64 --scope local ...`): the command contains
   this machine's env path and the repository is public, so no `.mcp.json` is committed.
+
+## D17 (2026-11-06) SEM image stitching (phase 6.5)
+
+- **Detector filter.** Class from `$SM_DETECTOR` (BED-* / BSE / COMPO → BSE; SED / SEI / LED / UED / USD → SE), the
+  file-name token as fallback (`…_BED-C_2`, `…_SED_1`); the .txt wins when both exist. One mosaic per detector; never
+  mixed. data/test/stitch: 8 BED-C + 8 SED, all from the .txt and consistent with the file names.
+- **Data bar.** Height = file height − `$CM_IMAGE_SIZE` height (= `$SM_PNU_HEIGHT`); verified on all 197 images in
+  data/ (1280 → 64, 2560 → 128, 5120 → 256 px; the image area is always 4:3). Without .txt: the 4:3 rule, confirmed by
+  detecting the strip (black + white only, text in both rows); dark overview images (23×, black chamber above the
+  strip) need the known-height check, a free search additionally requires textured image above the strip.
+  Manual `strip_px` as the last resort. The analysis pixels never contain the strip; the sidecar stores its height.
+- **Stage → image mapping, measured, not assumed.** `auto` tries every signed axis permutation and keeps the one whose
+  predicted overlaps correlate best. Results (JSM-IT500HR, stage rotation 241.12°, scan rotation 0):
+  +stage Y → +row (down): data/test/stitch, NCC 0.63 vs ≤ 0.11 for the other maps;
+  +stage X → −col (left): JU05 50× overview 9781–9783 (stage moved 3 mm along X only), NCC 0.90 vs 0.27.
+  This is `DEFAULT_STAGE_MAP`, used when the stage moved along one axis only (the other axis cannot be decided from
+  the data) and for the thumbnail preview. Consequence: in the test column, higher stage Y is lower in the image, so
+  9776 (Y 20.370) is at the top and 9777 / 9778 (Y 20.455 / 20.470) are at the BOTTOM (strict stage order, but not
+  "9777/9778 at the top" as the phase brief expected). Both measurements are at R = 241.12°; whether the mapping
+  depends on the stage rotation is not tested (tiles with different R or T are refused anyway).
+- **Stage scale / angle.** Fitted stage → mosaic transform on the test column: 99 290 px/mm along Y (nominal 100 000 at
+  10 nm/px, −0.7 %) and a cross term of 553 px/mm (the column drifts 58 px in x over 100 µm of stage Y, ~0.3°);
+  JU05 50× along X: 1012.6 px/mm (+1.3 %). Stage values have 1 µm resolution, so they are only the starting guess
+  (search ± `search_um` = 3 µm); the registration places the tiles. `$MP_BEAM_SHIFT` is reported; it was constant
+  within every set checked, a warning is written if it differs (the stage prior ignores it).
+- **Registration.** Translation only. Coarse level (tiles downsampled to ~640 px): phase correlation of the
+  predicted overlap (Hann window, 6 strongest peaks × 4 wrap-around interpretations) plus the best offset of a masked
+  NCC surface (Padfield 2012, doi:10.1109/TIP.2011.2181402) inside the search window; every candidate is scored by
+  NCC of the actual overlap. The NCC surface was added because phase correlation alone missed 4 of 7 pairs on the
+  test column (narrow overlaps of 220–560 px, true offsets up to 50 px from the stage). Full resolution:
+  `skimage.registration.phase_cross_correlation` (upsample 20) on the overlap at the coarse match, accepted when it
+  does not lower the NCC. Pairs with NCC < `min_score` (0.3) or > √2·search from the stage prediction are rejected.
+  Optional rotation check (± 1°, report only).
+- **Global placement.** Weighted least squares (weight = NCC) over all good pairs, anchored to the stage positions with
+  weight 1e-4, dropping the worst pair while its residual > 3 px (Fiji Grid/Collection stitching, Preibisch 2009
+  doi:10.1093/bioinformatics/btp184; NIST MIST, Chalfoun 2017 doi:10.1038/s41598-017-04567-y). Tiles without a good
+  pair are placed by the stage and flagged (`stage_only_tiles`, red border in the GUI). Without stage data all pairs
+  are tried and the good matches must connect all tiles. On a single column the pair graph is a chain, so residuals are
+  ≈ 0 by construction; they become informative on 2D grids (loops).
+- **Placement and blending.** Tiles are placed at integer pixel positions (no resampling, raw pixels stay raw);
+  subpixel positions are in the sidecar. Per-tile gain / offset from the overlap statistics (global LS, mean log gain
+  0), then linear feathering (weight = distance to the tile edge). `blend = "none"`: each pixel from the tile whose edge
+  is farthest, no normalisation (for measurements on raw pixels).
+- **SE with the BSE layout.** Each SE tile is matched to the BSE tile with the same `$SM_IMAGE_NUMBER` (± 40 px) by
+  NCC of Gaussian-smoothed intensities (σ 2 px; gradient NCC scored only 0.05–0.2), then subpixel phase correlation;
+  same canvas and origin as the BSE mosaic, so the two align pixel for pixel. Test column: shifts ≈ (+1, +1) px for
+  all 8 tiles, NCC 0.17–0.65, SE taken 12–43 s before BSE. SE stitched on its own lands within 0.6 px of the BSE
+  layout (relative).
+- **Info strip.** `none` (default); `keep`: the bottom tile's original strip under the mosaic (its image number and
+  date), only for single-column mosaics. "Single column" = mosaic width − tile width ≤ 5 % of the tile width: the test
+  column drifts 58 px in x (≈ 5 px per tile), more than the "few px" assumed in the brief, so a tighter tolerance would
+  refuse the reference data set. `generate`: a new JEOL-style strip for any layout, laid out from the measured
+  original (left fields from the left edge, camera at the centre, scale bar from the right edge; positions scale with
+  the strip height). Font: DejaVu Sans bundled with matplotlib (identical everywhere → replays reproduce the pixels),
+  condensed to 86 % width to match the JEOL glyph widths. Field starts match the original within 3 px (WD 389 vs 389,
+  Std.-PC 743 vs 743); the scale bar is at the same pixels (1790–2290, rows 18–45). Scale bar = largest 1/2/5 × 10ⁿ µm
+  not longer than the tiles' own bar (`SM_MICRON_BAR`). Fields that differ between tiles are shown as ranges.
+- **Output.** `mosaic_<DET>.tif`: tiled, zlib, BigTIFF above 2 GB, pyramid (sub-IFDs, /2 per level down to ~1024 px)
+  above 8192 px, resolution tags from the pixel size; written from a disk-backed array rendered in bands (RAM: tiles
+  in an LRU of 12, downsampled tiles, cached FFT spectra; test column peak 0.9 GB). New recipe output kind `mosaic`,
+  hashed over the file bytes (tifffile writes no timestamp; a replay reproduced the TIFF bit for bit), so verifying a
+  large mosaic never decodes it. PNG preview (≤ 2048 px), JSON sidecar, CSV tile table.
+- **Not covered by data here:** a 2D grid of real tiles (none in data/: every multi-tile set moved along one axis, and
+  `JU04/stich along crack path` is not usable: 9466 / 9467 and 9469 / 9470 / 9472 share stage X **and** Y but show
+  different fields, so the stage Y reading did not follow the moves). 2D grids are tested on synthetic data only.

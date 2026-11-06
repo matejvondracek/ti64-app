@@ -2,15 +2,19 @@
 
 JEOL writes a text file of `$KEY value...` lines next to each image (`$CM_FORMAT JEOL/SEM`).
 Used keys (aliases accepted, `$`/`$$` prefixes stripped, units in values tolerated):
-  CM_STAGE_POS        X Y Z [mm] tilt rotation [deg] (further numbers ignored)
+  CM_STAGE_POSITION   X Y Z [mm] R T [deg] (further numbers ignored); verified on real JSM-IT500HR files:
+                      "0.923 20.444 14.000 241.120 0.000 0.000" = X Y Z, rotation 241.12, tilt 0
+  SM_DETECTOR         detector (BED-C, BED-T, SED, ...)
+  CM_FIELD_OF_VIEW    width height of the image area in um or mm -> pixel size = FOV width / image width
+  CM_IMAGE_SIZE       width height of the image area [px]; the file is taller by the data bar (SM_PNU_HEIGHT)
   CM_ACCEL_VOLT       accelerating voltage [kV]
   CM_MAG              magnification
   SM_WD / CM_WD / *WORKING_DISTANCE   working distance [mm]
   SM_PIXEL_SIZE / CM_PIXEL_SIZE       pixel size [um] (nm if the value says nm), else
   SM_MICRON_MARKER + SM_MICRON_BAR    scale bar length [um] / [px]  -> pixel size
   CM_FULL_SIZE        width height of the full frame the scale refers to [px]
-STATUS: written from the format description and tested on a synthetic file only
-(docs/decisions.md D5). Check against a real JSM-IT500HR pair before trusting pixel size and stage.
+STATUS: verified on the 197 real JSM-IT500HR image + .txt pairs in data/ (2026-11-06, docs/decisions.md D5, D17):
+pixel size from the field of view agrees with SM_MICRON_MARKER / SM_MICRON_BAR (bar in file pixels).
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ from pydantic import BaseModel
 IMAGE_SUFFIXES = (".tif", ".tiff", ".bmp", ".png", ".jpg", ".jpeg")
 
 _ALIASES = {
-    "stage": ("CM_STAGE_POS", "SM_STAGE_POS"),
+    "stage": ("CM_STAGE_POSITION", "CM_STAGE_POS", "SM_STAGE_POS"),
     "kv": ("CM_ACCEL_VOLT", "SM_ACCEL_VOLT", "CM_ACCEL_VOLTAGE"),
     "mag": ("CM_MAG", "SM_MAG"),
     "wd": ("SM_WD", "CM_WD", "SM_WORKING_DISTANCE", "CM_WORKING_DISTANCE", "CM_WORK_DIST"),
@@ -32,7 +36,9 @@ _ALIASES = {
     "bar": ("SM_MICRON_BAR", "CM_MICRON_BAR"),
     "full_size": ("CM_FULL_SIZE", "SM_FULL_SIZE"),
     "instrument": ("CM_INSTRUMENT", "SM_INSTRUMENT"),
-    "signal": ("CM_SIGNAL", "SM_SIGNAL"),
+    "signal": ("SM_DETECTOR", "CM_SIGNAL", "SM_SIGNAL"),
+    "fov": ("CM_FIELD_OF_VIEW",),
+    "image_size": ("CM_IMAGE_SIZE",),
     "image_name": ("CM_IMAGE_NAME",),
     "date": ("CM_DATE",),
     "time": ("CM_TIME",),
@@ -56,6 +62,9 @@ class BSEMetadata(BaseModel):
     pixel_size_um: float | None = None
     pixel_size_source: str = ""          # which keys gave the pixel size
     full_size_px: tuple[int, int] | None = None
+    image_size_px: tuple[int, int] | None = None     # CM_IMAGE_SIZE: width, height of the image area (no data bar)
+    field_of_view_um: tuple[float, float] | None = None
+    data_bar_px: int | None = None       # SM_PNU_HEIGHT
     raw: dict[str, str] = {}
     verified_format: bool = False        # True once checked against a real JSM-IT500HR file
 
@@ -82,6 +91,15 @@ def _nums(s: str) -> list[float]:
     return [float(v) for v in _NUM.findall(s)]
 
 
+def _read_text(path: Path) -> str:
+    """JEOL writes UTF-8 with a BOM (µ = 2 bytes); older / synthetic files may be Latin-1."""
+    b = path.read_bytes()
+    try:
+        return b.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return b.decode("latin-1")
+
+
 def _length_um(s: str) -> float | None:
     v = _nums(s)
     if not v:
@@ -97,7 +115,7 @@ def _length_um(s: str) -> float | None:
 def read_metadata(txt: str | Path, image_shape: tuple[int, int] | None = None) -> BSEMetadata:
     """Parse a JEOL .txt. image_shape = (rows, cols) of the saved image, used to rescale the
     scale-bar pixel size when the image is not saved at CM_FULL_SIZE."""
-    raw = parse_txt(Path(txt).read_text(encoding="latin-1"))
+    raw = parse_txt(_read_text(Path(txt)))
     m = BSEMetadata(raw=raw)
     for field, what in (("instrument", "instrument"), ("signal", "signal"),
                         ("image_name", "image_name"), ("date", "date")):
@@ -106,7 +124,8 @@ def read_metadata(txt: str | Path, image_shape: tuple[int, int] | None = None) -
             setattr(m, field, hit[1])
     if (hit := _first(raw, "stage")):
         v = _nums(hit[1])
-        for name, val in zip(("stage_x_mm", "stage_y_mm", "stage_z_mm", "stage_tilt_deg", "stage_rotation_deg"), v):
+        # JEOL order X Y Z R T (CM_STAGE_POSITION on the JSM-IT500HR: 4th value 241.12 = rotation)
+        for name, val in zip(("stage_x_mm", "stage_y_mm", "stage_z_mm", "stage_rotation_deg", "stage_tilt_deg"), v):
             setattr(m, name, val)
     if (hit := _first(raw, "kv")) and (v := _nums(hit[1])):
         m.accelerating_voltage_kV = v[0] / 1000.0 if v[0] > 100 else v[0]      # > 100 -> given in V
@@ -118,9 +137,24 @@ def read_metadata(txt: str | Path, image_shape: tuple[int, int] | None = None) -
         v = _nums(hit[1])
         if len(v) >= 2:
             m.full_size_px = (int(v[0]), int(v[1]))
+    if (hit := _first(raw, "image_size")):
+        v = _nums(hit[1])
+        if len(v) >= 2:
+            m.image_size_px = (int(v[0]), int(v[1]))
+    if (hit := _first(raw, "fov")):
+        parts = hit[1].split()
+        if len(parts) >= 2 and _length_um(parts[0]) and _length_um(parts[1]):
+            m.field_of_view_um = (_length_um(parts[0]), _length_um(parts[1]))
+    if raw.get("SM_PNU_HEIGHT") and _nums(raw["SM_PNU_HEIGHT"]):
+        m.data_bar_px = int(_nums(raw["SM_PNU_HEIGHT"])[0])
+    width = image_shape[1] if image_shape else (m.image_size_px[0] if m.image_size_px else None)
     if (hit := _first(raw, "pixel")):
         m.pixel_size_um = _length_um(hit[1])
         m.pixel_size_source = hit[0]
+    elif m.field_of_view_um and width:
+        m.pixel_size_um = m.field_of_view_um[0] / width
+        m.pixel_size_source = "CM_FIELD_OF_VIEW / image width"
+        m.verified_format = True
     else:
         mk, bar = _first(raw, "marker"), _first(raw, "bar")
         if mk and bar and _nums(bar[1]):

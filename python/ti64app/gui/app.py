@@ -1,6 +1,6 @@
 """NiceGUI front end (localhost). Pages: project browser (/), map viewer (/viewer, gui/viewer.py), sample sheet
 (/sample), maps (/maps), prior-beta reconstruction (/recon), grain size (/grainsize), parameter panels for every
-operation (/ops), recipe history with undo / redo / replay (/recipe) and Settings (/settings) (gui/pages.py).
+operation (/ops), SEM image stitching (/stitch, gui/stitch_page.py), recipe history with undo / redo / replay (/recipe) and Settings (/settings) (gui/pages.py).
 
 All actions go through ti64app.service (recorded in recipe.json), the same as the MCP tools.
 Run:  python -m ti64app.gui.app      -> http://127.0.0.1:8064
@@ -53,7 +53,7 @@ def _nav() -> None:
 
 NAV = [("Projects", "/"), ("Viewer", "/viewer"), ("Sample sheet", "/sample"), ("Maps", "/maps"),
        ("Reconstruction", "/recon"), ("Grain size", "/grainsize"), ("Operations", "/ops"),
-       ("Compare backends", "/compare"), ("Recipe", "/recipe"),
+       ("Stitch SEM", "/stitch"), ("Compare backends", "/compare"), ("Recipe", "/recipe"),
        ("Settings", "/settings")]
 
 
@@ -537,6 +537,7 @@ def grainsize_page() -> None:
 
 def build() -> None:
     from . import pages, tiles  # noqa: F401, PLC0415  (tiles registers the tile routes)
+    from .stitch_page import stitch_page  # noqa: PLC0415
     from .viewer import viewer_page  # noqa: PLC0415
 
     ui.page("/")(lambda: pages.project_page(STATE, current_project, _nav, _error))
@@ -548,6 +549,7 @@ def build() -> None:
     ui.page("/ops")(lambda: pages.ops_page(current_project, _nav, _error))
     ui.page("/recipe")(lambda: pages.recipe_page(current_project, _nav, _error))
     ui.page("/compare")(lambda: pages.compare_page(current_project, _nav, _error))
+    ui.page("/stitch")(lambda: stitch_page(current_project, _nav, _error))
     ui.page("/settings")(lambda: pages.settings_page(current_project, _nav, _error))
 
 

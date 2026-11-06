@@ -37,7 +37,8 @@ def test_parse_metadata(bse_pair):
     im, m = bse.load_bse(path)
     np.testing.assert_array_equal(im, img)
     assert m.instrument == "JSM-IT500HR" and m.signal == "BED-C"
-    assert (m.stage_x_mm, m.stage_y_mm, m.stage_z_mm, m.stage_tilt_deg, m.stage_rotation_deg) == \
+    # JEOL order X Y Z R T (verified on real JSM-IT500HR files, decisions D5 / D17)
+    assert (m.stage_x_mm, m.stage_y_mm, m.stage_z_mm, m.stage_rotation_deg, m.stage_tilt_deg) == \
            (37.5085, 41.221, 10.0, 0.0, 15.5)
     assert m.working_distance_mm == 10.2 and m.accelerating_voltage_kV == 20.0 and m.magnification == 500
     # 50 um / 128 px at full size 1280 px; image saved at 640 px -> x2

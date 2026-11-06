@@ -1,6 +1,6 @@
 # Ti64 EBSD/BSE analysis app – documentation
 
-State after phase 5 (2026-11-01). Details of decisions: `docs/decisions.md`; data facts:
+State after phase 6.5 (2026-11-06). Details of decisions: `docs/decisions.md`; data facts:
 `docs/data_audit.md`; timings and RAM: `docs/performance.md`; reconstruction method (phase 3):
 `docs/beta_reconstruction_method.md`.
 
@@ -27,6 +27,7 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 | MCP server | `ti64 mcp` (stdio). Register in Claude Code (machine-local, not committed): `claude mcp add ti64 --scope local -- C:\Users\matej\miniforge3\envs\ti64\Scripts\ti64.exe mcp`; check with `claude mcp get ti64`; new tools appear in the next Claude Code session |
 | MCP demo (stdio client, both backends) | `python scripts/mcp_demo.py <map.ang> --angle <BD deg> [--map-id ID] [--prefix demo_mcp]` → projects `<prefix>_pymtex`, `<prefix>_matlab`, log `projects/<prefix>_log.json` |
 | CLI | `ti64 backends`, `ti64 ops`, `ti64 run <recipe.json> [--project P] [--backend B] [--include-stale] [--until ID] [--no-compare] [--json]`, `ti64 replay <project>` |
+| Stitch SEM images | `ti64 stitch <folder or files> [--scan] [--detector BSE\|SE\|both] [--se-layout bse] [--info-strip none\|keep\|generate] [--blend none] [--exclude 9771 ...] [--project P] [--json]`; GUI `/stitch`; MCP `scan_sem_images`, `stitch_images` |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
 | Test crops | `python scripts/make_crops.py` (300×300 and 1000×1000 points, into `data/test/crops/`) |
 | Full-map check | `python scripts/run_phase2_full.py JU02 pymtex --angle 270`; reconstruction: `python scripts/run_phase3_full.py JU02 pymtex --angle 270 [--or-mode burgers] [--sweep]`; grain size: `python scripts/run_phase4_full.py JU02 pymtex --angle 270 [--hagb 5]` |
@@ -133,6 +134,27 @@ Burgers, 53 (796) grains, fit 3.57°, ECDaw 89.5 µm; MATLAB 0.97° → refined 
 the compare table flags `or_used` burgers vs refined as the cause. Times: pymtex recon 20 s, MATLAB 78 s, compare
 109 s. `ti64 run projects/demo_mcp_pymtex/recipe.json` reproduced 21/21 recorded outputs (incl. the compare step).
 
+### Phase 6.5 – SEM image stitching
+| Feature | Implementation |
+| --- | --- |
+| Scan a folder / file list of JEOL images (.bmp first; .tif/.png/.jpg): image + .txt by base name, detector class from `$SM_DETECTOR` (file name as fallback), counts per detector, image number, stage, pixel size (`$CM_FIELD_OF_VIEW` / width), magnification, scan / stage rotation, beam shift | `modules/stitching.py` `scan`, `read_tile`, `detector_counts`; `io/bse.py` (real JEOL keys, D5 update) |
+| Data bar cropped: file height − `$CM_IMAGE_SIZE` height (64 / 128 / 256 px at 1280 / 2560 / 5120); without .txt the 4:3 rule confirmed by strip detection; manual `strip_px` last | `stitching.detect_strip`, `read_tile` |
+| Refuses tiles with another pixel size / magnification (unless `allow_rescale`), scan rotation, stage rotation or tilt | `check_consistency` |
+| Stage → image axis mapping chosen from the data (signed permutations scored by overlap NCC); measured default +Y → down, +X → left | `choose_stage_map`, `DEFAULT_STAGE_MAP` (D17) |
+| Pairwise registration: phase correlation + masked NCC surface at ~640 px, NCC score, subpixel phase correlation at full resolution; weak / far pairs rejected; all-pairs search without .txt; optional rotation check | `register_pair`, `ncc_surface`, `rotation_check` |
+| Global least squares over good pairs anchored to the stage, worst pair dropped while residual > 3 px; stage-only tiles flagged | `solve_positions` |
+| Per-tile gain / offset normalisation, linear feathering or no blending (raw pixels); integer placement, subpixel positions reported | `intensity_correction`, `render` |
+| "Stitch BSE, apply the layout to SE": SE tile matched to its BSE tile (same image number), same canvas → aligned mosaics | `se_layout="bse"`, `_se_from_bse` |
+| Info strip: none / keep original (single column; bottom tile's strip) / generate new (JEOL look, ranges, image numbers, redrawn round scale bar) | `modules/jeol_strip.py` |
+| Output per detector: TIFF (BigTIFF + pyramid when large), PNG preview, JSON sidecar (inputs, positions px + µm, pixel size, stage → mosaic transform, scores, residuals, strip height), CSV tile table; band-wise rendering into a disk-backed array (RAM) | `write_tiff`, `write_preview`, op `sem.stitch` (`ops_stitch.py`, output kind `mosaic`) |
+| GUI `/stitch`: folder / file browser, detector counts, options, stage-predicted thumbnail layout, stitch with progress, tile borders coloured by match score, click a tile → nudge / exclude → re-stitch, export dialog | `gui/stitch_page.py` |
+| MCP `scan_sem_images` (read-only), `stitch_images`; CLI `ti64 stitch` | `mcp_server.py`, `cli.py` |
+| Tests | `tests/unit/test_stitching.py` (synthetic tiles with known subpixel offsets, noise, gain changes, fake data bar, three stage mappings, no-.txt path, blending, SE layout, strips, pyramid, recipe replay, MCP + CLI), `test_gui_stitch.py`, `tests/integration/test_stitching_real.py` (data/test/stitch + JU04–JU06) |
+
+Real data (data/test/stitch, BSE, 2026-11-06): 8 tiles → 2618 × 11 861 px at 10 nm/px, all 7 neighbour pairs
+registered (NCC 0.44–0.88), no stage-only tiles; order top → bottom 9776, 9775, 9774, 9773, 9772, 9771, 9777,
+9778 (= increasing stage Y). BSE + SE with the BSE layout and kept strip: 20 s, peak RAM 0.9 GB.
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -143,8 +165,10 @@ Data and inputs needed from the user:
       (GUI Maps page or MCP `compare_with_oim`) for the IPF/CI comparison.
 - [ ] **OIM figure with an in-plane reference** (IPF along RD/TD or an OIM pole figure) to settle the
       x↔y frame question (decision D1: setting 2 vs the bachelor-thesis convention).
-- [ ] **JEOL BSE image + .txt pair** (JSM-IT500HR) to verify the BSE metadata parser (D5), plus images of
-      both specimen edges for position fiducials.
+- [x] **JEOL BSE image + .txt pairs** (JSM-IT500HR): parser verified on 197 real pairs (D5 update, D17).
+- [ ] Images of both specimen edges for position fiducials (phase 7).
+- [ ] A real **2D grid** of overlapping SEM tiles (only 1D sets in data/) to test stitching with loops in the pair
+      graph; and tiles at another stage rotation to check that the stage → image mapping (D17) does not depend on R.
 - [ ] **Build direction of RI02 and RM02** (sample sheets); JU02 = 270° from the thesis.
 - [ ] Which OIM cleanup steps were applied to the `_cleaned` maps; raw (uncleaned) exports if available.
 - [x] Earlier results (`EBSD_data/JU`) copied to `data/reference/JU`.

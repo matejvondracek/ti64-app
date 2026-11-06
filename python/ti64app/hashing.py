@@ -43,8 +43,12 @@ def png_hash(path: Path) -> str:
 
 
 def bytes_hash(path: Path) -> str:
-    """Hash of a file's bytes (CSV tables: written deterministically)."""
-    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    """Hash of a file's bytes (CSV tables, mosaic TIFFs: written deterministically). Streamed (large mosaics)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(16 * 2**20), b""):
+            h.update(chunk)
+    return "sha256:" + h.hexdigest()
 
 
 def xlsx_hash(path: Path) -> str:

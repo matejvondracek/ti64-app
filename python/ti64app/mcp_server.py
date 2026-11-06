@@ -21,6 +21,7 @@ from .annotations import Annotation
 from .backends import backend_status, get_backend
 from .backends.base import CleanupParams, ReconParams
 from .layers import LayerParams
+from .modules.stitching import StitchParams
 from .ops_export import ExportParams
 from .ops_grainsize import GrainSizeParams
 from .project import Project, list_projects, projects_dir
@@ -103,6 +104,11 @@ ExportOptions = _options(ExportParams, "ExportOptions",
                          "Further export options: annotations, roi_outlines, scale_bar, title, colorbar, legend, "
                          "line_px, background, name.")
 FigurePatch = _partial(FigureStyle, "FigurePatch", "Figure settings to change (None = keep).")
+StitchOptions = _options(StitchParams, "StitchOptions",
+                         {"folder", "files", "detector", "se_layout", "info_strip", "blend", "exclude", "nudge"},
+                         "Further stitching options: strip_px, allow_rescale, stage_map, search_um, min_overlap_px, "
+                         "min_score, se_min_score, se_search_px, max_residual_px, rotation_check, normalize, "
+                         "single_column_tol_px, tiff_tile, pyramid_min_px, preview_max_px, band_px.")
 
 # every service operation and the tool that runs it (tests check that this covers service.OPS)
 TOOL_FOR_OP = {
@@ -113,6 +119,7 @@ TOOL_FOR_OP = {
     "grainsize.run": "grain_size", "grainsize.figure": "grain_size_figure",
     "grainsize.compare_oim": "compare_oim_grain_size", "annotations.set": "set_annotations",
     "ebsd.crop": "crop_map", "export.map": "export_map", "compare.backends": "compare_backends",
+    "sem.stitch": "stitch_images",
 }
 
 
@@ -564,6 +571,59 @@ def export_map(project: str, map_id: str, kind: str = "ipf",
     step = service.run(p, "export.map", _clean(params), backend=backend)
     return {**_step_summary(step), "file": _path(p, step, "export"), "sidecar": _path(p, step, "sidecar"),
             "meta": _json_out(p, step, "sidecar")}
+
+
+# ---- SEM image stitching (phase 6.5) ---------------------------------------------------------
+@server.tool()
+def scan_sem_images(folder: str | None = None, files: list[str] | None = None,
+                    strip_px: int | None = None) -> dict[str, Any]:
+    """Read-only look at a folder (or files) of SEM images before stitching: counts per detector class (BSE / SE /
+    other) and per detector name ($SM_DETECTOR, else the file name), data-bar height and its source, pixel size,
+    magnification, stage X/Y per image. Nothing is recorded."""
+    from .modules import stitching  # noqa: PLC0415
+
+    tiles = stitching.scan(folder, files, strip_px=strip_px)
+    return {"counts": stitching.detector_counts(tiles), "detectors": stitching.detector_detail(tiles),
+            "images": [{"name": t.name, "detector": t.detector, "class": t.detector_class,
+                        "source": t.detector_source, "image_number": t.image_number,
+                        "size_px": [t.file_width, t.file_height], "strip_px": t.strip_px,
+                        "strip_source": t.strip_source, "pixel_size_um": t.pixel_size_um,
+                        "magnification": t.magnification, "stage_xy_mm": [t.stage_x_mm, t.stage_y_mm],
+                        "warnings": t.warnings} for t in tiles]}
+
+
+@server.tool()
+def stitch_images(project: str, folder: str | None = None, files: list[str] | None = None,
+                  detector: Literal["BSE", "SE", "both"] = "BSE", se_layout: Literal["own", "bse"] = "own",
+                  info_strip: Literal["none", "keep", "generate"] = "none",
+                  blend: Literal["feather", "none"] = "feather", exclude: list[str] | None = None,
+                  nudge: dict[str, tuple[float, float]] | None = None,
+                  options: StitchOptions | None = None) -> dict[str, Any]:  # type: ignore[valid-type]
+    """Stitch overlapping JEOL SEM images into one mosaic per detector (BSE = BED-*, SE = SED/...; never mixed;
+    check counts with scan_sem_images first). se_layout 'bse' stitches BSE and places each SE tile with the BSE
+    layout (small SE->BSE shift per image number) so both mosaics align. info_strip: none (default, for analysis),
+    keep (original data bar of the bottom tile; single-column mosaics only), generate (new JEOL-style strip with
+    ranges, image numbers and a redrawn scale bar). blend 'none' keeps raw pixel values. exclude / nudge (dx, dy px)
+    by file stem or image number. Returns per detector the TIFF, preview PNG, sidecar path, mosaic size, residuals,
+    weak pairs and tiles placed by the stage only."""
+    p = _project(project)
+    params = {"folder": folder, "files": files, "detector": detector, "se_layout": se_layout,
+              "info_strip": info_strip, "blend": blend, "exclude": exclude or [], "nudge": nudge or {},
+              **_set(StitchOptions, options)}
+    step = service.run(p, "sem.stitch", _clean(params))
+    out = _step_summary(step)
+    for det in ("BSE", "SE"):
+        if f"sidecar_{det}" in step.outputs:
+            side = _json_out(p, step, f"sidecar_{det}")
+            out[det] = {"tiff": _path(p, step, f"mosaic_{det}"), "preview": _path(p, step, f"preview_{det}"),
+                        "sidecar": _path(p, step, f"sidecar_{det}"), "mosaic_px": side["mosaic_px"],
+                        "pixel_size_um": side["pixel_size_um"], "residual_px": side["residual_px"],
+                        "stage_only_tiles": side["stage_only_tiles"], "strip": side["strip"],
+                        "stage_map": side["stage_map"].get("chosen"),
+                        "weak_pairs": [q for q in side["pairs"] if not q["ok"]],
+                        "tiles": [{k: t[k] for k in ("name", "x_px", "y_px", "best_score", "placed_by")}
+                                  for t in side["tiles"]]}
+    return out
 
 
 @server.tool()
