@@ -366,3 +366,147 @@
 - **Not covered by data here:** a 2D grid of real tiles (none in data/: every multi-tile set moved along one axis, and
   `JU04/stich along crack path` is not usable: 9466 / 9467 and 9469 / 9470 / 9472 share stage X **and** Y but show
   different fields, so the stage Y reading did not follow the moves). 2D grids are tested on synthetic data only.
+
+## D18 (2026-11-06) Samples and linked files: SampleInfo + MapInfo, format 2 migration (phase 6.6)
+- **Model.** `sample.py`: `SampleInfo` = one specimen, entered once (ID e.g. JU04, material, process, heat treatment,
+  4PB geometry + load, build direction in the specimen frame as an axis ±X/±Y/±Z, tension side ±Y, notes);
+  `MapInfo` = one linked file (absolute path, kind ang / image / up2 / other, sample or Unassigned, size + mtime,
+  input state, build direction in map coordinates, position, role tension / middle / compression, notes, and optional
+  per-file overrides of the inherited values material / process / heat treatment / 4PB). A file belongs to one sample.
+  The EBSD ops still read one `SampleSheet` per map: `Project.sample(map_id)` builds it from MapInfo + SampleInfo
+  (`effective_sheet`), so no op changed. A map is usable once it has a sample, an input state and a build direction;
+  otherwise the op stops with a plain message naming what to enter (never guessed).
+- **Storage (project format 2).** `samples.json` (list of SampleInfo) and `files.json` (list of MapInfo) replace
+  `samples/<map_id>.json`. `sample.set` (MCP `set_sample_sheet`, old recipes) still takes a full sheet: it creates the
+  sample if needed and stores values that differ from the sample as per-file overrides, so the effective sheet equals
+  the sheet given (replay of format 1 recipes gives the same results).
+- **Migration.** On open, a format 1 project (samples/ folder, no files.json) is converted: one SampleInfo per
+  specimen_id (from the first sheet of that specimen), one MapInfo per sheet with overrides where sheets of the same
+  specimen differed. The old folder is kept as `.history/format1_samples/`; `project.json` gets `format_version: 2`.
+  The undo snapshots are converted the same way, so undo across the migration restores format 2 files. The undo
+  stack moved from `cache/history/` to `.history/undo/` (so "Clear cache" never deletes it).
+- **Stale results.** Editing a file's sheet (or its sample, or moving it to another sample) marks that map's steps stale
+  only if the effective values the results depend on change (input state, build direction, 4PB, position, file);
+  notes, material, process and the sample ID do not.
+- **Sample suggestions.** Auto-assign proposes the sample ID from the first `[A-Z]{2}\d{2}` token of the file name,
+  else of the folder names (JU04 in `9445_MVH1_JU04_SED_1.bmp`, JU02 in `EBM_Ti64_JU02_C_Area 3_…ang`); the user
+  confirms the list. The role is suggested from the position through the thickness: |Y| ≤ 10 % of half the
+  thickness (0.05 mm without 4PB data) = middle; otherwise tension / compression from the sample's tension side, which
+  the user enters (no sign convention is assumed). JEOL stage coordinates are shown next to the position fields but
+  not converted to the specimen frame (the stage → specimen mapping is not known).
+- **Recipe.** Every step records `sample_id` (explicit `sample_id` param, else the sample of its map, else the
+  specimen of a `sample.set` sheet). Output folders are `outputs/<sample>_<step>/`; export names (`export.map`,
+  `sem.stitch`, `sem.export`) start with the sample ID unless the name already does (JU02_C_Area3 stays as it is).
+  Older projects keep their `outputs/<step>/` folders (`Project.find_step_dir` finds both).
+
+## D19 (2026-11-06) Desktop GUI, autosave and recovery (phase 6.6)
+- **Window.** `ti64-gui` (gui-script → `Scripts\ti64-gui.exe`, pythonw: no console, no conda activate) runs the
+  NiceGUI server in a background thread (`ui.run_with` + uvicorn on a free local port) and shows it in a pywebview
+  window (Edge WebView2). Chosen over NiceGUI's `native=True` because pywebview then runs in the main thread of one
+  process: native file dialogs, bring-to-front and a pythonw launcher work without NiceGUI's window subprocess.
+  `python -m ti64app.gui --browser` / `ti64 gui --browser` serve the same pages in a browser (Playwright, Claude,
+  development); the GUI tests always use the browser mode.
+- **One window per project.** The window writes `<project>/.window.lock` (pid, port). Opening a project whose lock
+  belongs to a live process calls that window's `/api/ti64/focus` (restore + show + briefly on top) instead of opening
+  it twice; opening another project from a window that already shows one starts a new window process.
+- **No console.** Logs go to `%APPDATA%\ti64app\logs\ti64-gui.log` (rotating, 3 × 2 MB). Start-up errors (missing
+  pywebview / WebView2, server not starting, unhandled exceptions) open a Windows message box that offers to open the
+  log; errors inside the app are plain-language notifications with an "Open log" button. Missing WebView2 runtime:
+  the message names the Evergreen Bootstrapper (developer.microsoft.com/microsoft-edge/webview2) and the
+  `ti64 gui --browser` fallback.
+- **Windows dialogs.** Native pywebview dialogs in the desktop window, tkinter dialogs in browser mode on this machine,
+  and a queue of answers in tests (`dialogs.MOCK`, or the JSON file named by `TI64_MOCK_DIALOGS` for Playwright).
+- **Autosave.** Every state file is written atomically (temp file + rename): project.json, recipe.json, samples.json,
+  files.json, annotations.json, gui_state.json, preferences. Sheet fields save on blur / Enter; Settings save on
+  every change; there is no Save button and no prompt on close. The top bar shows "Saved" / "Saving..." / the error.
+- **Working state.** `gui_state.json`: open tab, selected file / tree item, per map the layer, overlays and viewer
+  bounds (restored with `initial_view`), unapplied values of every edit-menu section ("● not applied", restored as
+  drafts), the export choices, the stitch options, the last folder.
+- **Recovery.** recipe.json keeps its last 20 versions in `.history/recipe/` (also on undo); History can restore one
+  (undoable). `running.json` is written while a recorded step runs; if the app closes during it, the next open finds
+  the file of a dead process and offers "Rerun step" (the step was never added to the recipe, so nothing is half
+  recorded).
+- **Linked files.** size + mtime are stored when a file is linked and updated when a step uses it; the Files tab shows
+  missing files greyed out with "Relocate" and changed files with a warning.
+- **Save copy as.** Copies the state files, `outputs/`, `maps/`, `figures/` (hard links where possible) and the GUI
+  state; not `cache/` or the undo history.
+- **Compare to original.** The viewer gets a second tile layer: the same map kind from the `ebsd.load` step (IPF if
+  the kind has no meaning before cleanup). It is swapped in client-side while the button is held (pointer or
+  Space / Enter), same view and zoom; overlays and annotations are hidden meanwhile.
+- **Mosaic export.** New op `sem.export` (PNG / TIFF / SVG with an embedded PNG / PDF, native or width at DPI,
+  optional scale bar from the mosaic pixel size and the info strip); export.map unchanged. Both copy the result to the
+  file chosen in the save dialog and write a JSON sidecar next to it.
+
+## D20 (2026-11-06) True hexagons for hexagonal-grid maps (viewer + exports, both backends)
+- **Processing unchanged** (MTEX EBSDhex in both backends). Only the drawing changes.
+- **Brick** (as before, `ti64app.raster` / `+ti64/hexRaster.m` from EBSD_part2.m): every measurement is a rectangle
+  one step wide and one row high; odd rows are shifted by half a step. Exact at 1 px per measurement (native export),
+  but at high zoom the cells look like bricks with straight vertical edges.
+- **Hexagons**: the cell of a measurement is its Voronoi cell on the hexagonal grid = a regular hexagon of width dx
+  (flat sides left / right, points up / down, height 2 dx / sqrt(3)), neighbouring rows offset by half a cell. A
+  pixel shows the nearest measurement centre; it is always the brick owner of its own row or of the nearer adjacent
+  row (the farther rows are > dy away), so the rasteriser needs two lookups per pixel and no search.
+- **Where:** the viewer draws hexagons when a cell is >= 8 screen pixels (zoom indicator: "brick" / "hexagons", with a
+  tooltip explaining both); exports at native and 2x stay brick (documented in the sidecar `cells`), 4x and 8x draw
+  hexagons with SQUARE pixels of dx / scale (regular hexagons need square pixels; the sidecar records the pixel size).
+- **Each backend draws its own cells** (new protocol method `cell_image`): pymtex with the Python hexagon rasteriser
+  (`raster.hexagon_image`), MATLAB with `+ti64/hexRasterize.m` (same rule, vectorised in chunks; called by
+  `+ti64/hexImage.m` for pixel-exact exports). MATLAB figures (`render.m`, width mode) switch from the brick
+  hexRaster image to hexRasterize when the figure has >= 4 output pixels per measurement; pymtex figures already
+  use pymtex's raster, which picks the nearest measurement (hexagons at that resolution).
+- **Test:** `tests/unit/test_hexagons.py` exports an 8x crop with a unique colour per measurement in each backend and
+  checks the cell shape (pointed top / bottom, height 2/sqrt(3) x width), the half-cell offset of neighbouring rows
+  and that no vertical edge runs through two rows; MATLAB and Python rasters agree to < 0.2 % of the pixels
+  (ties on cell borders).
+
+## D21 (2026-11-06) Stitching after the user test: stitch sets, manual arrangement, no ghosting
+- **Stitch sets.** A folder is often a magnification series (JU04: 23x ... 50000x). Images of different
+  magnification, pixel size or image size are NEVER stitched together (the `allow_rescale` option is removed).
+  `stitch_sets` groups a selection by detector, magnification, pixel size, image size, rotation / tilt and then by
+  overlapping stage footprints (field of view around the stage position, union of overlapping pairs). The GUI lists
+  the sets (single images listed as not stitchable) and stitches one set; a mixed selection is refused with the list
+  of sets.
+- **Manual pre-arrangement.** Arrange view: thumbnails at the stage positions (default JSM-IT500HR mapping) or in a
+  row without stage data; drag tiles, zoom, lock, select (click, Shift / Ctrl-click, Shift-drag box). "Refine" passes
+  `manual_layout` (x, y px per tile), `locked` and `refine_radius` (default 10 % of the tile size): pairs are searched
+  only within that radius around the given positions (the stage prior is replaced), locked tiles get a 1e3 prior
+  weight (1e-4 for the others) in the global least squares. The layout is part of the recorded parameters (replay).
+- **Ghosting.** Feathering over the whole overlap blends two slightly misregistered copies -> double edges. Now:
+  (a) every used overlap is registered again AFTER placement (subpixel phase correlation of the two placed tiles):
+  residual misalignment per pair and max / rms in the sidecar, mean |A - B| vs the pixel noise, and a
+  difference-image view (Overlaps tab); (b) tiles are placed at their subpixel positions: integer origin floor(q)
+  plus a cubic-spline resampling of the fraction (no rounding of origins); pairs are refined at full resolution with
+  subpixel phase correlation (upsample 20); (c) blending only in a narrow band around a seam (`blend="seam"`,
+  default, `blend_band_px` 32): the seam is the midline of the overlap (pixel owned by the tile whose edge is
+  farthest) or a minimum-difference path (`seam="min_difference"`, dynamic programming on the smoothed |A - B|
+  among the pixels the two tiles own); weights ramp linearly over the band from a signed distance transform of each
+  tile's region. `blend="feather"` keeps the old whole-overlap blending, `blend="none"` raw pixels at integer
+  positions. Accumulation arrays are disk-backed (RAM limit).
+- **Test:** synthetic tiles with subpixel offsets and noise: residual misalignment < 0.15 px, |A - B| in the overlaps
+  < 1.6 sigma, and the mosaic differs from the ground truth in the overlaps by less than the noise (no double edges).
+
+## D22 (2026-11-06) GUI changes after the user test of phase 6.6
+- **View tab** (Files | View | EBSD | Crack | Stitch): images, mosaics and .up2 files; image tiles from a mean
+  pyramid (`tiles.ImageLayer`) in the Leaflet viewer (um coordinates), metadata panel, draggable scale bar, Export
+  (`sem.export` now also takes a single image). .up2: header table and a pattern viewer (one pattern read at a time,
+  row / column, step to neighbours); indexing comes in phase 9.
+- **Messages name the exact place** ("under 'Images of the set'", "on the 'prior β' tab"), never "on the right".
+- **Stale-slot bug.** Clicking a button inside a list row also selected the row, which redrew the list and deleted
+  the button while the Windows dialog was open; the handler then failed ("parent element ... deleted") before
+  refreshing (Relocate, New sample for this file). Fixes: row clicks ignore clicks on buttons, and handlers that
+  await a dialog or a long step run in the page's root slot (`state.stable`).
+- **Find missing files**: a folder is searched recursively by name (size first when several match) for all missing
+  files at once; the matches are listed and relinked together.
+- **EBSD tab**: map tabs "α map" | "prior β" | "Results"; each map tab has its own layer, overlays and history (the
+  prior-β history = the reconstruction and the steps that use it); the reconstruction focuses the prior-β tab, which
+  shows no boundaries by default. History is a panel right of the map; steps can be dragged into a new order
+  (`ti64app.reorder`: dependency rules per operation, refused orders say why; a valid order re-runs the map's steps
+  from the first changed position, the old ones stay as stale, automatically resolved step references are resolved
+  again, and the whole reorder is one undo entry via `history.group`). Overlay menu: columns (grows to the right),
+  colour and width factor per boundary type (`OverlayStyle`, also used by exports).
+- **Legends on the map (what you see is what you get)**: scale bar, colour bar / colour legend, IPF key are boxes on
+  the viewer (toggle, drag, resize); their positions (fractions of the view) go into export.map / sem.export
+  (`legends`), which draw the bare map and add the items at the same relative place and size (PNG / TIFF burnt in,
+  SVG embedded images, PDF overlay page with pypdf, new dependency). The export dialog no longer has legend options;
+  it shows the final size in px, the physical size in um and an estimated file size, and takes a typed width or
+  height in px (aspect locked).

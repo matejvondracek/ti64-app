@@ -1,5 +1,5 @@
-"""Phase 5 GUI pages through NiceGUI's simulated user (no browser; the Leaflet viewer itself is exercised by
-scripts/gui_screenshots.py with Playwright, tests/integration/test_gui_playwright.py)."""
+"""Viewer features (phase 5) inside the phase 6.6 EBSD tab, through NiceGUI's simulated user (no browser; the Leaflet
+viewer itself is exercised by scripts/gui_screenshots.py with Playwright, tests/integration/test_gui_playwright.py)."""
 import sys
 
 import pytest
@@ -8,8 +8,8 @@ from nicegui.testing.user_simulation import user_simulation
 from tests.conftest import sample_params
 from ti64app import service
 from ti64app.gui import app as gui
+from ti64app.gui import dialogs
 from ti64app.project import Project
-from ti64app.settings import load_settings
 
 from .test_gui_pages import MAIN
 
@@ -22,8 +22,10 @@ def anyio_backend():
 @pytest.fixture(autouse=True)
 def _reset_state():
     gui.STATE["project"] = None
+    dialogs.MOCK = []
     yield
     gui.STATE["project"] = None
+    dialogs.MOCK = None
 
 
 @pytest.fixture
@@ -40,33 +42,31 @@ def _open(name):
 
 
 @pytest.mark.anyio
-async def test_project_browser_lists_projects_and_maps(gproj):
+async def test_viewer_layer_overlay_and_export_dialog(gproj, tmp_path):
+    target = tmp_path / "out" / "EBMX-1_JU02_c300_ipf.png"
+    target.parent.mkdir()
+    dialogs.MOCK[:] = [str(target)]                             # Windows save dialog
     async with user_simulation(main_file=MAIN) as user:
         _open("gui5")
-        await user.open("/")
-        await user.should_see(marker="project_table")
-        await user.should_see("JU02_c300")
-        await user.should_see(marker="load_JU02_c300")
-        await user.should_see("Recipe history, undo / redo and replay")
-
-
-@pytest.mark.anyio
-async def test_viewer_panels_layer_and_export(gproj):
-    async with user_simulation(main_file=MAIN) as user:
-        _open("gui5")
-        await user.open("/viewer")
-        for panel in ("panel_map", "panel_layer", "panel_key", "panel_overlays", "panel_tools", "panel_export"):
-            await user.should_see(marker=panel)
-        await user.should_see(marker="map_viewer", retries=200)           # layer coloured, viewer created
+        await user.open("/ebsd")
+        await user.should_see(marker="map_viewer", retries=200)
         await user.should_see("coloured by pymtex")
-        await user.should_see(marker="ov_hagb")
-        user.find("ov_hagb").click()
-        user.find("run_export").click()
-        await user.should_see("exported JU02_c300_ipf.png", retries=300)
-        await user.should_see(marker="exp_result")
+        user.find(marker="viewer_overlays").click()                       # overlay menu (columns)
+        user.find(marker="ov_hagb").elements.pop().set_value(True)
+        await user.should_see("Overlays (1)")
+        user.find(marker="export_btn").click()
+        await user.should_see(marker="export_dialog")
+        user.find(marker="exp_browse").click()
+        await user.should_see(marker="exp_fmt")
+        user.find(marker="run_export").click()
+        await user.should_see("Exported EBMX-1_JU02_c300_ipf.png", retries=300)
     steps = gproj.recipe().steps
     assert steps[-1].op == "export.map" and steps[-1].params["overlays"] == ["hagb"]
     assert steps[-1].params["layer"]["ipf_keys"]["Ti (alpha)"]["key"] == "ipfHKLKey"
+    assert target.is_file() and target.with_suffix(".json").is_file()
+    assert gproj.gui_state()["export"]["map"]["format"] == "png"           # last choices remembered
+    assert [it["kind"] for it in steps[-1].params["legends"]] == ["scale_bar"]   # as shown on the map (WYSIWYG)
+    assert gproj.gui_state()["overlays"]["JU02_c300"] == {"alpha": ["hagb"]}         # per map tab
 
 
 @pytest.mark.anyio
@@ -75,7 +75,7 @@ async def test_viewer_drawing_probe_measure_events(gproj):
 
     async with user_simulation(main_file=MAIN) as user:
         _open("gui5")
-        await user.open("/viewer")
+        await user.open("/ebsd")
         await user.should_see(marker="map_viewer", retries=200)
         v = user.find("map_viewer")
         v.trigger("shape", {"type": "arrow", "xy": [[2, 2], [10, 8]]})
@@ -84,21 +84,24 @@ async def test_viewer_drawing_probe_measure_events(gproj):
         await user.should_see("roi_rect added", retries=100)
         await user.should_see("roi_rect ROI1")
         v.trigger("shape", {"type": "text", "xy": [[3, 3]]})                 # no text entered yet
-        await user.should_see("enter the text first")
+        await user.should_see("Enter the text first")
         v.trigger("probe", {"type": "probe", "xy": [[10.0, 10.0]]})
         await user.should_see("point ")
         v.trigger("measure", {"type": "measure", "xy": [[0, 0], [3, 4]]})
         await user.should_see("distance 5.00 µm")
+        v.trigger("view", {"x0": 1.0, "x1": 20.0, "y0": 2.0, "y1": 15.0, "zoom": 2})
     a = load_annotations(gproj, "JU02_c300")
     assert [x.type for x in a] == ["arrow", "roi_rect"] and a[1].text == "ROI1"
     assert [s.op for s in gproj.recipe().steps][-2:] == ["annotations.set", "annotations.set"]
+    assert gproj.gui_state()["view"]["JU02_c300"]["x1"] == 20.0                 # restored on reopen
 
 
 @pytest.mark.anyio
-async def test_recipe_page_undo_redo(gproj):
+async def test_history_undo_redo(gproj):
     async with user_simulation(main_file=MAIN) as user:
         _open("gui5")
-        await user.open("/recipe")
+        await user.open("/ebsd")
+        await user.should_see(marker="history_panel")                     # right of the map
         await user.should_see(marker="recipe_table")
         await user.should_see("undo: grains.calc")
         user.find("undo").click()
@@ -106,17 +109,19 @@ async def test_recipe_page_undo_redo(gproj):
     assert [s.op for s in gproj.recipe().steps] == ["sample.set", "ebsd.load"]
     async with user_simulation(main_file=MAIN) as user:
         _open("gui5")
-        await user.open("/recipe")
+        await user.open("/ebsd")
+        await user.should_see(marker="recipe_table")
         user.find("redo").click()
         await user.should_see("redone: grains.calc", retries=100)
     assert gproj.recipe().steps[-1].op == "grains.calc"
 
 
 @pytest.mark.anyio
-async def test_ops_page_builds_forms_and_runs(gproj):
+async def test_any_operation_section_runs(gproj):
     async with user_simulation(main_file=MAIN) as user:
         _open("gui5")
-        await user.open("/ops")
+        await user.open("/ebsd")
+        user.find(marker="sec_ops").click()
         await user.should_see("Parameter panels for every operation")
         await user.should_see("overrides")                                  # ebsd.cleanup form
         user.find("ops_run").click()
@@ -128,23 +133,10 @@ def test_param_form_types():
     """Every op's params model can be turned into a form (no unsupported field types)."""
     import typing
 
-    from ti64app.gui.pages import _unwrap
+    from ti64app.gui.history_panel import _unwrap
     for name, spec in service.OPS.items():
         for f, info in spec.params.model_fields.items():
             tp, _ = _unwrap(info.annotation)
             assert tp is not None, (name, f)
             if typing.get_origin(tp) is typing.Literal:
                 assert typing.get_args(tp)
-
-
-@pytest.mark.anyio
-async def test_settings_page_saves_style_and_paths():
-    async with user_simulation(main_file=MAIN) as user:
-        await user.open("/settings")
-        for c in ("settings_backend", "settings_ipf", "settings_style", "settings_paths"):
-            await user.should_see(marker=c)
-        await user.should_see("literature_dir")
-        user.find("literature_dir").clear().type("C:/elsewhere/literature")
-        user.find("save_settings").click()
-        await user.should_see("saved to")
-    assert load_settings().paths.literature_dir == "C:/elsewhere/literature"

@@ -1,5 +1,9 @@
-"""Browser click-through of every GUI page and panel (scripts/gui_screenshots.py) on a demo project built from the
-JU02 1000x1000 crop (load, grains, KAM, reconstruction, annotations). Needs Playwright + Chromium:
+"""Browser click-through of the GUI (scripts/gui_screenshots.py, --browser mode, Windows dialogs mocked):
+home -> new project -> add files -> find missing -> new sample for a file -> fold -> View tab (image, .up2) ->
+EBSD load / cleanup / grains -> overlay menu -> legends on the map -> hexagons when zoomed -> export dialog (sizes) ->
+history reorder (refused + applied + undo) -> prior-beta map tab -> Settings -> Stitch (stitch sets, greyed info-strip
+option, Arrange, Refine, overlap difference, export, View) -> Crack, then 1920x1080. Needs the test data and
+Playwright + Chromium:
     pip install playwright && python -m playwright install chromium
 """
 import os
@@ -14,22 +18,22 @@ REPO = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.slow
 
 
-def test_click_through_every_panel(tmp_path):
+def test_click_through_new_layout(tmp_path):
     pytest.importorskip("playwright")
-    from tests.conftest import CROPS
+    from tests.conftest import CROPS, DATA
 
-    if not sorted(CROPS.glob("*JU02*_crop1000.ang")):
-        pytest.skip("crops missing (python scripts/make_crops.py)")
-    # projects dir + prefs: isolated by conftest; no PYTEST_* variables, or NiceGUI starts in its own test mode
+    if not sorted(CROPS.glob("*JU02*_crop1000.ang")) or not (DATA / "stitch").is_dir():
+        pytest.skip("test data missing (crops: python scripts/make_crops.py; data/test/stitch)")
+    # no PYTEST_* variables, or the GUI would start in NiceGUI's test mode
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
     env["PYTHONPATH"] = str(REPO / "python")
-    subprocess.run([sys.executable, str(REPO / "scripts" / "make_demo_project.py"), "--name", "pw_demo"],
-                   cwd=REPO, env=env, check=True, capture_output=True, timeout=900)
     out = tmp_path / "shots"
-    r = subprocess.run([sys.executable, str(REPO / "scripts" / "gui_screenshots.py"), "--project", "pw_demo",
-                        "--port", "8093", "--out", str(out)], cwd=REPO, env=env, capture_output=True, text=True,
-                       timeout=1800)
+    r = subprocess.run([sys.executable, str(REPO / "scripts" / "gui_screenshots.py"), "--port", "8093",
+                        "--out", str(out), "--work", str(tmp_path / "work")], cwd=REPO, env=env, capture_output=True,
+                       text=True, timeout=2400)
     shots = sorted(out.glob("*.png"))
     assert r.returncode == 0, r.stdout[-4000:]
-    assert len(shots) >= 40 and not any("FAILED" in f.name for f in shots)
+    assert len(shots) >= 35 and not any("FAILED" in f.name for f in shots)
     assert "pageerror" not in r.stdout
+    assert (tmp_path / "work" / "exports" / "JU02_ipf_export.png").is_file()
+    assert (tmp_path / "work" / "exports" / "JU05_mosaic.png").is_file()

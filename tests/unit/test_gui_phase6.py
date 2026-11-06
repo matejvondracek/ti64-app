@@ -1,4 +1,4 @@
-"""Phase 6 GUI: compare-backends page and running a recipe file from the recipe page (NiceGUI simulated user)."""
+"""Phase 6 GUI: Compare backends and History sections of the EBSD tab (NiceGUI simulated user)."""
 import sys
 
 import pytest
@@ -8,7 +8,7 @@ from tests.conftest import sample_params
 from ti64app import service
 from ti64app.backends import get_backend
 from ti64app.gui import app as gui
-from ti64app.gui.pages import compare_table_rows
+from ti64app.gui.history_panel import compare_table_rows
 from ti64app.project import Project
 
 from .test_gui_pages import MAIN
@@ -42,8 +42,9 @@ def _open(name):
 async def test_compare_page_renders(gproj):
     async with user_simulation(main_file=MAIN) as user:
         _open("gui6")
-        await user.open("/compare")
-        for m in ("cmp_op", "cmp_map", "cmp_form", "cmp_run"):
+        await user.open("/ebsd")
+        user.find(marker="sec_compare").click()
+        for m in ("cmp_op", "cmp_form", "cmp_run"):
             await user.should_see(marker=m)
         await user.should_see("Compare backends")
 
@@ -55,7 +56,8 @@ async def test_compare_page_runs_cleanup(gproj):
         pytest.skip("matlab backend unavailable")
     async with user_simulation(main_file=MAIN) as user:
         _open("gui6")
-        await user.open("/compare")
+        await user.open("/ebsd")
+        user.find(marker="sec_compare").click()
         user.find(marker="cmp_op").elements.pop().set_value("ebsd.cleanup")
         user.find(marker="cmp_run").click()
         await user.should_see(marker="cmp_result", retries=1200)
@@ -77,8 +79,9 @@ async def test_recipe_page_runs_recipe_file(gproj):
     async with user_simulation(main_file=MAIN) as user:
         _open("gui6")
         Project.create("gui6_target")
-        await user.open("/recipe")
-        await user.should_see(marker="run_recipe_file")
+        await user.open("/ebsd")
+        await user.should_see(marker="history_panel")
+        await user.should_see(marker="run_recipe")
     # same service call the button makes
     rep = service.run_recipe(Project.open(gproj.root.parent / "gui6_target"), service.load_recipe_file(gproj.recipe_path),
                              recorded_root=gproj.root)

@@ -1,6 +1,6 @@
 # Ti64 EBSD/BSE analysis app – documentation
 
-State after phase 6.5 (2026-11-06). Details of decisions: `docs/decisions.md`; data facts:
+State after phase 6.6 and the fixes after the user test (2026-11-06). Details of decisions: `docs/decisions.md`; data facts:
 `docs/data_audit.md`; timings and RAM: `docs/performance.md`; reconstruction method (phase 3):
 `docs/beta_reconstruction_method.md`.
 
@@ -10,7 +10,8 @@ A local app for EBSD + BSE analysis of electron-beam-melted Ti-6Al-4V (alpha + r
 orientation and quality maps, cleanup, grains and grain boundaries, prior-beta reconstruction, and later
 grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis.
 
-- One service layer, three front ends: a NiceGUI web page (for the user), MCP tools (for Claude) and a CLI.
+- One service layer, three front ends: a desktop app (NiceGUI in a pywebview window, for the user), MCP tools
+  (for Claude) and a CLI.
 - Two interchangeable analysis backends behind one interface, chosen in Settings:
   **pymtex** (MTEX for Python 1.0.0, default) and **MATLAB R2025b + MTEX 7.2** (optional).
   Each backend computes and draws its own figures; conformance tests check that both give the same numbers.
@@ -21,13 +22,16 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 
 | What | Command (ti64 env: `C:\Users\matej\miniforge3\envs\ti64\python.exe`) |
 | --- | --- |
-| GUI | `python -m ti64app.gui` → http://127.0.0.1:8064 (or `ti64 gui [--project <name>] [--port <n>]`) |
-| Demo project / GUI click-through | `python scripts/make_demo_project.py [--map crop1000\|full] [--no-recon]`; `python scripts/gui_screenshots.py --project phase5_demo` (Playwright: `pip install playwright` + `python -m playwright install chromium`; screenshots in `projects/<p>/screenshots/`) |
+| Desktop app | Start menu / Desktop shortcut **Ti64 EBSD-BSE**, or `Scripts\ti64-gui.exe` in the ti64 env (no console, no conda activate). One-time setup: `python -m pip install -e . --no-deps` (creates `ti64-gui.exe`), then `powershell -ExecutionPolicy Bypass -File scripts\make_shortcut.ps1`. Needs the Microsoft Edge WebView2 runtime (Windows 11 has it; else the Evergreen Bootstrapper from developer.microsoft.com/microsoft-edge/webview2). Log: `%APPDATA%\ti64app\logs\ti64-gui.log` |
+| GUI for development / tests / Claude | `python -m ti64app.gui --browser [--port 8064] [--project <root or name>] [--no-show]` or `ti64 gui --browser` → http://127.0.0.1:8064; without `--browser` both open the desktop window |
+| GUI click-through + screenshots | `python scripts/gui_screenshots.py [--no-stitch]` (Playwright + Chromium: `python -m playwright install chromium`; Windows dialogs mocked; screenshots in `projects/_gui_screenshots/`, demo project in `projects/_gui_demo/`) |
+| Demo project (older scripts) | `python scripts/make_demo_project.py [--map crop1000\|full] [--no-recon]` |
 | Viewer / export timings | `python scripts/bench_viewer.py --project phase5_full --map JU02_full` |
 | MCP server | `ti64 mcp` (stdio). Register in Claude Code (machine-local, not committed): `claude mcp add ti64 --scope local -- C:\Users\matej\miniforge3\envs\ti64\Scripts\ti64.exe mcp`; check with `claude mcp get ti64`; new tools appear in the next Claude Code session |
 | MCP demo (stdio client, both backends) | `python scripts/mcp_demo.py <map.ang> --angle <BD deg> [--map-id ID] [--prefix demo_mcp]` → projects `<prefix>_pymtex`, `<prefix>_matlab`, log `projects/<prefix>_log.json` |
 | CLI | `ti64 backends`, `ti64 ops`, `ti64 run <recipe.json> [--project P] [--backend B] [--include-stale] [--until ID] [--no-compare] [--json]`, `ti64 replay <project>` |
-| Stitch SEM images | `ti64 stitch <folder or files> [--scan] [--detector BSE\|SE\|both] [--se-layout bse] [--info-strip none\|keep\|generate] [--blend none] [--exclude 9771 ...] [--project P] [--json]`; GUI `/stitch`; MCP `scan_sem_images`, `stitch_images` |
+| Stitch SEM images | `ti64 stitch <folder or files> [--scan] [--detector BSE\|SE\|both] [--se-layout bse] [--info-strip none\|keep\|generate] [--blend seam\|feather\|none] [--seam midline\|min_difference] [--band 32] [--exclude 9771 ...] [--project P] [--json]`; GUI Stitch tab; MCP `scan_sem_images` (lists the stitch sets), `stitch_images` |
+| Hexagons of both backends side by side | `python scripts/hex_backends.py` → `projects/_gui_screenshots/hex_backends.png` (+ `_detail.png`) |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
 | Test crops | `python scripts/make_crops.py` (300×300 and 1000×1000 points, into `data/test/crops/`) |
 | Full-map check | `python scripts/run_phase2_full.py JU02 pymtex --angle 270`; reconstruction: `python scripts/run_phase3_full.py JU02 pymtex --angle 270 [--or-mode burgers] [--sweep]`; grain size: `python scripts/run_phase4_full.py JU02 pymtex --angle 270 [--hagb 5]` |
@@ -155,6 +159,56 @@ Real data (data/test/stitch, BSE, 2026-11-06): 8 tiles → 2618 × 11 861 px at 
 registered (NCC 0.44–0.88), no stage-only tiles; order top → bottom 9776, 9775, 9774, 9773, 9772, 9771, 9777,
 9778 (= increasing stage Y). BSE + SE with the BSE layout and kept strip: 20 s, peak RAM 0.9 GB.
 
+### Phase 6.6 – GUI redesign: desktop window, Files / EBSD / Crack / Stitch tabs, samples, autosave
+Layout from the sketches in `docs/gui_mockups/` (01_home, 02_ebsd, 03_files); one colour scheme (navy top bar, blue
+primary, white cards; `gui/theme.py`), rounded buttons, number boxes with increment arrows, hover explanations for every
+option (`gui/tips.py`). Decisions: D18 (samples / files), D19 (desktop, autosave, recovery). The phase 5 / 6 pages
+(`/viewer`, `/maps`, `/recon`, `/grainsize`, `/ops`, `/recipe`, `/compare`, `/sample`, `/settings`) now live in these tabs;
+the old URLs redirect.
+
+| Feature | Where |
+| --- | --- |
+| Desktop window "Ti64 EBSD/BSE" (pywebview + Edge WebView2, server thread on a free port), `ti64-gui.exe` gui-script, app icon `docs/icon.ico`, Desktop / Start-menu shortcut, log file + plain error box with "Open log", WebView2 check, one window per project (`.window.lock`; opening it again brings the window to the front, another project opens a new window) | `gui/desktop.py`, `scripts/make_shortcut.ps1`, `pyproject.toml` `[project.gui-scripts]` |
+| `--browser` mode for Playwright / Claude / development; Windows dialogs native in the window, tkinter in the browser, mocked in tests | `gui/app.py`, `gui/dialogs.py` |
+| Home (no project): New Project (name + location), Open Project (folder dialog + recent projects), title page | `gui/home.py`, `gui/shell.py` |
+| Top bar: tabs Files / EBSD / Crack / Stitch, project name with menu (new, open, save copy as, show folder, close), "Saved / Saving... / error" indicator, Settings gear → dialog (backend + availability, IPF key per phase, figure style, paths, project disk use + Clear cache), every change saved at once | `gui/shell.py` |
+| Files tab: Add file (multi-file dialog, linked by absolute path), Remove (project only, confirmed), tree Project → Sample → files grouped by type and folder, JEOL .txt hidden, missing files greyed with Relocate, changed files flagged, New sample, drag and drop / right-click "Move to sample", Auto-assign (suggested from the file / folder name, confirmed in a list), sample sheet and map sheet (inherited values greyed "from sample", per-file overrides), file metadata (.ang header, JEOL .txt, .up2 header), open a file in its tool (double-click, Enter or button) | `gui/files_tab.py`; `sample.py` `SampleInfo`, `MapInfo`; `project.py` |
+| EBSD tab: accordion of edit sections (Load and cleanup, Maps and IPF key, Grains and boundaries, KAM / GND, Prior-β reconstruction + figures + sweep, Grain size + figures + OIM, Annotations and ROIs, OIM image, any operation), History (undo / redo, re-run with edited parameters, replay, run a recipe file, restore a recipe version, interrupted step) and Compare backends; Apply = one recipe step with a progress bar; fields start from the last applied step; unapplied values kept as drafts ("● not applied"); Export and Compare to original (hold: mouse or Space / Enter) at the bottom; right: Sample / file dropdown, map type, overlays, tool, the tiled viewer and a Results tab | `gui/ebsd_tab.py`, `gui/history_panel.py`, `gui/viewer.py` + `map_viewer.js` (`showAlt`, `initial_view`) |
+| Export dialog (EBSD and Stitch): PNG / TIFF / SVG / PDF, native / 2× / 4× / 8× / width in mm at DPI, region, scale bar, IPF key / colour bar, overlays, annotations, info strip, Windows save dialog, last choices remembered; mosaics through the new op `sem.export` | `gui/export_dialog.py`, `ops_stitch.py` |
+| Stitch tab: images = all images of a sample / a folder / picked files, detector filter with counts, info strip, blending, min. score; layout, result (tile borders by score, nudge / exclude, re-stitch), image view with metadata | `gui/stitch_page.py` |
+| Crack tab: placeholder until phase 8 | `gui/app.py` |
+| Autosave and recovery: atomic writes of every state file, `gui_state.json` (tab, selection, viewer bounds, overlays, drafts, export choices), undo history in `.history/undo/` (survives closing and Clear cache), last 20 recipe.json versions in `.history/recipe/`, `running.json` → "interrupted, rerun?", Save copy as, linked-file size + mtime | `project.py`, `recipe.py`, `history.py`, `gui/state.py` |
+| Samples in the recipe: every step records `sample_id`; output folders `outputs/<sample>_<step>/`; export names start with the sample ID; the current map sheet is recorded as a `sample.set` step before an op uses the map (so the recipe alone replays the project); a sheet change marks results stale only when input state, build direction, 4PB, position or the file change | `service.py` (`record_sheet`, `step_sample`) |
+| Tests | `tests/unit/test_project_samples.py` (inheritance, migration, stale rules, recorded sheets + replay, files, recipe versions, interrupted, copy, cache), `test_gui_layout.py` (home → new project → files / samples / auto-assign → EBSD load + cleanup + drafts + undo → Settings → interrupted → Crack), `test_gui_pages.py`, `test_gui_phase5.py`, `test_gui_phase6.py`, `test_gui_stitch.py` (sections of the new tabs), `tests/integration/test_gui_playwright.py` (slow: `scripts/gui_screenshots.py`, incl. holding Compare to original and both exports) |
+
+Screenshots (`projects/_gui_screenshots/`, made by `scripts/gui_screenshots.py`; git-ignored): home and Open menu,
+new-project dialog, Files tab (empty, unassigned, by sample, auto-assign, sample sheet, map sheet, image sheet, context
+menu), EBSD tab (not loaded, loaded, draft, running, applied, Compare to original held by mouse / keyboard, each
+section, tooltip, History, Compare backends), export dialog, Settings, Stitch (layout, result, export), Crack, keyboard
+focus, and Files / EBSD / Stitch at 1920 × 1080; `00_desktop_window.png` is the native window.
+
+### Phase 6.6 fixes after the user test (2026-11-06)
+Decisions D20 (true hexagons), D21 (stitching), D22 (GUI). Tabs are now **Files | View | EBSD | Crack | Stitch**.
+
+| Change | Where |
+| --- | --- |
+| Stitching never mixes magnifications / pixel sizes: a selection is grouped into **stitch sets** (same magnification + resolution + overlapping stage footprints, e.g. JU04 9475–9479 at 10000×); the Stitch tab lists the sets, single images are listed as not stitchable; a mixed selection is refused with the list of sets (`allow_rescale` removed) | `modules/stitching.py` (`stitch_sets`, `check_one_set`), `gui/stitch_page.py` |
+| **Arrange view**: thumbnails at the stage positions (in a row without stage data), drag, zoom, lock; select with click / Shift-click / Shift-drag box (= the images to stitch, also a checklist filtered by detector); **Refine** searches only within a radius (default 10 % of the tile size) around these positions; the manual layout is saved in the recipe (`manual_layout`, `locked`, `refine_radius`) | `gui/arrange_view.js`, `gui/stitch_page.py`, `modules/stitching.py` |
+| **No ghosting**: subpixel placement (cubic resampling of the fractional offset), full-resolution subpixel pair refinement, blending only in a band around each seam (`blend="seam"`, 32 px; seam = midline or a minimum-difference path); residual misalignment after placement per overlap + a difference-image view (Overlaps tab) | `modules/stitching.py` (`render`, `seam_owner`, `min_difference_seams`, `pair_alignment`, `overlap_difference`) |
+| Info strip "keep the original data bar": greyed out with the reason as a hover tooltip when the images are not one column | `gui/stitch_page.py` |
+| **View tab**: any image or mosaic (zoom / pan, metadata, draggable scale bar, export), `.up2` files (header table + pattern viewer: row / column, step to neighbours; indexing in phase 9) | `gui/view_tab.py`, `gui/tiles.py` (`ImageLayer`, thumbnails), `io/up2.py` (`read_pattern`, `pattern_index`) |
+| Files tab: **Find missing…** searches a folder (with subfolders) by name and size and relinks all missing files at once (list of what was found); the list updates immediately (stale-slot bug fixed for all dialogs: `state.stable`, row clicks ignore buttons); Add file starts with "All files (*.*)"; right-click "New sample for this file" asks for the ID (prefilled) and moves the file; clicking a sample's name folds its files (remembered) | `gui/files_tab.py`, `gui/dialogs.py`, `project.py` (`find_missing`) |
+| EBSD tab: overlay menu in columns (grows to the right) with colour and line width per boundary type; map tabs **α map · prior β · Results**, each map tab with its own layer, overlays and history; the reconstruction focuses the prior-β tab (no boundaries by default) | `gui/ebsd_tab.py`, `ops_ebsd.py` (`OverlayStyle`), `layers.py` |
+| **History panel right of the map**: drag a step onto another to reorder; invalid orders are refused with the reason (e.g. "Cleanup needs a loaded map before it"); a valid order re-runs from the first changed step, old results stay as stale, one undo entry | `gui/history_panel.py`, `reorder.py`, `history.py` (`group`) |
+| **True hexagons**: the viewer draws regular hexagons when a cell is ≥ 8 screen px (zoom indicator says brick / hexagons, tooltip explains both); exports: native and 2× brick, 4× / 8× hexagons drawn by each backend (`cell_image`: pymtex `raster.hexagon_image`, MATLAB `+ti64/hexRasterize.m`); MATLAB `render.m` figures with ≥ 4 px per measurement use hexagons | `raster.py`, `backends/*`, `matlab/+ti64/hexImage.m`, `hexRasterize.m`, `render.m` |
+| **Export dialog**: final size in px, physical size in µm, estimated file size; type the width or height in px (aspect locked), or scale / mm at DPI; hexagon note for hex maps; no legend options any more | `gui/export_dialog.py` |
+| **Legends on the map** (scale bar, colour bar / colour legend, IPF key): toggled in the map toolbar, dragged and resized on the map; exports put them exactly there (PNG / TIFF burnt in, SVG embedded, PDF overlay page via pypdf) | `gui/map_viewer.js`, `legends.py`, `ops_export.py`, `ops_stitch.py` (`sem.export`: also single images) |
+| Tests | `tests/unit/test_stitching.py` (stitch sets, subpixel no-ghosting, min-difference seam + difference image, manual layout + lock + radius), `test_hexagons.py` (per backend, MATLAB marked), `test_reorder.py`, `test_gui_layout.py` (find missing, new sample for a file, fold), GUI tests updated; `scripts/gui_screenshots.py` covers every changed screen |
+
+Screenshots of every changed screen (`python scripts/gui_screenshots.py`, 46 screens, plus
+`python scripts/hex_backends.py` for the pymtex / MATLAB hexagon comparison) are in `projects/_gui_screenshots/`
+(git-ignored; `index.html` shows them all).
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -196,6 +250,19 @@ Technical:
 - [ ] MATLAB halfQuadraticFilter (`l1TVFilter`) is slow (~40× pymtex).
 - [ ] Phases 7–10 (4PB, crack, .up2 re-indexing, packaging).
 - [ ] Renderer scale bars differ (pymtex 25 µm vs MATLAB 50 µm on the same full-map recon figure); harmonise the scale-bar length rule.
+
+Phase 6.6 fixes, open points:
+- [ ] Reordering re-runs the map's steps from the first changed one; on full maps that can take minutes (progress in
+      a notification). Steps of other maps are never moved.
+- [ ] The stage → image mapping of the Arrange view's starting positions is the measured JSM-IT500HR default (D17);
+      Stitch (not Refine) still chooses the mapping from the data.
+- [ ] Legends in SVG exports are embedded raster images (the map and boundaries stay vector).
+
+Phase 6.6 open points:
+- [ ] Specimen frame ↔ JEOL stage: the map position is entered by hand; converting stage X/Y to the specimen frame
+      needs a reference (edge fiducials, phase 7).
+- [ ] Role suggestion needs the tension side (+Y / -Y) on the sample sheet; confirm the convention for your rig.
+- [ ] Drag and drop in the file tree moves one file at a time (several: right-click per file or Auto-assign).
 
 Phase 5 open points:
 - [ ] Pixel-exact exports: colours come from the backend, the pixel layout and line rasterisation from shared Python

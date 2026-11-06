@@ -1,13 +1,19 @@
 """Phase 5 operations: annotations / ROIs, map crop, map export (pixel-exact or figure) with a JSON sidecar.
 
-export.map modes (decisions D15):
+export.map modes (decisions D15, D20):
   native / scale   pixel-exact PNG or TIFF: one measurement = scale x scale pixels (1 = native), nearest
                    neighbour. Colours from the backend (measurement_colors: IPF key, colour map), pixel layout and
-                   overlay lines from raster.py (same geometry for both backends). Pixel size in the resolution
-                   tags and the sidecar; texts and the scale bar are not burnt in (no font renderer).
+                   overlay lines from raster.py (same geometry for both backends). Hex maps: native and 2x keep the
+                   brick layout (1 px per measurement cannot show a hexagon); 4x and 8x draw REGULAR HEXAGONS with
+                   square pixels of dx / scale, rasterised by the backend (cell_image: pymtex = Python hexagon
+                   rasteriser, MATLAB = +ti64/hexRasterize.m). Pixel size in the resolution tags and the sidecar.
   width            a figure exactly width_mm wide at dpi (PNG / TIFF / SVG / PDF), drawn entirely by the
                    backend renderer (pymtex: matplotlib; MATLAB: print), overlays and annotations as vectors,
                    optional scale bar, title, colour bar, legend.
+  legends          (GUI, what you see is what you get) scale bar / colour bar / IPF key placed where the viewer
+                   shows them (fractions of the image, legends.py); with legends the backend draws the bare map
+                   and the items are added on top (raster: burnt in, SVG: embedded images, PDF: overlay page).
+  overlay_style    colour / width factor per overlay class (viewer settings).
 """
 from __future__ import annotations
 
@@ -25,8 +31,9 @@ from .annotations import (Annotation, find, load_annotations, rasterize_primitiv
                           save_map_annotations, to_primitives, validate)
 from .hashing import bytes_hash, file_fingerprint
 from .layers import RECON_KINDS, LayerParams, layer_spec, layout_for
-from .ops_ebsd import overlay_segments
-from .raster import colour_image, exact_grid, rasterize_segments, write_raster
+from .legends import LegendItem
+from .ops_ebsd import OverlayStyle, overlay_segments
+from .raster import HEXAGON_MIN_SCALE, colour_image, exact_grid, hexagon_grid, rasterize_segments, write_raster
 from .service import OpContext, op
 from .settings import load_settings
 
@@ -117,6 +124,13 @@ def crop_ang(src: Path, dst: Path, roi: tuple[float, float, float, float]) -> di
             "x_um": [xs + c0 * dx, xs + c1 * dx], "y_um": [ys + r0 * dy, ys + r1 * dy], "grid": "hex" if hexg else "square"}
 
 
+def sample_prefixed(sample_id: str | None, name: str) -> str:
+    """Export names start with the sample ID (phase 6.6), without repeating it (JU02_C_Area3 stays)."""
+    if not sample_id or name.startswith(sample_id):
+        return name
+    return f"{sample_id}_{name}"
+
+
 @op("ebsd.crop", CropParams, uses_backend=False)
 def _ebsd_crop(ctx: OpContext) -> None:
     """Crop a map to an ROI: writes maps/<new_map_id>.ang in the project (the .ang rows inside the ROI, original
@@ -129,7 +143,7 @@ def _ebsd_crop(ctx: OpContext) -> None:
         raise ValueError("give roi (x0, y0, x1, y1 in um) or roi_id")
     roi = p.roi or roi_box(find(ctx.project, p.roi_id))
     parent = ctx.project.sample(p.map_id)
-    if (ctx.project.samples_dir / f"{p.new_map_id}.json").is_file():
+    if ctx.project.file(p.new_map_id) is not None:
         raise FileExistsError(f"map {p.new_map_id} already exists")
     src = Path(parent.map_file)
     ctx.add_input(src)
@@ -138,9 +152,7 @@ def _ebsd_crop(ctx: OpContext) -> None:
     sheet = parent.model_copy(update={"map_id": p.new_map_id, "map_file": str(dst),
                                       "notes": (parent.notes + "\n" if parent.notes else "")
                                       + f"crop of {p.map_id}: x {info['x_um']}, y {info['y_um']} um"})
-    from .project import write_json  # noqa: PLC0415
-
-    write_json(ctx.project.samples_dir / f"{p.new_map_id}.json", sheet.model_dump(mode="json"))
+    ctx.project.set_sheet(sheet)             # linked file of the same sample, map sheet copied from the parent
     ctx.params.update(roi=list(roi))
     ctx.metrics.update(n_points=info["n_points"])
     ctx.output("crop", "json", {**info, "parent": p.map_id, "map_file": dst.relative_to(ctx.project.root).as_posix(),
@@ -169,6 +181,9 @@ class ExportParams(BaseModel):
     line_px: float | None = None              # pixel-exact: overlay line width in pixels (default max(1, scale/2))
     background: Literal["white", "black", "transparent"] = "white"
     name: str = ""                            # file name stem (default <map>_<kind>)
+    legends: list[LegendItem] | None = None   # GUI: legends where the viewer shows them (replaces scale_bar /
+                                              # colorbar / legend / title of the backend figure)
+    overlay_style: dict[str, OverlayStyle] = Field(default_factory=dict)   # per overlay class (viewer settings)
 
 
 BACKGROUNDS = {"white": (255, 255, 255, 255), "black": (0, 0, 0, 255), "transparent": (0, 0, 0, 0)}
@@ -182,14 +197,15 @@ def _export_map(ctx: OpContext) -> None:
     p = ExportParams.model_validate(ctx.params)
     style = load_settings().figure
     sheet = ctx.project.sample(p.map_id)
-    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.name or f"{p.map_id}_{p.layer.kind}")
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", p.name or sample_prefixed(ctx.step.sample_id, f"{p.map_id}_{p.layer.kind}"))
     roi = tuple(p.roi) if p.roi else (roi_box(find(ctx.project, p.roi_id)) if p.roi_id else None)
     if p.mode != "width" and p.format in ("svg", "pdf"):
         raise ValueError("SVG / PDF are figures: use mode 'width' (pixel-exact exports are PNG or TIFF)")
     spec, handle, meta, src = layer_spec(ctx, p.map_id, p.layer)
     L = layout_for(ctx.project, p.map_id, src)
-    ov = overlay_segments(ctx, p.map_id, list(p.overlays), p.layer.grains, p.layer.recon, style.boundary_line_width) \
-        if p.overlays else None
+    ov = overlay_segments(ctx, p.map_id, list(p.overlays), p.layer.grains, p.layer.recon, style.boundary_line_width,
+                          {k: v.model_dump() for k, v in p.overlay_style.items()}) if p.overlays else None
+    legend_info = _legend_info(ctx, p, spec, meta, handle) if p.legends else {}
     items = [a for a in load_annotations(ctx.project, p.map_id) if a.type != "crack"] if p.annotations else []
     x0, x1, y0, y1 = L.extent
     view_w = (abs(roi[2] - roi[0]) if roi else x1 - x0)
@@ -218,9 +234,13 @@ def _export_map(ctx: OpContext) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     if p.mode in ("native", "scale"):
         k = 1 if p.mode == "native" else int(p.scale)
-        g = exact_grid(L, k, roi)
+        hexagons = L.hex and k >= HEXAGON_MIN_SCALE
+        g = hexagon_grid(L, k, roi) if hexagons else exact_grid(L, k, roi)
         colors, cinfo = ctx.backend.measurement_colors(spec)
-        img = colour_image(L, g, colors, BACKGROUNDS[p.background])
+        if hexagons:                         # regular hexagonal cells, rasterised by the backend that coloured them
+            img = ctx.backend.cell_image(L.xs, L.ys, colors, g, BACKGROUNDS[p.background])
+        else:
+            img = colour_image(L, g, colors, BACKGROUNDS[p.background])
         line_px = p.line_px if p.line_px is not None else max(1.0, k / 2)
         if ov:
             for seg, rgb, w in ov["parts"]:
@@ -230,11 +250,22 @@ def _export_map(ctx: OpContext) -> None:
         skipped = rasterize_primitives(img, g, prims, line_px)
         if skipped:
             side["warnings"].append(f"texts not drawn in pixel-exact exports (use mode 'width'): {skipped}")
+        if p.legends:
+            from .legends import compose_array  # noqa: PLC0415
+
+            legend_info.setdefault("colorbar", cinfo.get("colorbar"))
+            legend_info.setdefault("clim", cinfo.get("clim"))
+            img = compose_array(img, p.legends, g.px, legend_info)
         side.update(scale=k, image_px=[g.W, g.H], pixel_size_um=[g.px, g.py], origin_um=[g.x0, g.y0],
                     physical_size_um=[g.W * g.px, g.H * g.py], line_px=line_px, background=p.background,
+                    cells="regular hexagons (backend cell_image)" if hexagons else
+                          ("brick (1 measurement = 1 x 1 cell, odd rows shifted)" if L.hex else "square"),
                     colour={"cmap": cinfo.get("cmap"), "clim": cinfo.get("clim")},
+                    legends=[it.model_dump() for it in p.legends or []],
                     notes=g.notes + ["colours per measurement from the backend; pixel layout and lines from "
-                                     "ti64app.raster (decisions D15)", "no scale bar or texts: see pixel_size_um"])
+                                     "ti64app.raster (decisions D15)"] +
+                          (["hexagonal cells rasterised by the backend (decisions D20)"] if hexagons else []) +
+                          ([] if p.legends else ["no scale bar or texts: see pixel_size_um"]))
         write_raster(out, img, (g.px, g.py), json.dumps({"ti64app": side["recipe_step"], "map_id": p.map_id,
                                                          "layer": p.layer.kind, "pixel_size_um": [g.px, g.py]}),
                      transparent=p.background == "transparent")
@@ -243,10 +274,10 @@ def _export_map(ctx: OpContext) -> None:
         spec.exact = True
         spec.width_cm = p.width_mm / 10.0
         spec.dpi = int(p.dpi)
-        spec.scale_bar = p.scale_bar
-        if not p.title:
+        spec.scale_bar = p.scale_bar and p.legends is None
+        if not p.title or p.legends is not None:
             spec.title = ""
-        if not p.colorbar:
+        if not p.colorbar or p.legends is not None:
             spec.colorbar_label = ""
         elif spec.values is not None and not spec.colorbar_label:
             spec.colorbar_label = " "
@@ -254,12 +285,14 @@ def _export_map(ctx: OpContext) -> None:
             spec.seg, spec.seg_rgb = ov["seg"], ov["rgb"]
             spec.seg_widths = ov["widths"] if np.unique(ov["widths"]).size > 1 else None
             spec.legend = spec.legend + ov["legend"]
-        if not p.legend:
+        if not p.legend or p.legends is not None:
             spec.legend = []
         spec.prims = prims
         if roi:
             spec.xlim, spec.ylim = (roi[0], roi[2]), (roi[1], roi[3])
         ctx.backend.render(handle(), spec, out)
+        if p.legends:
+            _legends_on_figure(out, p, roi or (x0, y0, x1, y1), legend_info, ctx, spec)
         side.update(width_mm=p.width_mm, dpi=p.dpi, expected_width_px=round(p.width_mm / 25.4 * p.dpi)
                     if p.format in ("png", "tiff") else None, scale_bar=p.scale_bar, title=p.title,
                     colorbar=p.colorbar, legend=p.legend, notes=[f"figure drawn by the {ctx.backend.name} renderer"])
@@ -275,6 +308,59 @@ def _export_map(ctx: OpContext) -> None:
         ctx.params.pop(k, None)
     ctx.metrics.update(n_overlay_segments=int(len(ov["rgb"])) if ov else 0)
     ctx.output("sidecar", "json", side, stem)
+
+
+def _legend_info(ctx: OpContext, p: ExportParams, spec, meta: dict, handle) -> dict:
+    """What the legend items show: colour bar (value maps) or swatches (phase / ID maps), IPF key PNGs drawn by
+    the backend into the step folder."""
+    info: dict = {"colorbar_label": spec.colorbar_label, "legend": list(spec.legend)}
+    if spec.values is not None:
+        _, cinfo = ctx.backend.measurement_colors(spec)
+        info.update(colorbar=cinfo.get("colorbar"), clim=cinfo.get("clim"))
+    if any(it.kind == "ipf_key" for it in p.legends or []) and meta.get("keys"):
+        from .ops_ebsd import _ipf_vector  # noqa: PLC0415
+
+        sheet = ctx.project.sample(p.map_id)
+        pngs = []
+        for ph, k in meta["keys"].items():
+            vec = tuple(k.get("vector") or _ipf_vector(sheet, k["direction"], None))
+            f = ctx.out_dir / f"ipf_key_{'beta' if 'beta' in ph else 'alpha'}.png"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            h = handle() if p.layer.kind not in RECON_KINDS else ctx.use(meta.get("source") or
+                                                                         ctx.project.recipe().step(meta["recon"]).params["source"])
+            ctx.backend.render_key(h, ph, k["key"], vec, f, 300)
+            pngs.append(f)
+        info["ipf_key_pngs"] = pngs
+    return info
+
+
+def _legends_on_figure(out: Path, p: ExportParams, view: tuple, info: dict, ctx: OpContext, spec) -> None:
+    """Put the legend items on a backend figure (bare map exactly width_mm wide)."""
+    from . import legends as lg  # noqa: PLC0415
+
+    x0, y0, x1, y1 = view
+    view_w = abs(x1 - x0)
+    ext = out.suffix.lower()
+    if ext in (".png", ".tif", ".tiff"):
+        from PIL import Image  # noqa: PLC0415
+
+        with Image.open(out) as im:
+            dpi = im.info.get("dpi")
+            new = lg.compose(im.copy(), p.legends, view_w / im.width, info)
+        kw = {"dpi": dpi} if dpi else {}
+        if ext == ".png":
+            new.save(out, "PNG", **kw)
+        else:
+            new.save(out, "TIFF", compression="tiff_deflate", **kw)
+    elif ext == ".svg":
+        import re as _re  # noqa: PLC0415
+
+        m = _re.search(r'viewBox="[-\d.eE]+ [-\d.eE]+ ([-\d.eE]+) ', out.read_text(encoding="utf-8")[:4000])
+        units = float(m.group(1)) if m else 1.0
+        lg.compose_svg(out, p.legends, view_w / units, info)
+    elif ext == ".pdf":
+        width_pt = p.width_mm / 25.4 * 72
+        lg.compose_pdf(out, p.legends, view_w / width_pt, info)
 
 
 def export_files(project, step) -> tuple[Path, Path]:

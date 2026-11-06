@@ -1,5 +1,6 @@
 # conda env for ti64app, exact versions of the working env (2026-10-31).
 #   conda env create -f environment.yml   then   python -m pip install -e . --no-deps
+#   (creates Scripts	i64-gui.exe; Desktop / Start-menu shortcut: powershell -File scripts\make_shortcut.ps1)
 # MATLAB R2025b + MTEX 7.2.0 are optional and installed separately; matlabengine must match the
 # MATLAB release (25.2.* for R2025b). pyopencl (Intel Arc GPU indexing) is optional and not pinned.
 name: ti64
@@ -25,7 +26,9 @@ dependencies:
       - dask==2026.8.0
       - tifffile==2026.10.15
       - pillow==13.0.0
+      - pypdf==7.0.0             # legends on PDF exports (overlay page)
       - nicegui==3.18.0
+      - pywebview==6.2.1         # desktop window (ti64-gui; needs the Edge WebView2 runtime on Windows)
       - mcp==2.3.0
       - pytest==9.2.0
       - anyio==4.15.1            # pytest plugin for the NiceGUI page tests

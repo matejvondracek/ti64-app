@@ -106,7 +106,8 @@ ExportOptions = _options(ExportParams, "ExportOptions",
 FigurePatch = _partial(FigureStyle, "FigurePatch", "Figure settings to change (None = keep).")
 StitchOptions = _options(StitchParams, "StitchOptions",
                          {"folder", "files", "detector", "se_layout", "info_strip", "blend", "exclude", "nudge"},
-                         "Further stitching options: strip_px, allow_rescale, stage_map, search_um, min_overlap_px, "
+                         "Further stitching options: strip_px, manual_layout, locked, refine_radius, seam, blend_band_px, "
+                         "stage_map, search_um, min_overlap_px, "
                          "min_score, se_min_score, se_search_px, max_residual_px, rotation_check, normalize, "
                          "single_column_tol_px, tiff_tile, pyramid_min_px, preview_max_px, band_px.")
 
@@ -119,7 +120,7 @@ TOOL_FOR_OP = {
     "grainsize.run": "grain_size", "grainsize.figure": "grain_size_figure",
     "grainsize.compare_oim": "compare_oim_grain_size", "annotations.set": "set_annotations",
     "ebsd.crop": "crop_map", "export.map": "export_map", "compare.backends": "compare_backends",
-    "sem.stitch": "stitch_images",
+    "sem.stitch": "stitch_images", "sem.export": "export_mosaic",
 }
 
 
@@ -579,7 +580,8 @@ def scan_sem_images(folder: str | None = None, files: list[str] | None = None,
                     strip_px: int | None = None) -> dict[str, Any]:
     """Read-only look at a folder (or files) of SEM images before stitching: counts per detector class (BSE / SE /
     other) and per detector name ($SM_DETECTOR, else the file name), data-bar height and its source, pixel size,
-    magnification, stage X/Y per image. Nothing is recorded."""
+    magnification, stage X/Y per image, and the stitch sets (same magnification + pixel size + overlapping stage
+    footprints; only one set is stitched at a time). Nothing is recorded."""
     from .modules import stitching  # noqa: PLC0415
 
     tiles = stitching.scan(folder, files, strip_px=strip_px)
@@ -589,21 +591,26 @@ def scan_sem_images(folder: str | None = None, files: list[str] | None = None,
                         "size_px": [t.file_width, t.file_height], "strip_px": t.strip_px,
                         "strip_source": t.strip_source, "pixel_size_um": t.pixel_size_um,
                         "magnification": t.magnification, "stage_xy_mm": [t.stage_x_mm, t.stage_y_mm],
-                        "warnings": t.warnings} for t in tiles]}
+                        "warnings": t.warnings} for t in tiles],
+            "stitch_sets": [{"id": st.id, "label": st.label, "files": st.paths, "note": st.note}
+                            for st in stitching.stitch_sets(tiles)]}
 
 
 @server.tool()
 def stitch_images(project: str, folder: str | None = None, files: list[str] | None = None,
                   detector: Literal["BSE", "SE", "both"] = "BSE", se_layout: Literal["own", "bse"] = "own",
                   info_strip: Literal["none", "keep", "generate"] = "none",
-                  blend: Literal["feather", "none"] = "feather", exclude: list[str] | None = None,
+                  blend: Literal["seam", "feather", "none"] = "seam", exclude: list[str] | None = None,
                   nudge: dict[str, tuple[float, float]] | None = None,
                   options: StitchOptions | None = None) -> dict[str, Any]:  # type: ignore[valid-type]
     """Stitch overlapping JEOL SEM images into one mosaic per detector (BSE = BED-*, SE = SED/...; never mixed;
     check counts with scan_sem_images first). se_layout 'bse' stitches BSE and places each SE tile with the BSE
     layout (small SE->BSE shift per image number) so both mosaics align. info_strip: none (default, for analysis),
     keep (original data bar of the bottom tile; single-column mosaics only), generate (new JEOL-style strip with
-    ranges, image numbers and a redrawn scale bar). blend 'none' keeps raw pixel values. exclude / nudge (dx, dy px)
+    ranges, image numbers and a redrawn scale bar). blend 'seam' (default) places tiles at subpixel positions and
+    blends only in a narrow band around each seam (no ghosting); 'feather' blends whole overlaps; 'none' keeps raw
+    pixel values. Different magnifications are never stitched together (scan_sem_images lists the stitch sets).
+    exclude / nudge (dx, dy px)
     by file stem or image number. Returns per detector the TIFF, preview PNG, sidecar path, mosaic size, residuals,
     weak pairs and tiles placed by the stage only."""
     p = _project(project)
@@ -624,6 +631,21 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
                         "tiles": [{k: t[k] for k in ("name", "x_px", "y_px", "best_score", "placed_by")}
                                   for t in side["tiles"]]}
     return out
+
+
+@server.tool()
+def export_mosaic(project: str, stitch: str, detector: Literal["BSE", "SE"] = "BSE",
+                  format: Literal["png", "tiff", "svg", "pdf"] = "png", mode: Literal["native", "width"] = "native",
+                  width_mm: float = 120.0, dpi: int = 600, scale_bar: bool = True, info_strip: bool = True,
+                  name: str = "") -> dict[str, Any]:
+    """Export a stitched mosaic (step id of stitch_images) as PNG / TIFF / SVG / PDF: native pixels or a width in mm
+    at a DPI, with an optional scale bar (from the mosaic pixel size) and the mosaic's info strip. The file stays in
+    the project (path returned) with a JSON sidecar giving the pixel size of the exported image."""
+    p = _project(project)
+    step = service.run(p, "sem.export", {"stitch": stitch, "detector": detector, "format": format, "mode": mode,
+                                         "width_mm": width_mm, "dpi": dpi, "scale_bar": scale_bar,
+                                         "info_strip": info_strip, "name": name})
+    return {**_step_summary(step), "file": _path(p, step, "export"), "sidecar": _json_out(p, step, "sidecar")}
 
 
 @server.tool()

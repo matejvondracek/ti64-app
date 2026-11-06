@@ -1,16 +1,22 @@
-"""Click through every GUI page and panel with Playwright and save screenshots (phase 5 visual check).
+"""Click through the phase 6.6 GUI (with the fixes after the user test) with Playwright (browser mode, Windows dialogs mocked) and save a screenshot of
+every screen: home -> new project -> add files -> samples (auto-assign, sheets) -> EBSD (load, cleanup Apply, hold
+Compare to original, sections, export dialog) -> Settings -> Stitch (layout, stitch, export) -> Crack; then the main
+screens again at 1920x1080. Checks that no page scrolls horizontally at 1366x768 and that there are no page errors.
 
-Usage:  python scripts/gui_screenshots.py [--project phase5_demo] [--port 8091] [--out projects/<project>/screenshots]
-        [--headed]
-Needs a project with a loaded map, grains, KAM and a reconstruction (scripts/make_demo_project.py) and Playwright
-(`pip install playwright` + `python -m playwright install chromium`). Starts the GUI itself and stops it at the end.
+Usage:  python scripts/gui_screenshots.py [--out projects/_gui_screenshots] [--work projects/_gui_demo]
+                                          [--port 8095] [--headed] [--no-stitch]
+Needs the test data (data/test/crops/*JU02*_crop1000.ang, data/test/stitch/) and Playwright with Chromium
+(`python -m playwright install chromium`). Starts the GUI itself (`python -m ti64app.gui --browser`) and stops it.
 Every step that fails is reported and the run continues; the exit code is the number of failed steps.
 """
 from __future__ import annotations
 
 import argparse
+import functools
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -18,20 +24,22 @@ import traceback
 import urllib.request
 from pathlib import Path
 
+print = functools.partial(print, flush=True)  # noqa: A001  (progress lines appear while it runs)
 REPO = Path(__file__).resolve().parents[1]
+DATA = REPO / "data" / "test"
 
 
 class Run:
-    def __init__(self, page, out: Path) -> None:
-        self.page, self.out, self.n, self.failed = page, out, 0, []
+    def __init__(self, page, out: Path, mock: Path) -> None:
+        self.page, self.out, self.mock, self.n, self.failed = page, out, mock, 0, []
         self.logs: list[str] = []
         page.on("console", lambda m: m.type == "error" and self.logs.append(f"console: {m.text}"))
         page.on("pageerror", lambda e: self.logs.append(f"pageerror: {e}"))
 
-    def shot(self, name: str, el=None) -> None:
+    def shot(self, name: str, full: bool = False) -> None:
         self.n += 1
         f = self.out / f"{self.n:02d}_{re.sub(r'[^A-Za-z0-9_.-]+', '_', name)}.png"
-        (el or self.page).screenshot(path=str(f))
+        self.page.screenshot(path=str(f), full_page=full)
         print(f"  saved {f.name}")
 
     def step(self, name: str, fn) -> None:
@@ -46,25 +54,38 @@ class Run:
             except Exception:  # noqa: BLE001
                 pass
 
+    def queue(self, *answers) -> None:
+        """Answers of the next Windows dialogs (TI64_MOCK_DIALOGS)."""
+        d = json.loads(self.mock.read_text(encoding="utf-8")) if self.mock.is_file() else {}
+        d["queue"] = list(answers)
+        self.mock.write_text(json.dumps(d, indent=1), encoding="utf-8")
+
+    def no_hscroll(self, where: str) -> None:
+        sw, cw = self.page.evaluate("[document.documentElement.scrollWidth, document.documentElement.clientWidth]")
+        if sw > cw + 1:
+            self.failed.append(f"horizontal scrolling on {where}: {sw} > {cw} px")
+            print(f"  ! horizontal scroll {sw} > {cw}")
+
 
 def mark(page, name: str):
     return page.locator(f'[data-testid="{name}"]').first
 
 
-def wait_idle(page, ms: int = 600) -> None:
+def inp(page, name: str):
+    """The native <input> of a NiceGUI input / number (Quasar puts data-testid on the input itself)."""
+    return page.locator(f'input[data-testid="{name}"], [data-testid="{name}"] input').first
+
+
+def wait_idle(page, ms: int = 500, timeout_s: float = 600) -> None:
     page.wait_for_timeout(ms)
-    # notifications with a spinner disappear when the backend call is done
-    for _ in range(600):
-        if page.locator(".q-notification .q-spinner").count() == 0:
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        busy = page.locator('[data-testid="apply_progress"]:visible').count() + \
+            page.locator(".q-notification .q-spinner").count()
+        if busy == 0:
             break
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(250)
     page.wait_for_timeout(300)
-
-
-def tool(page, name: str) -> None:
-    """Select a viewer tool and wait until the browser has it (the choice goes through the server)."""
-    page.locator('[data-testid="viewer_tool"] button', has_text=name).first.click()
-    page.wait_for_timeout(700)
 
 
 def choose(page, testid: str, option: str) -> None:
@@ -76,43 +97,56 @@ def choose(page, testid: str, option: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--project", default="phase5_demo")
-    ap.add_argument("--port", type=int, default=8091)
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--port", type=int, default=8095)
+    ap.add_argument("--out", default=str(REPO / "projects" / "_gui_screenshots"))
+    ap.add_argument("--work", default=str(REPO / "projects" / "_gui_demo"))
     ap.add_argument("--headed", action="store_true")
+    ap.add_argument("--no-stitch", action="store_true", help="skip stitching (faster)")
     a = ap.parse_args()
-    from ti64app.project import projects_dir  # noqa: PLC0415
-
-    out = Path(a.out) if a.out else projects_dir() / a.project / "screenshots"
-    out.mkdir(parents=True, exist_ok=True)
-    for f in out.glob("*.png"):
-        f.unlink()
-    env = {**os.environ, "PYTHONPATH": str(REPO / "python")}
-    log = open(out / "server.log", "w", encoding="utf-8")
-    srv = subprocess.Popen([sys.executable, "-m", "ti64app.cli", "gui", "--port", str(a.port), "--project", a.project],
-                           cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT, text=True)
-    url = f"http://127.0.0.1:{a.port}"
+    out, work = Path(a.out), Path(a.work)
+    for d in (out, work):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
+    crop = sorted((DATA / "crops").glob("*JU02*_crop1000.ang"))
+    stitch = sorted((DATA / "stitch").glob("*.bmp")) + sorted((DATA / "stitch").glob("*.txt"))
+    if not crop:
+        print("test data missing: data/test/crops/*JU02*_crop1000.ang (python scripts/make_crops.py)")
+        return 1
+    mock = work / "dialogs.json"
+    mock.write_text('{"queue": []}', encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST")}
+    env.update(PYTHONPATH=str(REPO / "python"), TI64_MOCK_DIALOGS=str(mock),
+               TI64_PROJECTS_DIR=str(work / "projects"), TI64_PREFS=str(work / "prefs" / "preferences.json"))
+    log = open(work / "server.log", "w", encoding="utf-8")  # noqa: SIM115
+    srv = subprocess.Popen([sys.executable, "-m", "ti64app.gui", "--browser", "--no-show", "--port", str(a.port)],
+                           cwd=REPO, env=env, stdout=log, stderr=subprocess.STDOUT)
+    base = f"http://127.0.0.1:{a.port}"
     try:
-        for _ in range(240):
-            if srv.poll() is not None:
-                break
+        for _ in range(120):
             try:
-                urllib.request.urlopen(url, timeout=2)
+                urllib.request.urlopen(base, timeout=1)  # noqa: S310
                 break
             except Exception:  # noqa: BLE001
                 time.sleep(0.5)
-        if srv.poll() is not None:
-            log.flush()
-            print("GUI server exited:\n" + (out / "server.log").read_text(encoding="utf-8")[-3000:])
-            return 99
-        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+        from playwright.sync_api import sync_playwright
 
         with sync_playwright() as pw:
-            b = pw.chromium.launch(headless=not a.headed)
-            page = b.new_page(viewport={"width": 1600, "height": 1000})
-            r = Run(page, out)
-            clickthrough(r, page, url)
-            b.close()
+            br = pw.chromium.launch(headless=not a.headed)
+            page = br.new_page(viewport={"width": 1366, "height": 768})
+            page.set_default_timeout(60_000)
+            r = Run(page, out, mock)
+            ju04 = [f for f in sorted((REPO / "data" / "JU04").glob("*BED-C*")) if f.suffix.lower() in (".bmp", ".txt")]
+            up2 = next(iter(sorted(DATA.glob("*.up2"))), None)
+            flow(r, page, base, work, crop[0], stitch, a.no_stitch, ju04, up2)
+            # same screens at 1920 x 1080
+            page.set_viewport_size({"width": 1920, "height": 1080})
+            for path, name in (("/files", "files"), ("/view", "view"), ("/ebsd", "ebsd"), ("/stitch", "stitch")):
+                r.step(f"1920 {name}", lambda path=path, name=name: (
+                    page.goto(base + path), wait_idle(page, 1500), r.shot(f"1920x1080_{name}"),
+                    r.no_hscroll(f"{name} 1920")))
+            page.goto(base + "/")
+            br.close()
     finally:
         srv.terminate()
         try:
@@ -120,228 +154,371 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             srv.kill()
         log.close()
-    print(f"\n{r.n} screenshots in {out}")
-    for line in r.logs:
-        print("  browser", line)
+    errs = [x for x in r.logs if "pageerror" in x]
+    print(f"\n{r.n} screenshots in {out}; {len(r.failed)} failed steps; {len(errs)} page errors")
     for f in r.failed:
         print("  FAILED", f)
-    if r.failed:
-        print("server log (tail):\n" + (out / "server.log").read_text(encoding="utf-8")[-3000:])
-    return len(r.failed)
+    for x in r.logs:
+        print("  ", x)
+    return len(r.failed) + len(errs)
 
 
-def clickthrough(r: Run, page, url: str) -> None:
-    def projects():
-        page.goto(url + "/")
-        page.wait_for_selector("text=Projects in")
-        wait_idle(page)
-        r.shot("projects")
-    r.step("project browser", projects)
+def flow(r: Run, page, base: str, work: Path, crop: Path, stitch: list[Path], no_stitch: bool,
+         ju04: list[Path], up2: Path | None) -> None:
+    def home():
+        page.goto(base + "/")
+        mark(page, "home_title").wait_for()
+        page.wait_for_timeout(500)
+        r.shot("home")
+        r.no_hscroll("home")
+    r.step("home", home)
 
-    def viewer_open():
-        page.goto(url + "/viewer")
-        page.wait_for_selector(".leaflet-tile-loaded", timeout=60000)
-        wait_idle(page, 1500)
-        r.shot("viewer_ipf")
-    r.step("viewer: IPF map", viewer_open)
+    def new_project():
+        r.queue(str(work / "projects"))
+        mark(page, "home_new").click()
+        inp(page, "np_name").fill("Ti64_demo")
+        mark(page, "np_browse").click()
+        page.wait_for_timeout(500)
+        mark(page, "np_create").click()
+        mark(page, "tab_files").wait_for()
+        page.wait_for_timeout(600)
+        r.shot("files_empty_tabs_with_View")
+    r.step("new project", new_project)
 
-    def overlays():
-        for o in ("ov_hagb", "ov_beta_gb", "ov_crack"):
-            mark(page, o).click()
-            wait_idle(page, 800)
-        page.wait_for_timeout(1500)
-        r.shot("viewer_overlays_hagb_betagb_crack")
-        r.shot("panel_overlays", mark(page, "panel_overlays"))
-        mark(page, "ov_lagb").click()
-        mark(page, "ov_hagb").click()
-        wait_idle(page, 1500)
-        r.shot("viewer_overlay_lagb")
-        for o in ("ov_lagb", "ov_beta_gb"):
-            mark(page, o).click()
-        wait_idle(page, 800)
-    r.step("viewer: overlays", overlays)
-
-    def map_types():
-        for opt, name in (("KAM", "kam"), ("phase", "phase"), ("CI", "ci"), ("prior β IPF", "parent_ipf"),
-                          ("α variant ID", "variant"), ("reconstruction fit", "recon_fit")):
-            choose(page, "viewer_kind", opt)
-            wait_idle(page, 1500)
-            page.wait_for_selector(".leaflet-tile-loaded", timeout=60000)
-            page.wait_for_timeout(1200)
-            r.shot(f"viewer_{name}")
-        r.shot("panel_key_recon_fit", mark(page, "panel_key"))
-        choose(page, "viewer_kind", "IPF (alpha / beta)")
-        wait_idle(page, 1500)
-    r.step("viewer: map types", map_types)
-
-    def ipf_direction():
-        choose(page, "ipf_dir_alpha", "X")
-        choose(page, "ipf_dir_beta", "X")
-        mark(page, "viewer_apply").click()
-        wait_idle(page, 2000)
-        r.shot("viewer_ipf_x")
-        r.shot("panel_layer", mark(page, "panel_layer"))
-        mark(page, "viewer_ipfkey").click()
-        wait_idle(page, 1500)
-        page.wait_for_selector('[data-testid="viewer_keyimg"]', timeout=60000)
+    def add_files():
+        # one copy of a SEM image that is then moved away: "Find missing…"
+        lost = work / "lost" / stitch[0].name
+        lost.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(stitch[0], lost)
+        files = [str(crop)] + [str(f) for f in stitch] + [str(f) for f in ju04] + ([str(up2)] if up2 else []) \
+            + [str(lost)]
+        r.queue(files)
+        mark(page, "add_file").click()
+        page.wait_for_selector("text=file(s) linked")
+        mark(page, "auto_assign").click()
+        page.wait_for_selector("text=Auto-assign files to samples")
+        mark(page, "aa_confirm").click()
+        page.wait_for_selector('[data-testid="sample_JU05"]')
+        page.wait_for_timeout(600)
+        moved = work / "archive" / "2026" / lost.name
+        moved.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(lost), moved)
+        page.reload()
+        mark(page, "relocate_all").wait_for()
+        page.wait_for_timeout(600)
+        r.shot("files_missing_file")
+        r.no_hscroll("files")
+        r.queue(str(work / "archive"))
+        page.locator('[data-testid^="relocate_"]').nth(1).click()
+        mark(page, "relocate_dialog").wait_for()
+        page.wait_for_timeout(500)
+        r.shot("find_missing_dialog")
+        mark(page, "reloc_go").click()
+        page.wait_for_selector("text=file(s) relinked")
         page.wait_for_timeout(800)
-        r.shot("panel_key_ipf_key", mark(page, "panel_key"))
-        choose(page, "ipf_dir_alpha", "Z")
-        choose(page, "ipf_dir_beta", "Z")
-        mark(page, "viewer_apply").click()
-        wait_idle(page, 1500)
-    r.step("viewer: IPF direction and key", ipf_direction)
+        if page.locator('[data-testid="relocate_all"]:visible').count():
+            raise AssertionError("missing file still shown after relinking (refresh bug)")
+        r.shot("find_missing_relinked_immediately")
+    r.step("add files, find missing", add_files)
 
-    def zoom():
-        m = mark(page, "map_viewer")
-        box = m.bounding_box()
-        page.mouse.move(box["x"] + box["width"] * 0.6, box["y"] + box["height"] * 0.45)
+    def files_tree():
+        # right-click "New sample for this file"
+        row = page.locator('[data-testid^="file_9772_MVH1_JU05_BED"]').first
+        row.click(button="right")
+        page.wait_for_timeout(400)
+        r.shot("context_menu")
+        page.locator(".q-menu .q-item", has_text="New sample for this file").first.click()
+        mark(page, "new_sample_dialog").wait_for()
+        inp(page, "ns_id").fill("JU05b")
+        page.wait_for_timeout(300)
+        r.shot("new_sample_for_file_dialog")
+        mark(page, "ns_create").click()
+        page.wait_for_selector('[data-testid="sample_JU05b"]')
+        page.wait_for_timeout(600)
+        r.shot("new_sample_for_file_done")
+        page.locator('[data-testid^="file_9772_MVH1_JU05_BED"]').first.click(button="right")
+        page.wait_for_timeout(300)
+        page.locator(".q-menu .q-item", has_text="Move to sample JU05").first.click()
+        page.wait_for_timeout(600)
+        mark(page, "name_sample_JU04").click()                 # fold JU04
+        page.wait_for_timeout(600)
+        r.shot("sample_JU04_folded")
+        mark(page, "name_sample_JU04").click()
+        page.wait_for_timeout(1000)
+        # map sheet of the EBSD crop
+        page.locator('[data-testid^="file_JU02"]').first.click()
+        page.locator('[data-testid="sheet_map"]', has_text="JU02").wait_for()
+        mark(page, "ms_input_state").locator("button", has_text="OIM-cleaned").click()
+        inp(page, "ms_bd_angle").fill("270")
+        inp(page, "ms_bd_angle").press("Enter")
+        page.wait_for_timeout(600)
+    r.step("files tree", files_tree)
+
+    def view_tab():
+        page.locator('[data-testid^="file_9771_MVH1_JU05_BED"]').first.dblclick()
+        mark(page, "view_viewer").wait_for(timeout=60_000)
+        page.wait_for_timeout(2500)
+        r.shot("view_image")
+        r.no_hscroll("view")
+        lg = mark(page, "legend_scale_bar")
+        box = lg.bounding_box()
+        if box:
+            page.mouse.move(box["x"] + 10, box["y"] + 6)
+            page.mouse.down()
+            page.mouse.move(box["x"] + 420, box["y"] - 380, steps=8)
+            page.mouse.up()
+            page.wait_for_timeout(600)
+        mark(page, "view_viewer").hover()
         for _ in range(3):
             page.mouse.wheel(0, -240)
             page.wait_for_timeout(500)
+        page.wait_for_timeout(1500)
+        r.shot("view_image_zoomed_scale_bar_moved")
+        if up2:
+            choose(page, "view_source", Path(up2).name)
+            mark(page, "up2_viewer").wait_for(timeout=60_000)
+            page.wait_for_timeout(1200)
+            r.shot("view_up2_pattern")
+            mark(page, "up2_right").click()
+            page.wait_for_timeout(800)
+            r.shot("view_up2_next_pattern")
+    r.step("View tab", view_tab)
+
+    def ebsd_load():
+        mark(page, "tab_ebsd").click()
+        mark(page, "edit_menu").wait_for()
+        choose(page, "ebsd_file", "JU02")
+        page.wait_for_timeout(800)
+        mark(page, "run_load").click()
+        wait_idle(page, 1500)
+        mark(page, "map_viewer").wait_for(timeout=300_000)
         page.wait_for_timeout(2500)
-        r.shot("viewer_zoom_in")
-        page.mouse.move(box["x"] + 300, box["y"] + 300)
-        page.mouse.down()
-        page.mouse.move(box["x"] + 500, box["y"] + 400, steps=8)
-        page.mouse.up()
+        r.shot("ebsd_loaded_history_right")
+        r.no_hscroll("ebsd")
+        inp(page, "cleanup_noise_max_void_px").fill("6")
+        inp(page, "cleanup_noise_max_void_px").blur()
+        mark(page, "run_cleanup").click()
+        wait_idle(page, 1000)
         page.wait_for_timeout(2000)
-        r.shot("viewer_pan")
-        for _ in range(3):
+    r.step("EBSD load + cleanup", ebsd_load)
+
+    def grains_overlays():
+        mark(page, "sec_grains").locator(".q-item").first.click()
+        page.wait_for_timeout(300)
+        mark(page, "run_grains").click()
+        wait_idle(page, 1000)
+        page.wait_for_timeout(2000)
+        mark(page, "viewer_overlays").click()
+        page.wait_for_timeout(600)
+        r.shot("overlay_menu_columns")
+        mark(page, "ov_interface").click()
+        page.wait_for_timeout(300)
+        w = inp(page, "ov_width_hagb")
+        w.fill("1.5")
+        w.press("Enter")
+        c = inp(page, "ov_color_hagb")
+        c.fill("#1d4ed8")
+        c.press("Enter")
+        page.wait_for_timeout(1500)
+        r.shot("overlay_menu_styles")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(1500)
+        r.shot("map_with_styled_boundaries")
+    r.step("grains + overlay menu", grains_overlays)
+
+    def legends_hex():
+        mark(page, "legend_btn_colorbar").click()
+        page.wait_for_timeout(600)
+        mark(page, "legend_btn_ipf_key").click()
+        page.wait_for_selector('[data-testid="legend_ipf_key"] img', timeout=120_000)
+        page.wait_for_timeout(1500)
+        lg = mark(page, "legend_ipf_key")
+        box = lg.bounding_box()
+        if box:
+            page.mouse.move(box["x"] + 20, box["y"] + 20)
+            page.mouse.down()
+            page.mouse.move(box["x"] - 300, box["y"] + 40, steps=8)
+            page.mouse.up()
+        page.wait_for_timeout(800)
+        r.shot("legends_on_map")
+        mark(page, "map_viewer").hover()
+        for _ in range(5):
+            page.mouse.wheel(0, -240)
+            page.wait_for_timeout(600)
+        page.wait_for_timeout(2500)
+        mark(page, "viewer_zoominfo").hover()
+        page.wait_for_timeout(1200)
+        r.shot("viewer_hexagons_zoom_tooltip")
+        mode = mark(page, "viewer_zoominfo").get_attribute("data-mode")
+        if mode != "hexagons":
+            raise AssertionError(f"zoomed in, the viewer should draw hexagons, not {mode}")
+        for _ in range(4):
             page.mouse.wheel(0, 240)
             page.wait_for_timeout(500)
         page.wait_for_timeout(1500)
-    r.step("viewer: zoom and pan", zoom)
-
-    def tools():
-        m = mark(page, "map_viewer")
-        box = m.bounding_box()
-        cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-        tool(page, "probe")
-        page.mouse.click(cx, cy)
-        page.wait_for_timeout(800)
-        r.shot("viewer_probe", mark(page, "viewer_status"))
-        tool(page, "measure")
-        page.mouse.click(cx - 150, cy - 100)
-        page.mouse.click(cx + 100, cy + 50)
-        page.wait_for_timeout(800)
-        r.shot("viewer_measure", mark(page, "viewer_status"))
-        tool(page, "arrow")
-        page.mouse.click(cx + 200, cy - 200)
-        page.mouse.click(cx + 120, cy - 120)
-        wait_idle(page, 1200)
-        mark(page, "ann_text").fill("pore")
-        tool(page, "text")
-        page.mouse.click(cx + 210, cy - 215)
-        wait_idle(page, 1200)
-        mark(page, "ann_text").fill("R2")
-        tool(page, "ROI ▭")
-        page.mouse.click(cx - 300, cy - 250)
-        page.mouse.click(cx - 120, cy - 100)
-        wait_idle(page, 1200)
-        tool(page, "pan / zoom")
-        page.wait_for_timeout(1000)
-        r.shot("viewer_annotations")
-        r.shot("panel_tools", mark(page, "panel_tools"))
-    r.step("viewer: tools (probe, measure, arrow, text, ROI)", tools)
+        r.shot("viewer_brick_zoomed_out")
+    r.step("legends + hexagons", legends_hex)
 
     def export():
-        page.locator(".q-expansion-item", has_text="Export").locator(".q-item").first.click()
+        target = work / "exports" / "JU02_ipf_export.png"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        r.queue(str(target))
+        mark(page, "export_btn").click()
+        mark(page, "export_dialog").wait_for()
+        mark(page, "exp_browse").click()
         page.wait_for_timeout(500)
-        choose(page, "exp_mode", "4× nearest neighbour")
-        choose(page, "exp_region", "ROI R2")
+        r.shot("export_dialog_native")
+        choose(page, "exp_mode", "size in pixels")
+        inp(page, "exp_px_h").fill("1500")
+        inp(page, "exp_px_h").blur()
+        page.wait_for_timeout(600)
+        r.shot("export_dialog_px_height_typed")
+        choose(page, "exp_mode", "8×")
+        page.wait_for_timeout(500)
+        mark(page, "exp_hex_info").hover()
+        page.wait_for_timeout(900)
+        r.shot("export_dialog_8x_hex_tooltip")
+        choose(page, "exp_mode", "4×")
         mark(page, "run_export").click()
-        wait_idle(page, 1500)
-        page.wait_for_selector('[data-testid="exp_result"]', timeout=120000)
-        r.shot("panel_export_4x_roi", mark(page, "panel_export"))
-        choose(page, "exp_mode", "width in mm at DPI (figure)")
-        choose(page, "exp_fmt", "pdf")
-        choose(page, "exp_region", "whole map")
-        mark(page, "run_export").click()
-        wait_idle(page, 3000)
-        page.wait_for_timeout(1000)
-        r.shot("panel_export_width_pdf", mark(page, "panel_export"))
-    r.step("viewer: export", export)
+        page.wait_for_selector("text=Exported", timeout=300_000)
+        r.shot("export_done")
+        if not target.is_file():
+            raise AssertionError(f"export not written: {target}")
+        shutil.copy2(target, r.out / "export_result_JU02_4x_legends.png")
+    r.step("export dialog", export)
 
-    def crop():
-        page.locator('[data-testid="ann_list"] button').filter(has=page.locator("text=content_cut")).first.click()
-        page.wait_for_timeout(800)
-        r.shot("viewer_crop_dialog")
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(300)
-    r.step("viewer: crop dialog", crop)
-
-    for path, name, wait in (("/sample", "sample_sheet", "Map file"), ("/maps", "maps", "1 Cleanup"),
-                             ("/recon", "reconstruction", "1 Reconstruct"), ("/grainsize", "grain_size", "1 Alpha grains")):
-        def pg(path=path, name=name, wait=wait):
-            page.goto(url + path)
-            page.wait_for_selector(f"text={wait}")
-            wait_idle(page)
-            for _ in range(10):                      # open every closed panel (re-query after each click)
-                closed = page.locator(".q-expansion-item--collapsed > div > .q-item")
-                if closed.count() == 0:
-                    break
-                closed.first.click()
-                page.wait_for_timeout(300)
-            page.wait_for_timeout(500)
-            r.shot(name)
-        r.step(f"page {path}", pg)
-
-    def maps_figure():
-        page.goto(url + "/maps")
-        page.wait_for_selector("text=4 Figure")
-        mark(page, "run_figure").click()
-        wait_idle(page, 2000)
-        page.wait_for_selector(".q-img__image--loaded", state="attached", timeout=120000)
-        page.wait_for_timeout(1000)
-        r.shot("maps_figure_ipf")
-    r.step("maps: draw a figure", maps_figure)
-
-    def ops():
-        page.goto(url + "/ops")
-        page.wait_for_selector("text=Parameter panels")
-        wait_idle(page)
-        r.shot("ops_cleanup_panel")
-        for op in ("export.map", "recon.run", "grains.calc"):
-            choose(page, "ops_select", op)
-            page.wait_for_timeout(600)
-            r.shot(f"ops_{op.replace('.', '_')}_panel")
-        mark(page, "ops_run").click()
-        wait_idle(page, 2000)
-        page.wait_for_selector('[data-testid="ops_result"]', timeout=120000)
-        r.shot("ops_grains_result")
-    r.step("operations: parameter panels", ops)
-
-    def recipe():
-        page.goto(url + "/recipe")
-        page.wait_for_selector("text=Recipe")
-        wait_idle(page)
-        r.shot("recipe")
-        page.locator('[data-testid="recipe_table"] tbody tr').nth(1).locator("td").first.click()
-        page.wait_for_timeout(1000)
-        r.shot("recipe_step_detail")
+    def history_reorder():
+        page.wait_for_timeout(9000)                     # let the export notifications fade
+        hist = mark(page, "recipe_table")
+        rows = hist.locator('[data-testid^="hist_"]')
+        n = rows.count()
+        if n < 3:
+            raise AssertionError(f"history shows {n} steps")
+        r.shot("history_panel")
+        # invalid: Cleanup before Load map
+        rows.nth(1).drag_to(rows.nth(0))
+        page.wait_for_selector("text=This order is not possible", timeout=10_000)
+        page.wait_for_timeout(400)
+        r.shot("history_reorder_refused")
+        page.wait_for_timeout(2000)
+        # valid: grains on the loaded map before the cleanup -> rerun
+        rows = mark(page, "recipe_table").locator('[data-testid^="hist_"]')
+        rows.nth(2).drag_to(rows.nth(1))
+        mark(page, "reorder_dialog").wait_for()
+        page.wait_for_timeout(400)
+        r.shot("history_reorder_confirm")
+        mark(page, "reorder_ok").click()
+        page.wait_for_selector("text=New order applied", timeout=300_000)
+        page.wait_for_timeout(2500)
+        r.shot("history_reordered_stale_kept")
         mark(page, "undo").click()
-        wait_idle(page, 1500)
-        r.shot("recipe_after_undo")
-        mark(page, "redo").click()
-        wait_idle(page, 1500)
-        r.shot("recipe_after_redo")
-        mark(page, "replay").click()
-        page.wait_for_selector('[data-testid="replay_result"]', timeout=600000)
-        wait_idle(page, 500)
-        r.shot("recipe_replay")
-    r.step("recipe: details, undo, redo, replay", recipe)
+        page.wait_for_timeout(4000)
+        mark(page, "map_viewer").wait_for(timeout=120_000)
+        page.wait_for_timeout(1500)
+        r.shot("history_reorder_undone")
+    r.step("history reorder", history_reorder)
+
+    def recon():
+        mark(page, "sec_recon").locator(".q-item").first.click()
+        page.wait_for_timeout(400)
+        mark(page, "run_recon").click()
+        page.wait_for_selector("text=Prior-β map shown", timeout=900_000)
+        page.wait_for_timeout(3000)
+        r.shot("recon_beta_tab_no_boundaries")
+        if mark(page, "mtab_beta").get_attribute("aria-selected") != "true":
+            raise AssertionError("after the reconstruction the prior-beta tab should be focused")
+        mark(page, "mtab_alpha").click()
+        page.wait_for_timeout(2500)
+        r.shot("alpha_tab_own_overlays_history")
+        mark(page, "mtab_beta").click()
+        page.wait_for_timeout(2500)
+        mark(page, "rtab_results").click()
+        page.wait_for_timeout(800)
+        r.shot("results_recon_summary")
+        mark(page, "mtab_beta").click()
+        page.wait_for_timeout(1500)
+    r.step("prior-beta map tab", recon)
 
     def settings():
-        page.goto(url + "/settings")
-        page.wait_for_selector("text=Analysis backend")
-        wait_idle(page)
+        mark(page, "settings_gear").click()
+        mark(page, "settings_dialog").wait_for()
+        page.wait_for_timeout(600)
         r.shot("settings")
-        for c in ("settings_backend", "settings_ipf", "settings_style", "settings_paths"):
-            r.shot(c, mark(page, c))
+        page.keyboard.press("Escape")
     r.step("settings", settings)
+
+    def stitch_tab():
+        mark(page, "tab_stitch").click()
+        mark(page, "stitch_left").wait_for()
+        choose(page, "st_source", "All images of sample JU04")
+        page.wait_for_timeout(2500)
+        mark(page, "st_set_radio").wait_for(timeout=120_000)
+        page.wait_for_timeout(1500)
+        r.shot("stitch_sets_JU04_magnification_series")
+        r.no_hscroll("stitch")
+        mark(page, "st_strip").click()
+        page.wait_for_timeout(400)
+        page.locator(".q-menu .q-item", has_text="keep the original").first.hover()
+        page.wait_for_timeout(1000)
+        r.shot("stitch_info_strip_keep_greyed_tooltip")
+        page.keyboard.press("Escape")
+        choose(page, "st_source", "All images of sample JU05")
+        page.wait_for_timeout(3000)
+        mark(page, "st_arrange").wait_for(timeout=120_000)
+        page.wait_for_timeout(1500)
+        r.shot("stitch_arrange_JU05")
+        # drag one tile roughly, lock another, box-select
+        tiles = page.locator('.ti64-arrange [data-key]')
+        t = tiles.nth(3)
+        b = t.bounding_box()
+        if b:
+            page.mouse.move(b["x"] + b["width"] / 2, b["y"] + b["height"] / 2)
+            page.mouse.down()
+            page.mouse.move(b["x"] + b["width"] / 2 + 4, b["y"] + b["height"] / 2 + 2, steps=4)
+            page.mouse.up()
+        page.wait_for_timeout(500)
+        tiles.nth(0).click()
+        mark(page, "st_lock").click()
+        page.wait_for_timeout(300)
+        mark(page, "st_all").click()
+        page.wait_for_timeout(800)
+        r.shot("stitch_arrange_moved_locked")
+        if no_stitch:
+            return
+        mark(page, "st_refine").click()
+        mark(page, "st_summary_BSE").wait_for(timeout=900_000)
+        page.mouse.move(700, 700)
+        page.wait_for_timeout(1500)
+        r.shot("stitch_result_refined")
+        mark(page, "st_pairs_BSE").locator("tbody tr").first.click()
+        mark(page, "st_overlap_img").wait_for(timeout=120_000)
+        page.wait_for_timeout(1200)
+        r.shot("stitch_overlap_difference")
+        target = work / "exports" / "JU05_mosaic.png"
+        r.queue(str(target))
+        mark(page, "st_export").click()
+        mark(page, "export_dialog").wait_for()
+        mark(page, "exp_browse").click()
+        page.wait_for_timeout(500)
+        r.shot("stitch_export_dialog")
+        mark(page, "run_export").click()
+        page.wait_for_selector("text=Exported", timeout=300_000)
+        if not target.is_file():
+            raise AssertionError(f"mosaic export not written: {target}")
+        mark(page, "st_tab_result").click()
+        page.wait_for_timeout(800)
+        mark(page, "st_view_BSE").click()
+        mark(page, "view_viewer").wait_for(timeout=120_000)
+        page.wait_for_timeout(2500)
+        r.shot("view_mosaic")
+    r.step("stitch", stitch_tab)
+
+    def crack():
+        mark(page, "tab_crack").click()
+        mark(page, "crack_placeholder").wait_for()
+        r.shot("crack_placeholder")
+    r.step("crack", crack)
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(REPO / "python"))
     sys.exit(main())

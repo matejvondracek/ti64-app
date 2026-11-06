@@ -230,21 +230,23 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
     return L
 
 
-def get_overlay(project: Project, map_id: str, name: str, lp: LayerParams, backend: str | None = None) -> Overlay:
-    """One overlay class as a binned segment index (crack paths are re-read on every change)."""
+def get_overlay(project: Project, map_id: str, name: str, lp: LayerParams, backend: str | None = None,
+                style: dict | None = None) -> Overlay:
+    """One overlay class as a binned segment index (crack paths are re-read on every change). style = OverlayStyle
+    of this class (colour / width factor, from the viewer settings)."""
     from .annotations import load_annotations  # noqa: PLC0415
     from .ops_ebsd import overlay_segments  # noqa: PLC0415
 
     backend = backend or project.info().backend
-    extra = [name] + ([a.model_dump(mode="json") for a in load_annotations(project, map_id) if a.type == "crack"]
-                      if name == "crack" else [])
+    extra = [name, style] + ([a.model_dump(mode="json") for a in load_annotations(project, map_id)
+                              if a.type == "crack"] if name == "crack" else [])
     key = _cache_key(project, map_id, LayerParams(grains=lp.grains, recon=lp.recon), backend, extra)
     with _LOCK:
         if key in _OVERLAYS:
             return _OVERLAYS[key]
     ctx = view_context(project, backend)
     lw = load_settings().figure.boundary_line_width
-    ov = overlay_segments(ctx, map_id, [name], lp.grains, lp.recon, lw)
+    ov = overlay_segments(ctx, map_id, [name], lp.grains, lp.recon, lw, {name: style} if style else None)
     seg = ov["seg"] or {k: np.zeros(0) for k in ("x1", "y1", "x2", "y2")}
     O = Overlay(key, SegmentIndex(seg, ov["rgb"]), float(ov["widths"][0]) / lw if len(ov["widths"]) else 1.0,
                 [(l, _hex(c)) for l, c in ov["legend"]])
@@ -271,3 +273,29 @@ def available(project: Project, map_id: str) -> dict:
         overlays.append("beta_gb")
     overlays.append("crack")
     return {"layers": layers, "overlays": overlays, "loaded": bool(ops & {"ebsd.load"})}
+
+
+def key_pngs(project: Project, map_id: str, lp: LayerParams, backend: str | None = None) -> list:
+    """IPF colour key PNG(s) of the phases a layer shows (viewer legend), drawn by the backend outside the recipe
+    and cached in cache/viewer/: alpha (+ beta when the map has beta) for 'ipf', beta for 'parent_ipf'."""
+    from .ops_ebsd import _ipf_vector, resolve_source  # noqa: PLC0415
+
+    if lp.kind not in ("ipf", "parent_ipf"):
+        return []
+    backend = backend or project.info().backend
+    style = load_settings().figure
+    sheet = project.sample(map_id)
+    L = get_layer(project, map_id, lp, backend)
+    keys = L.info.get("keys") or {}
+    out = []
+    ctx = None
+    for ph, k in keys.items():
+        vec = tuple(k.get("vector") or _ipf_vector(sheet, k["direction"], None))
+        f = project.cache_dir / "viewer" / f"key_{json_hash([backend, ph, k['key'], vec])[7:23]}.png"
+        if not f.is_file():
+            ctx = ctx or view_context(project, backend)
+            src = resolve_source(ctx, map_id, None)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            ctx.backend.render_key(ctx.use(src), ph, k["key"], vec, f, min(style.dpi, 200))
+        out.append(f)
+    return out

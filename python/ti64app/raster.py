@@ -12,6 +12,12 @@ Cell model ("brick" layout, the same as matlab/+ti64/hexRaster.m from EBSD_part2
 A pixel shows the measurement whose cell contains the pixel centre (nearest neighbour, no blending),
 or nothing (-1).
 
+True hexagons (`hexagons=True`, hex grids only): the cell of a measurement is its Voronoi cell on the hexagonal
+grid = a regular hexagon of width dx (flat sides left / right, points up / down), neighbouring rows offset by half
+a cell. A pixel shows the NEAREST measurement centre: the brick owner of its row or the brick owner of the nearer
+adjacent row (the other rows are always farther). Used by the viewer when a cell is >= 8 screen pixels and by
+exports at >= 4 pixels per measurement; the native (1 px) and 2x exports stay brick (decisions D20).
+
 Pixel-exact exports at scale k (1 = native, one pixel per measurement; 2, 4, 8 nearest-neighbour):
   pixel = dx/k x dy/k um.  On a hex grid the pixels are not square (dy = dx * sqrt(3)/2) and at k = 1 the
   odd rows cannot be shifted by half a pixel: they are drawn dx/2 to the LEFT of their true position
@@ -41,6 +47,8 @@ class CellLayout:
     dy: float                       # row height (um)
     dx: float                       # measurement step along x (um)
     hex: bool
+    xs: np.ndarray | None = None    # measurement centres (file order), for true hexagons
+    ys: np.ndarray | None = None
 
     @property
     def width_um(self) -> float:
@@ -55,15 +63,37 @@ class CellLayout:
         """(xmin, xmax, ymin, ymax) of the cells in um."""
         return self.x0, self.x0 + self.width_um, self.y0, self.y0 + self.height_um
 
-    def sample(self, px: np.ndarray, py: np.ndarray) -> np.ndarray:
-        """Measurement index at points (um), -1 outside the map or on an empty cell."""
-        c = np.floor((np.asarray(px, float) - self.x0) / self.cw + EPS).astype(np.int64)
-        r = np.floor((np.asarray(py, float) - self.y0) / self.dy + EPS).astype(np.int64)
+    def sample(self, px: np.ndarray, py: np.ndarray, hexagons: bool = False) -> np.ndarray:
+        """Measurement index at points (um), -1 outside the map or on an empty cell. hexagons=True (hex grids):
+        the nearest measurement centre (regular hexagonal cells) instead of the brick cell."""
+        px, py = np.broadcast_arrays(np.asarray(px, float), np.asarray(py, float))
+        fr = (py - self.y0) / self.dy
+        c = np.floor((px - self.x0) / self.cw + EPS).astype(np.int64)
+        r = np.floor(fr + EPS).astype(np.int64)
         R, C = self.lut.shape
-        c, r = np.broadcast_arrays(c, r)
         ok = (r >= 0) & (r < R) & (c >= 0) & (c < C)
         out = np.full(c.shape, -1, np.int32)
         out[ok] = self.lut[r[ok], c[ok]]
+        if not (hexagons and self.hex and self.xs is not None):
+            return out
+        # the other candidate: the brick owner of the nearer adjacent row at the same x
+        rb = np.where(fr - r >= 0.5, r + 1, r - 1)
+        okb = (rb >= 0) & (rb < R) & (c >= 0) & (c < C)
+        ob = np.full(c.shape, -1, np.int32)
+        ob[okb] = self.lut[rb[okb], c[okb]]
+        both = (out >= 0) & (ob >= 0)
+        if both.any():
+            ia, ib = out[both], ob[both]
+            xq, yq = px[both], py[both]
+            da = (self.xs[ia] - xq) ** 2 + (self.ys[ia] - yq) ** 2
+            db = (self.xs[ib] - xq) ** 2 + (self.ys[ib] - yq) ** 2
+            out[both] = np.where(db < da - 1e-12, ib, ia)
+        only_b = (out < 0) & (ob >= 0)
+        if only_b.any():                    # outside the brick map but inside the hexagon of an edge cell
+            ib = ob[only_b]
+            xq, yq = px[only_b], py[only_b]
+            d = np.hypot(self.xs[ib] - xq, self.ys[ib] - yq)
+            out[only_b] = np.where(d <= self.dx / math.sqrt(3) + 1e-9, ib, -1)
         return out
 
 
@@ -86,7 +116,7 @@ def cell_layout(x: np.ndarray, y: np.ndarray, grid: str, step: float | None = No
         idx = np.arange(x.size, dtype=np.int32)
         lut[row, h] = idx
         lut[row, h + 1] = idx
-        return CellLayout(lut, xmin - dx / 2, float(y.min()) - dy / 2, dx / 2, dy, dx, True)
+        return CellLayout(lut, xmin - dx / 2, float(y.min()) - dy / 2, dx / 2, dy, dx, True, x, y)
     c = np.round((x - xmin) / dx).astype(np.int64)
     lut = np.full((int(row.max()) + 1, int(c.max()) + 1), -1, np.int32)
     lut[row, c] = np.arange(x.size, dtype=np.int32)
@@ -158,6 +188,31 @@ def exact_grid(L: CellLayout, scale: int = 1, roi: tuple[float, float, float, fl
     return g
 
 
+HEXAGON_MIN_SCALE = 4          # exports with >= 4 px per measurement draw true hexagons
+HEXAGON_MIN_SCREEN_PX = 8      # the viewer draws true hexagons when a cell is >= 8 screen pixels
+
+
+def hexagon_grid(L: CellLayout, scale: int, roi: tuple[float, float, float, float] | None = None) -> PixelGrid:
+    """Square pixels of dx / scale um for true-hexagon exports of a hex map (regular hexagons need square pixels);
+    covers the map (or ROI) extent."""
+    if scale < 1 or int(scale) != scale:
+        raise ValueError("scale must be a positive integer")
+    bx0, bx1, by0, by1 = _roi_box(L, roi)
+    p = L.dx / scale
+    g = PixelGrid(bx0, by0, p, p, int(math.ceil((bx1 - bx0) / p - EPS)), int(math.ceil((by1 - by0) / p - EPS)))
+    g.notes.append(f"hex grid drawn as regular hexagons (width {L.dx:g} um = {scale} px), square pixels "
+                   f"{p:.4g} um")
+    return g
+
+
+def hexagon_image(x: np.ndarray, y: np.ndarray, colors: np.ndarray, g: PixelGrid,
+                  background=(255, 255, 255, 255)) -> np.ndarray:
+    """Hexagon rasteriser (pymtex backend): every measurement of a hex map (centres x, y in um, file order) drawn as
+    its regular hexagonal cell into the pixel grid g; (H, W, 4) uint8."""
+    L = cell_layout(x, y, "hex")
+    return colour_image(L, g, colors, background, hexagons=True)
+
+
 def width_grid(L: CellLayout, width_px: int, roi: tuple[float, float, float, float] | None = None) -> PixelGrid:
     """Square pixels, `width_px` pixels across the map (or ROI); nearest-neighbour resampling."""
     bx0, bx1, by0, by1 = _roi_box(L, roi)
@@ -165,24 +220,24 @@ def width_grid(L: CellLayout, width_px: int, roi: tuple[float, float, float, flo
     return PixelGrid(bx0, by0, p, p, int(width_px), max(1, int(round((by1 - by0) / p))))
 
 
-def index_image(L: CellLayout, g: PixelGrid, rows: slice | None = None) -> np.ndarray:
+def index_image(L: CellLayout, g: PixelGrid, rows: slice | None = None, hexagons: bool = False) -> np.ndarray:
     """(H, W) measurement index of every pixel (nearest neighbour), -1 = none."""
     xc, yc = g.centres()
     if rows is not None:
         yc = yc[rows]
-    return L.sample(xc[None, :], yc[:, None])
+    return L.sample(xc[None, :], yc[:, None], hexagons=hexagons)
 
 
 def colour_image(L: CellLayout, g: PixelGrid, colors: np.ndarray, background=(255, 255, 255, 255),
-                 chunk_rows: int = 2048) -> np.ndarray:
+                 chunk_rows: int = 2048, hexagons: bool = False) -> np.ndarray:
     """(H, W, 4) uint8 image of per-measurement RGBA colours (n, 4) uint8; alpha 0 colours (not indexed,
-    no value) and empty pixels get `background`."""
+    no value) and empty pixels get `background`. hexagons=True: regular hexagonal cells (hex grids)."""
     colors = np.asarray(colors, np.uint8)
     out = np.empty((g.H, g.W, 4), np.uint8)
     bg = np.asarray(background, np.uint8)
     for r0 in range(0, g.H, chunk_rows):
         sl = slice(r0, min(g.H, r0 + chunk_rows))
-        idx = index_image(L, g, sl)
+        idx = index_image(L, g, sl, hexagons)
         c = np.where((idx >= 0)[..., None], colors[np.clip(idx, 0, None)], bg)
         c[c[..., 3] == 0] = bg
         out[sl] = c
@@ -250,11 +305,12 @@ def tile_grid(base_px_um: float, z: int, tx: int, ty: int, tile: int = TILE) -> 
 
 def tile_colours(L: CellLayout, colors: np.ndarray, g: PixelGrid, max_ss: int = 4) -> np.ndarray:
     """(tile, tile, 4) RGBA tile; zoomed out (pixel larger than a cell) it averages up to max_ss^2 samples
-    per pixel so the overview is not aliased. Empty pixels are transparent."""
+    per pixel so the overview is not aliased. Empty pixels are transparent. Zoomed in so far that a cell is
+    >= HEXAGON_MIN_SCREEN_PX screen pixels, hex maps are drawn as true hexagons."""
     ss = int(min(max_ss, max(1, math.ceil(g.px / min(L.cw, L.dy) - 1e-9))))
     colors = np.asarray(colors, np.uint8)
     if ss == 1:
-        idx = index_image(L, g)
+        idx = index_image(L, g, hexagons=uses_hexagons(L, g.px))
         out = np.zeros((g.H, g.W, 4), np.uint8)
         ok = idx >= 0
         out[ok] = colors[idx[ok]]
@@ -269,6 +325,11 @@ def tile_colours(L: CellLayout, colors: np.ndarray, g: PixelGrid, max_ss: int = 
     rgb = (c[..., :3] * a).sum(axis=(1, 3)) / np.maximum(wsum, 1e-9)
     alpha = 255.0 * wsum / (ss * ss)
     return np.concatenate([rgb, alpha], -1).round().clip(0, 255).astype(np.uint8)
+
+
+def uses_hexagons(L: CellLayout, screen_px_um: float) -> bool:
+    """True when the viewer draws regular hexagons: hex map and a cell (dx) >= HEXAGON_MIN_SCREEN_PX screen px."""
+    return bool(L.hex and L.xs is not None and L.dx / screen_px_um >= HEXAGON_MIN_SCREEN_PX - 1e-9)
 
 
 class SegmentIndex:

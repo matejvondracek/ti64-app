@@ -118,6 +118,11 @@ class PymtexBackend(PymtexAnalysis):
             out[ok] = np.asarray(make_key(cs, key, vec).orientation2color(o), float).reshape(-1, 3)
         return out
 
+    def cell_image(self, x, y, colors, grid, background):
+        from ..raster import hexagon_image  # noqa: PLC0415
+
+        return hexagon_image(x, y, colors, grid, background)
+
     def render_chart(self, spec, out_png):
         from .pymtex_plot import render_chart  # noqa: PLC0415
 

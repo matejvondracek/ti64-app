@@ -23,7 +23,12 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
 - python/ti64app/   service layer: project + recipe model, job runner, settings,
                     Python-only modules (up2 indexing, BSE metadata, image stitching, registration, crack,
                     4PB mechanics)
-- python/ti64app/gui/          NiceGUI front end (localhost), incl. Settings (backend, IPF key, figure style)
+- python/ti64app/gui/          NiceGUI front end as a desktop window (native mode, pywebview; --browser for
+                               tests), layout per docs/gui_mockups/: tabs Files | View | EBSD | Crack | Stitch,
+                               project name centred, Settings dialog (backend, IPF key, figure style, paths)
+- Project files are LINKED by absolute path, never copied; removing a file from a project never deletes it.
+- Autosave: every change (recipe step, sample sheet, file list, settings, view state, unapplied drafts)
+  is written immediately with atomic writes (temp file + rename). There is no Save button.
 - python/ti64app/mcp_server.py MCP tools = thin wrappers over the service layer
 - python/ti64app/cli.py        CLI for batch runs
 - Each backend computes AND draws: MATLAB figures with MTEX plotting + exportgraphics, pymtex figures
@@ -123,8 +128,10 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   Threshold ranges from Yang 2025 (doi:10.1016/j.ijlmm.2025.07.009): reconstruction 5-8 deg, merging ~3 deg.
   The "use refined OR if <= 1 deg from Burgers" limit is a visible setting; report the deviation.
 - Grain size: ISO 13067 / ASTM E2627 rules (min pixels per grain, exclude edge grains, report method).
-- Build direction and 4PB geometry (outer/inner span, width, thickness, load) are entered by the
-  user in the sample sheet, never guessed. Build direction drives the IPF reference
+- Samples: Project -> Sample -> files. Specimen data (4PB geometry: outer/inner span, width,
+  thickness, load; material/process; build direction in the specimen frame) is entered once per
+  sample; map data (input state, build direction in map coordinates, position, role) per file,
+  inheriting from its sample. All entered by the user, never guessed. Build direction drives the IPF reference
   direction default and beta-grain length/width relative to the build direction.
 - Units: um, deg, MPa. Sample frame: X = beam axis, Y = thickness (neutral axis at Y=0), Z = width.
 

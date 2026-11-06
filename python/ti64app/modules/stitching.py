@@ -9,11 +9,17 @@ Method (docs/decisions.md D17)
 1. Detector from $SM_DETECTOR (BED-* = BSE, SED/LED/UED/... = SE), file name as fallback; detectors never mixed.
 2. Data bar (info strip) cropped: height = file height - $CM_IMAGE_SIZE height (= $SM_PNU_HEIGHT); without a .txt the
    JEOL image area is 4:3 (height = width * 3/4), confirmed by detecting the black strip with white text.
-3. Pixel size = $CM_FIELD_OF_VIEW width / image width. Tiles with another pixel size, magnification, scan rotation
-   or stage rotation / tilt are refused unless `allow_rescale`.
+3. Pixel size = $CM_FIELD_OF_VIEW width / image width. Different magnifications or pixel sizes are NEVER stitched
+   together (a folder is often a magnification series, e.g. JU04 23x ... 50000x): `stitch_sets` groups a selection
+   into stitch sets (same detector, magnification, pixel size, image size, rotation / tilt and overlapping stage
+   footprints) and a selection that mixes sets is refused with the list of sets. Scan rotation or stage rotation /
+   tilt differences are refused too.
 4. Initial layout from $CM_STAGE_POSITION (1 um resolution = only a starting guess). The stage -> image axis mapping
    (which image axis, which sign) is chosen from the data: every signed axis permutation is tried and the one whose
    predicted overlaps correlate best wins. Without stage data all pairs are tried (downsampled phase correlation).
+   A manual pre-arrangement (`manual_layout`, the Arrange view) replaces the stage prior: pairs are searched only
+   within `refine_radius` (fraction of the tile size, default 10 %) around the given positions; `locked` tiles keep
+   their manual position.
 5. Pairwise registration: translation only. Phase correlation of the predicted overlap (Hann window, the strongest
    peaks with all wrap-around interpretations, plus the best offset of a masked NCC surface within the search window;
    each candidate scored by normalized cross-correlation (NCC) of the real overlap, at 1/f resolution), then subpixel refinement with skimage.registration.phase_cross_correlation at full resolution. Weak pairs
@@ -22,10 +28,17 @@ Method (docs/decisions.md D17)
    iterative removal of the worst pair while its residual exceeds max_residual_px - as in Fiji Grid/Collection
    stitching (Preibisch et al. 2009, doi:10.1093/bioinformatics/btp184) and NIST MIST (Chalfoun et al. 2017,
    doi:10.1038/s41598-017-04567-y). Tiles without a good pair are placed by the stage only and flagged.
-7. Per-tile brightness / contrast normalisation (gain + offset from the overlap statistics, global least squares),
-   then linear feathering in the overlaps (blend="feather") or no blending (blend="none": each pixel from the one
-   tile whose edge is farthest, raw values, no normalisation) for measurements on raw pixels.
-   Tiles are placed at integer pixel positions (no resampling); the subpixel positions are reported.
+7. Per-tile brightness / contrast normalisation (gain + offset from the overlap statistics, global least squares).
+   Tiles are placed at their SUBPIXEL positions (cubic-spline resampling of the fractional offset, no rounding of the
+   origins). Blending (blend="seam", default) only in a narrow band (`blend_band_px`, default 32 px) around a seam:
+   the seam is the midline of each overlap (the pixel belongs to the tile whose edge is farthest) or, with
+   seam="min_difference", a minimum-difference path through the overlap (dynamic programming on |A - B|), so a small
+   residual misalignment cannot show as double edges across the whole overlap. blend="feather" blends across the
+   whole overlap (linear weights, older behaviour); blend="none" takes each pixel from its seam owner at an integer
+   position (raw values, no normalisation, no resampling) for measurements on raw pixels.
+   Ghosting check: after placement every used overlap is registered again at full resolution (subpixel phase
+   correlation of the resampled overlap) -> residual misalignment (px) and mean |A - B| per pair in the sidecar;
+   `overlap_difference` draws the difference image of one overlap.
 8. Output: TIFF (BigTIFF + pyramid when large, tifffile), PNG preview, JSON sidecar (inputs, detector, positions in
    px and um, pixel size, stage -> mosaic transform, match scores, residuals, data-bar height). Rendering is done in
    bands into a disk-backed array so peak RAM stays far below 8 GB for large mosaics.
@@ -277,6 +290,99 @@ def detector_detail(tiles: list[TileInfo]) -> dict[str, int]:
     return out
 
 
+class StitchSet(BaseModel):
+    """Images that can be stitched together: same detector, magnification, pixel size, image size, rotation / tilt,
+    and stage footprints that overlap (connected)."""
+    id: str
+    detector_class: str
+    magnification: float | None = None
+    pixel_size_um: float | None = None
+    size_px: tuple[int, int]                   # width, height (strip-free)
+    names: list[str]
+    paths: list[str]
+    image_numbers: list[int | None]
+    overlapping: bool                          # footprints overlap (stage) / unknown without stage data
+    note: str = ""
+
+    @property
+    def n(self) -> int:
+        return len(self.names)
+
+    @property
+    def label(self) -> str:
+        mag = f"{self.magnification:g}×" if self.magnification else "unknown magnification"
+        ps = f", {self.pixel_size_um * 1000:.3g} nm/px" if self.pixel_size_um else ""
+        nums = [n for n in self.image_numbers if n is not None]
+        rng = (f" {min(nums)}–{max(nums)}" if len(nums) > 1 else f" {nums[0]}") if nums else ""
+        return f"{self.detector_class} {mag}{ps}: {self.n} image{'s' if self.n != 1 else ''}{rng}"
+
+
+def _setting_key(t: TileInfo) -> tuple:
+    r = lambda v, k=6: None if v is None else round(float(v), k)  # noqa: E731
+    return (t.detector_class, r(t.magnification, 3), r(t.pixel_size_um, 7), t.width, t.height,
+            r(t.scan_rotation_deg, 2), r(t.stage_rotation_deg, 2), r(t.stage_tilt_deg, 2))
+
+
+def stitch_sets(tiles: list[TileInfo], min_overlap_frac: float = 0.0) -> list[StitchSet]:
+    """Group images into stitch sets: same setting (detector, magnification, pixel size, size, rotation, tilt) and
+    overlapping stage footprints (field of view around the stage position; components of the overlap graph). Without
+    stage data a setting group is one set (overlap unknown until registration). Single images are sets of one
+    (nothing to stitch). Sorted by detector, magnification, first image number."""
+    groups: dict[tuple, list[TileInfo]] = {}
+    for t in sorted(tiles, key=lambda t: (t.image_number or 0, t.name)):
+        groups.setdefault(_setting_key(t), []).append(t)
+    out: list[StitchSet] = []
+    for key, tl in groups.items():
+        ps = tl[0].pixel_size_um
+        if ps and all(t.has_stage for t in tl) and len(tl) > 1:
+            fw, fh = tl[0].width * ps, tl[0].height * ps                 # um
+            S = np.array([stage_um(t) for t in tl])
+            parent = list(range(len(tl)))
+
+            def find(a):
+                while parent[a] != a:
+                    parent[a] = parent[parent[a]]
+                    a = parent[a]
+                return a
+            for i, j in combinations(range(len(tl)), 2):
+                d = np.abs(S[i] - S[j])
+                # the scan may be rotated 90 deg against the stage: accept either axis assignment
+                ov = max((fw - d[0]) * (fh - d[1]) if d[0] < fw and d[1] < fh else 0.0,
+                         (fh - d[0]) * (fw - d[1]) if d[0] < fh and d[1] < fw else 0.0)
+                if ov > min_overlap_frac * fw * fh:
+                    parent[find(i)] = find(j)
+            comps: dict[int, list[TileInfo]] = {}
+            for k, t in enumerate(tl):
+                comps.setdefault(find(k), []).append(t)
+            parts = [(c, True) for c in comps.values()]
+        else:
+            parts = [(tl, len(tl) > 1 and not (ps and all(t.has_stage for t in tl)))]
+        for c, _ in parts:
+            has_stage = bool(ps) and all(t.has_stage for t in c)
+            out.append(StitchSet(
+                id="", detector_class=key[0], magnification=c[0].magnification, pixel_size_um=ps,
+                size_px=(c[0].width, c[0].height), names=[t.name for t in c], paths=[t.path for t in c],
+                image_numbers=[t.image_number for t in c], overlapping=len(c) > 1,
+                note=("" if len(c) > 1 and has_stage else "single image: nothing to stitch" if len(c) == 1
+                      else "no stage data: overlaps are found by registration")))
+    out.sort(key=lambda s: (s.detector_class, -(s.magnification or 0), min(n or 0 for n in s.image_numbers)))
+    for k, s in enumerate(out):
+        s.id = f"{s.detector_class}-{(s.magnification or 0):g}x-{k + 1}"
+    return out
+
+
+def check_one_set(tiles: list[TileInfo]) -> list[StitchSet]:
+    """Refuse a selection that mixes magnifications / pixel sizes / image sizes (never stitched together); returns the
+    stitch sets of the selection."""
+    sets = stitch_sets(tiles)
+    settings = {(s.magnification, s.pixel_size_um, s.size_px) for s in sets}
+    if len(settings) > 1:
+        lines = "; ".join(s.label for s in sets)
+        raise ValueError(f"the selection mixes magnifications or pixel sizes ({len(sets)} stitch sets: {lines}). "
+                         "Images of different magnifications are never stitched together: choose one stitch set.")
+    return sets
+
+
 def _read_pixels(path: str | Path) -> np.ndarray:
     return bse_io.read_image(path)
 
@@ -291,7 +397,12 @@ class StitchParams(BaseModel):
         "own", description="'bse': stitch BSE, register each SE tile to its BSE tile (same $SM_IMAGE_NUMBER, small "
                            "shift only) and place it with the BSE layout, so both mosaics are aligned")
     strip_px: int | None = Field(None, description="manual data-bar height (default: from the .txt / detected)")
-    allow_rescale: bool = Field(False, description="rescale tiles with another pixel size to the finest one")
+    manual_layout: dict[str, tuple[float, float]] = Field(
+        {}, description="manual pre-arrangement: tile (stem or image number) -> (x, y) px of its top-left corner in "
+                        "one common frame; replaces the stage prior (Arrange view)")
+    locked: list[str] = Field([], description="tiles (stem or image number) that keep their manual position")
+    refine_radius: float = Field(0.10, description="with manual_layout: search radius around the given positions, as "
+                                                   "a fraction of the tile size")
     stage_map: Literal["auto", "default"] | tuple[tuple[int, int], tuple[int, int]] = Field(
         "auto", description="stage -> image axes: auto (chosen from the data), default (measured JSM-IT500HR "
                             "mapping), or a 2x2 signed permutation ((col<-X, col<-Y), (row<-X, row<-Y))")
@@ -304,7 +415,12 @@ class StitchParams(BaseModel):
     rotation_check: bool = Field(False, description="also report the best small rotation (+-1 deg) per pair")
     normalize: bool | None = Field(None, description="per-tile gain/offset normalisation (default: on for feather, "
                                                      "off for blend='none')")
-    blend: Literal["feather", "none"] = "feather"
+    blend: Literal["seam", "feather", "none"] = Field(
+        "seam", description="seam: blend only in a narrow band around a seam (default); feather: across the whole "
+                            "overlap; none: raw pixels of the seam owner, integer positions")
+    seam: Literal["midline", "min_difference"] = Field(
+        "midline", description="seam position: midline of the overlap, or a minimum-difference path")
+    blend_band_px: int = Field(32, description="width of the blending band around a seam (px)")
     info_strip: Literal["none", "keep", "generate"] = "none"
     single_column_tol_px: int | None = Field(None, description="'keep' needs mosaic width - tile width <= this "
                                                                "(default 5 % of the tile width; the 8-tile test column drifts 58 px)")
@@ -510,6 +626,7 @@ class PairResult:
     rotation_deg: float | None = None
     residual_px: float | None = None
     used: bool = False
+    after: dict = field(default_factory=dict)     # residual misalignment after placement (pair_alignment)
 
 
 def register_pair(A: np.ndarray, B: np.ndarray, predicted: tuple[float, float] | None, search_px: float | None,
@@ -721,10 +838,12 @@ def _is_signed_perm(M) -> bool:
 
 # ---- global placement ----------------------------------------------------------------------------------------
 def solve_positions(n: int, pairs: list[PairResult], prior: np.ndarray | None, prior_weight: float = 1e-4,
-                    max_residual_px: float = 3.0) -> tuple[np.ndarray, list[PairResult], list[int]]:
-    """Weighted least squares: p_j - p_i = offset_ij (weight = NCC score), p ~ prior (weak), iteratively dropping
-    the pair with the largest residual while it exceeds max_residual_px. Returns positions (n x 2: row, col),
-    the pairs (used / residual set) and the tiles placed by the stage prior only."""
+                    max_residual_px: float = 3.0,
+                    prior_weights: np.ndarray | None = None) -> tuple[np.ndarray, list[PairResult], list[int]]:
+    """Weighted least squares: p_j - p_i = offset_ij (weight = NCC score), p ~ prior (weak; per tile with
+    `prior_weights`, e.g. strong for locked tiles), iteratively dropping the pair with the largest residual while it
+    exceeds max_residual_px. Returns positions (n x 2: row, col), the pairs (used / residual set) and the tiles placed
+    by the prior only."""
     good = [r for r in pairs if r.ok]
     while True:
         rows, rhs, wts = [], [], []
@@ -742,7 +861,7 @@ def solve_positions(n: int, pairs: list[PairResult], prior: np.ndarray | None, p
             if prior is not None:
                 rows.append(row)
                 rhs.append(tuple(prior[k]))
-                wts.append(prior_weight)
+                wts.append(prior_weight if prior_weights is None else float(prior_weights[k]))
             elif k in roots:                           # no stage: fix the first tile of each component
                 rows.append(row)
                 rhs.append((0.0, 0.0))
@@ -825,56 +944,279 @@ def intensity_correction(store: TileStore, pos: np.ndarray, pairs: list[PairResu
 
 
 # ---- rendering ----------------------------------------------------------------------------------------------
-def _edge_weight(shape: tuple[int, int]) -> np.ndarray:
-    """Linear feathering weight: distance (px) to the nearest tile edge, + 1."""
-    h, w = shape
-    wy = np.minimum(np.arange(h) + 1, h - np.arange(h)).astype(np.float32)
-    wx = np.minimum(np.arange(w) + 1, w - np.arange(w)).astype(np.float32)
-    return np.minimum(wy[:, None], wx[None, :])
+def _edge_dist(rows: slice, cols: slice, q, shape) -> np.ndarray:
+    """Distance (px) of canvas pixel centres to the nearest edge of a tile whose top-left corner is at the subpixel
+    position q = (row, col); > 0 inside the tile."""
+    ys = np.arange(rows.start, rows.stop) + 0.5 - q[0]
+    xs = np.arange(cols.start, cols.stop) + 0.5 - q[1]
+    dy = np.minimum(ys, shape[0] - ys).astype(np.float32)
+    dx = np.minimum(xs, shape[1] - xs).astype(np.float32)
+    return np.minimum(dy[:, None], dx[None, :])
 
 
-def render(store: TileStore, origins: np.ndarray, canvas: tuple[int, int], out: np.ndarray,
-           gains: list[tuple[float, float]] | None, blend: str, dtype, band_px: int = 2048,
-           msg: str = "render", span: tuple[float, float] = (0.0, 1.0)) -> None:
-    """Write the mosaic into `out` (canvas shape, may be a memmap) band by band. origins: integer (row, col)."""
+def placed_tile(store: TileStore, k: int, frac, gains=None) -> np.ndarray:
+    """Tile k (gain / offset applied) resampled onto the canvas pixel grid: out[r, c] = tile at (r - frac_r,
+    c - frac_c) (cubic spline), so it can be pasted at the integer origin floor(q)."""
+    a = store.get(k)
+    if gains:
+        g, o = gains[k]
+        a = a * np.float32(g) + np.float32(o)
+    if abs(frac[0]) > 1e-3 or abs(frac[1]) > 1e-3:
+        from scipy.ndimage import shift as ndshift  # noqa: PLC0415
+
+        a = ndshift(a, (float(frac[0]), float(frac[1])), order=3, mode="nearest")
+    return a.astype(np.float32, copy=False)
+
+
+def _footprint(O, shape, canvas) -> tuple[slice, slice, slice, slice]:
+    """Canvas slices of a tile at integer origin O and the matching slices in the tile."""
+    r0, c0 = int(O[0]), int(O[1])
+    rs = slice(max(0, r0), min(canvas[0], r0 + shape[0]))
+    cs = slice(max(0, c0), min(canvas[1], c0 + shape[1]))
+    return rs, cs, slice(rs.start - r0, rs.stop - r0), slice(cs.start - c0, cs.stop - c0)
+
+
+def seam_owner(Q: np.ndarray, shapes: list[tuple[int, int]], canvas: tuple[int, int], out: np.ndarray,
+               band_rows: int = 2048) -> np.ndarray:
+    """Midline seams: each canvas pixel belongs to the tile whose edge is farthest (-1 = no tile). `out` (int16,
+    canvas shape, may be a memmap) is filled and returned."""
     H, W = canvas
-    info = np.iinfo(dtype) if np.issubdtype(dtype, np.integer) else None
-    n = len(origins)
-    weights: dict[tuple[int, int], np.ndarray] = {}
-    for y0 in range(0, H, band_px):
-        y1 = min(H, y0 + band_px)
-        acc = np.zeros((y1 - y0, W), np.float32)
-        wsum = np.zeros((y1 - y0, W), np.float32)
-        for k in range(n):
-            th, tw = store.shape(k)
-            r0, c0 = int(origins[k][0]), int(origins[k][1])
-            a0, a1 = max(y0, r0), min(y1, r0 + th)
+    for y0 in range(0, H, band_rows):
+        y1 = min(H, y0 + band_rows)
+        best = np.zeros((y1 - y0, W), np.float32)
+        own = np.full((y1 - y0, W), -1, np.int16)
+        for k, q in enumerate(Q):
+            r0, c0 = int(math.floor(q[0])), int(math.floor(q[1]))
+            a0, a1 = max(y0, r0), min(y1, r0 + shapes[k][0] + 1)
             if a1 <= a0:
                 continue
-            tile = store.get(k)[a0 - r0: a1 - r0]
-            if gains:
-                g, o = gains[k]
-                tile = tile * g + o
-            if (th, tw) not in weights:
-                weights[(th, tw)] = _edge_weight((th, tw))
-            wk = weights[(th, tw)][a0 - r0: a1 - r0]
-            c1 = c0 + tw
-            cs = slice(max(0, c0), min(W, c1))
-            ts = slice(cs.start - c0, cs.stop - c0)
-            sub_acc, sub_w = acc[a0 - y0: a1 - y0, cs], wsum[a0 - y0: a1 - y0, cs]
+            cs = slice(max(0, c0), min(W, c0 + shapes[k][1] + 1))
+            d = _edge_dist(slice(a0, a1), cs, q, shapes[k])
+            sb, so = best[a0 - y0: a1 - y0, cs], own[a0 - y0: a1 - y0, cs]
+            m = d > sb
+            sb[m] = d[m]
+            so[m] = k
+        out[y0:y1] = own
+    return out
+
+
+def _dp_seam(cost: np.ndarray) -> np.ndarray:
+    """Minimum-cost path from the top row to the bottom row (one column per row, steps of at most one column)."""
+    R, C = cost.shape
+    M = cost.astype(np.float64).copy()
+    back = np.zeros((R, C), np.int8)
+    cols = np.arange(C)
+    for r in range(1, R):
+        prev = M[r - 1]
+        stack = np.stack([np.r_[np.inf, prev[:-1]], prev, np.r_[prev[1:], np.inf]])
+        k = np.argmin(stack, axis=0)
+        M[r] += stack[k, cols]
+        back[r] = k - 1
+    path = np.zeros(R, np.int64)
+    path[-1] = int(np.argmin(M[-1]))
+    for r in range(R - 1, 0, -1):
+        path[r - 1] = min(C - 1, max(0, path[r] + back[r, path[r]]))
+    return path
+
+
+def min_difference_seams(store: TileStore, Q, O, shapes, canvas, owner: np.ndarray, pairs: list[PairResult],
+                         gains) -> int:
+    """Move the midline seam of every used pair to a minimum-difference path through its overlap (dynamic programming
+    on the smoothed |A - B| of the placed tiles), only among the pixels the two tiles own. Returns how many seams."""
+    from scipy.ndimage import gaussian_filter  # noqa: PLC0415
+
+    n = 0
+    for r in pairs:
+        if not r.used:
+            continue
+        i, j = r.i, r.j
+        rs_i, cs_i, _, _ = _footprint(O[i], shapes[i], canvas)
+        rs_j, cs_j, _, _ = _footprint(O[j], shapes[j], canvas)
+        rs = slice(max(rs_i.start, rs_j.start), min(rs_i.stop, rs_j.stop))
+        cs = slice(max(cs_i.start, cs_j.start), min(cs_i.stop, cs_j.stop))
+        if rs.stop - rs.start < 8 or cs.stop - cs.start < 8:
+            continue
+        own = np.asarray(owner[rs, cs])
+        R = (own == i) | (own == j)
+        if R.sum() < 64:
+            continue
+        A = placed_tile(store, i, Q[i] - O[i], gains)[rs.start - int(O[i][0]): rs.stop - int(O[i][0]),
+                                                      cs.start - int(O[i][1]): cs.stop - int(O[i][1])]
+        B = placed_tile(store, j, Q[j] - O[j], gains)[rs.start - int(O[j][0]): rs.stop - int(O[j][0]),
+                                                      cs.start - int(O[j][1]): cs.stop - int(O[j][1])]
+        cost = np.where(R, gaussian_filter(np.abs(A - B), 1.5), 1e6)
+        ci = np.array([Q[i][0] + shapes[i][0] / 2, Q[i][1] + shapes[i][1] / 2])
+        cj = np.array([Q[j][0] + shapes[j][0] / 2, Q[j][1] + shapes[j][1] / 2])
+        if abs(cj[1] - ci[1]) >= abs(cj[0] - ci[0]):               # side by side: a seam from top to bottom
+            path = _dp_seam(cost)
+            first, second = (i, j) if cj[1] > ci[1] else (j, i)
+            side = np.arange(cost.shape[1])[None, :] < path[:, None]
+        else:                                                       # one above the other: left to right
+            path = _dp_seam(cost.T)
+            first, second = (i, j) if cj[0] > ci[0] else (j, i)
+            side = np.arange(cost.shape[0])[:, None] < path[None, :]
+        owner[rs, cs] = np.where(R, np.where(side, first, second), own).astype(np.int16)
+        n += 1
+    return n
+
+
+def _seam_weight(inside: np.ndarray, band: float) -> np.ndarray:
+    """Blending weight of a tile around the boundary of the region it owns: 1 inside, 0 outside, a linear ramp of
+    `band` px across the boundary (signed distance from Euclidean distance transforms, computed only near it)."""
+    w = inside.astype(np.float32)
+    if band <= 0 or inside.all() or not inside.any():
+        return w
+    from scipy.ndimage import distance_transform_edt  # noqa: PLC0415
+
+    ch_r = inside[:-1] != inside[1:]
+    ch_c = inside[:, :-1] != inside[:, 1:]
+    edge_r = np.nonzero(ch_r)
+    edge_c = np.nonzero(ch_c)
+    ys = np.r_[edge_r[0], edge_r[0] + 1, edge_c[0]]
+    xs = np.r_[edge_r[1], edge_c[1], edge_c[1] + 1]
+    if ys.size == 0:
+        return w
+    pad = int(math.ceil(band)) + 2
+    r0, r1 = max(0, int(ys.min()) - pad), min(inside.shape[0], int(ys.max()) + pad + 1)
+    c0, c1 = max(0, int(xs.min()) - pad), min(inside.shape[1], int(xs.max()) + pad + 1)
+    sub = inside[r0:r1, c0:c1]
+    s = distance_transform_edt(sub) - distance_transform_edt(~sub)        # +1 / -1 next to the boundary
+    w[r0:r1, c0:c1] = np.clip(0.5 + s / band, 0.0, 1.0)
+    return w
+
+
+def render(store: TileStore, Q: np.ndarray, O: np.ndarray, canvas: tuple[int, int], out: np.ndarray,
+           gains: list[tuple[float, float]] | None, blend: str, dtype, work_dir: Path, seam: str = "midline",
+           blend_band_px: float = 32.0, pairs: list[PairResult] | None = None, band_px: int = 2048,
+           msg: str = "render", span: tuple[float, float] = (0.0, 1.0)) -> dict:
+    """Write the mosaic into `out` (canvas shape, may be a memmap). Q = subpixel tile origins (row, col) on the canvas,
+    O = integer origins (floor(Q) for seam / feather: the fractional part is resampled; rint(Q) for blend 'none').
+    Accumulation arrays are disk-backed (work_dir) so large mosaics stay far below the RAM limit."""
+    H, W = canvas
+    n = len(Q)
+    shapes = [store.shape(k) for k in range(n)]
+    info = np.iinfo(dtype) if np.issubdtype(dtype, np.integer) else None
+    work_dir = Path(work_dir)
+    report: dict = {"blend": blend, "seam": seam if blend != "feather" else None,
+                    "blend_band_px": blend_band_px if blend == "seam" else None}
+    maps: dict[str, np.memmap] = {}
+
+    def mm(name, dt):
+        maps[name] = np.memmap(work_dir / f".render_{name}.raw", dtype=dt, mode="w+", shape=canvas)
+        return maps[name]
+    try:
+        owner = None
+        if blend in ("seam", "none"):
+            owner = mm("owner", np.int16)
+            Qs = Q if blend == "seam" else O.astype(float)       # 'none': seams between the integer-placed tiles
+            seam_owner(Qs, shapes, canvas, owner, band_px)
+            if seam == "min_difference" and pairs:
+                report["min_difference_seams"] = min_difference_seams(store, Qs, O, shapes, canvas, owner, pairs,
+                                                                      gains if blend == "seam" else None)
+        if blend == "none":
+            for k in range(n):
+                rs, cs, ts, us = _footprint(O[k], shapes[k], canvas)
+                m = np.asarray(owner[rs, cs]) == k
+                tile = store.get(k)[ts, us]
+                dst = np.asarray(out[rs, cs]).copy()
+                dst[m] = tile[m] if not info else np.clip(np.rint(tile[m]), info.min, info.max)
+                out[rs, cs] = dst
+                _progress(msg, span[0] + (span[1] - span[0]) * (k + 1) / n)
+            return report
+        acc, wsum = mm("acc", np.float32), mm("wsum", np.float32)
+        for k in range(n):
+            tile = placed_tile(store, k, Q[k] - O[k], gains)
+            rs, cs, ts, us = _footprint(O[k], shapes[k], canvas)
+            d = _edge_dist(rs, cs, Q[k], shapes[k])
             if blend == "feather":
-                sub_acc += tile[:, ts] * wk[:, ts]
-                sub_w += wk[:, ts]
-            else:                                   # winner takes all: the tile whose edge is farthest
-                m = wk[:, ts] > sub_w
-                sub_acc[m] = tile[:, ts][m]
-                sub_w[m] = wk[:, ts][m]
-        if blend == "feather":
-            np.divide(acc, wsum, out=acc, where=wsum > 0)
-        if info:
-            np.clip(np.rint(acc), info.min, info.max, out=acc)
-        out[y0:y1] = acc.astype(dtype)
-        _progress(msg, span[0] + (span[1] - span[0]) * y1 / H)
+                wk = np.maximum(d, 0)
+            else:
+                wk = _seam_weight(np.asarray(owner[rs, cs]) == k, blend_band_px) * (d > 0)
+            acc[rs, cs] += tile[ts, us] * wk
+            wsum[rs, cs] += wk
+            _progress(msg, span[0] + 0.8 * (span[1] - span[0]) * (k + 1) / n)
+        for y0 in range(0, H, band_px):
+            y1 = min(H, y0 + band_px)
+            a = np.asarray(acc[y0:y1])
+            ws = np.asarray(wsum[y0:y1])
+            v = np.divide(a, ws, out=np.zeros_like(a), where=ws > 0)
+            if info:
+                np.clip(np.rint(v), info.min, info.max, out=v)
+            out[y0:y1] = v.astype(dtype)
+        return report
+    finally:
+        names = list(maps)
+        maps.clear()
+        owner = acc = wsum = None                   # noqa: F841 (release the memory maps before deleting)
+        import gc  # noqa: PLC0415
+
+        gc.collect()
+        for nm in names:
+            try:
+                (work_dir / f".render_{nm}.raw").unlink()
+            except OSError:
+                pass
+
+
+def placed_overlap(store: TileStore, Q: np.ndarray, i: int, j: int, gains=None):
+    """The overlap of tiles i and j at their final subpixel positions, both on tile i's pixel grid (j resampled):
+    (a, b) arrays, or None."""
+    qi = np.asarray(Q[i], float)
+    d = np.asarray(Q[j], float) - qi
+    di = np.floor(d)
+    A = placed_tile(store, i, (0.0, 0.0), gains)
+    B = placed_tile(store, j, d - di, gains)
+    ov = _overlap(A.shape, B.shape, (float(di[0]), float(di[1])))
+    if ov is None:
+        return None
+    (ya, xa), (yb, xb) = ov
+    a, b = A[ya, xa][1:, 1:], B[yb, xb][1:, 1:]                # first row / column of b is extrapolated
+    if min(a.shape) < 8:
+        return None
+    return a, b
+
+
+def pair_alignment(store: TileStore, Q: np.ndarray, i: int, j: int, gains=None) -> dict:
+    """Residual misalignment of one overlap after placement: subpixel phase correlation of the two placed tiles in
+    their overlap (0 = perfectly aligned), mean |A - B| and the pixel-noise level (MAD of the 1-px differences)."""
+    ov = placed_overlap(store, Q, i, j, gains)
+    if ov is None:
+        return {}
+    a, b = ov
+    from skimage.registration import phase_cross_correlation  # noqa: PLC0415
+
+    s, _, _ = phase_cross_correlation(a, b, upsample_factor=20, normalization=None)
+    noise = float(np.median(np.abs(np.diff(a, axis=1))) * 1.4826 / math.sqrt(2))
+    return {"misalignment_px": round(float(math.hypot(*s)), 3),
+            "misalignment_dxdy_px": [round(float(s[1]), 3), round(float(s[0]), 3)],
+            "diff_mean": round(float(np.abs(a - b).mean()), 3), "noise": round(noise, 3)}
+
+
+def overlap_difference(side: dict, a_name: str, b_name: str) -> tuple[np.ndarray, dict]:
+    """Difference image |A - B| of one overlap of a stitched mosaic (sidecar), both tiles at their final subpixel
+    positions with the mosaic's gain / offset: uint8 image (0 = identical, 255 = the 99.5th percentile or more) and
+    stats. Misregistration shows as double edges / bright outlines here."""
+    names = [t["name"] for t in side["tiles"]]
+    ia, ib = names.index(a_name), names.index(b_name)
+    tl = []
+    for k in (ia, ib):
+        t = side["tiles"][k]
+        inp = next((x for x in side["inputs"] if Path(x["image"]).stem == t["name"]), None)
+        if inp is None:
+            raise KeyError(f"tile {t['name']} not in the sidecar inputs")
+        tl.append(read_tile(inp["image"], inp.get("txt")))
+    store = TileStore(tl)
+    Q = np.array([[side["tiles"][k]["y_px"], side["tiles"][k]["x_px"]] for k in (ia, ib)], float)
+    gains = [(side["tiles"][k]["gain"], side["tiles"][k]["offset"]) for k in (ia, ib)] if side.get("normalize") else None
+    ov = placed_overlap(store, Q, 0, 1, gains)
+    if ov is None:
+        raise ValueError(f"{a_name} and {b_name} do not overlap")
+    a, b = ov
+    d = np.abs(a - b)
+    hi = max(float(np.percentile(d, 99.5)), 1e-6)
+    stats = {"a": a_name, "b": b_name, "size_px": [int(d.shape[1]), int(d.shape[0])], "scale_max": round(hi, 2),
+             **pair_alignment(store, Q, 0, 1, gains)}
+    return np.clip(d / hi * 255, 0, 255).astype(np.uint8), stats
 
 
 # ---- output -------------------------------------------------------------------------------------------------
@@ -948,9 +1290,9 @@ def _match(t: TileInfo, keys: list[str] | dict) -> str | None:
     return None
 
 
-def check_consistency(tiles: list[TileInfo], allow_rescale: bool) -> tuple[list[float], list[str]]:
-    """Refuse tiles with another pixel size, magnification, scan rotation, stage rotation / tilt or size (unless
-    allow_rescale: different pixel sizes are rescaled to the finest). Returns per-tile scale and notes."""
+def check_consistency(tiles: list[TileInfo]) -> tuple[list[float], list[str]]:
+    """Refuse tiles with another pixel size, magnification, image size, scan rotation or stage rotation / tilt: they
+    are never stitched together (see stitch_sets). Returns per-tile scale (always 1) and notes."""
     notes = []
     ps = [t.pixel_size_um for t in tiles]
     known = [p for p in ps if p]
@@ -960,27 +1302,20 @@ def check_consistency(tiles: list[TileInfo], allow_rescale: bool) -> tuple[list[
         v = [x for x in vals if x is not None]
         return bool(v) and (max(v) - min(v)) > tol
 
-    problems = []
-    if known and len(known) != len(ps):
-        problems.append("some tiles have no pixel size (.txt missing)")
-    if known and differs(known, 1e-4 * min(known)):
-        problems.append(f"pixel sizes differ: {sorted({round(p * 1000, 3) for p in known})} nm")
-    if differs([t.magnification for t in tiles], 1e-6):
-        problems.append(f"magnifications differ: {sorted({t.magnification for t in tiles if t.magnification})}")
     for name, attr, tol in (("scan rotation", "scan_rotation_deg", 0.01), ("stage rotation", "stage_rotation_deg", 0.01),
                             ("stage tilt", "stage_tilt_deg", 0.01)):
         if differs([getattr(t, attr) for t in tiles], tol):
             vals = sorted({getattr(t, attr) for t in tiles if getattr(t, attr) is not None})
             raise ValueError(f"{name} differs between tiles ({vals} deg): tiles are rotated / foreshortened against "
                              "each other; stitch each setting separately")
+    problems = []
+    if known and len(known) != len(ps):
+        problems.append("some tiles have no pixel size (.txt missing)")
+    if (known and differs(known, 1e-4 * min(known))) or differs([t.magnification for t in tiles], 1e-6) \
+            or len({(t.width, t.height) for t in tiles}) > 1:
+        check_one_set(tiles)                          # raises with the list of stitch sets
     if problems:
-        rescalable = all("pixel size" in p or "magnification" in p for p in problems) and len(known) == len(ps)
-        if not (allow_rescale and rescalable):
-            raise ValueError("tiles are not compatible: " + "; ".join(problems) +
-                             (" (allow_rescale=True rescales them to the finest pixel size)" if rescalable else ""))
-        fine = min(known)
-        scale = [p / fine for p in ps]
-        notes.append(f"rescaled to {fine * 1000:.3f} nm/px: " + "; ".join(problems))
+        raise ValueError("tiles are not compatible: " + "; ".join(problems))
     bs = {t.beam_shift for t in tiles if t.beam_shift is not None}
     if len(bs) > 1:
         notes.append("MP_BEAM_SHIFT differs between tiles; the stage prior ignores beam shift (registration "
@@ -998,7 +1333,22 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
     use_stage = ps is not None and all(t.has_stage for t in tiles) and n > 1
     report: dict = {}
     prior = None
-    if use_stage:
+    prior_w = None
+    if p.manual_layout and n > 1:
+        missing = [t.name for t in tiles if _match(t, p.manual_layout) is None]
+        if missing:
+            raise ValueError(f"manual_layout has no position for {missing}")
+        prior = np.array([[p.manual_layout[_match(t, p.manual_layout)][1],
+                           p.manual_layout[_match(t, p.manual_layout)][0]] for t in tiles], float)   # row, col
+        locked = [k for k, t in enumerate(tiles) if _match(t, p.locked) is not None]
+        prior_w = np.full(n, 1e-4)
+        prior_w[locked] = 1e3
+        search = p.refine_radius * max(shapes[0])
+        pair_ids = candidate_pairs(prior, shapes, p.min_overlap_px, margin=search)
+        report = {"notes": [f"manual layout (Arrange view): pairs searched within {100 * p.refine_radius:g} % of the "
+                            f"tile size ({search:.0f} px) around the given positions"],
+                  "locked": [tiles[k].name for k in locked]}
+    elif use_stage:
         _progress(f"{label}: stage mapping", 0.02)
         if p.stage_map == "auto":
             M, report = choose_stage_map(tiles, store, ps, p, coarse)
@@ -1028,7 +1378,7 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
             pairs.append(r)
         if p.rotation_check and r.ok:
             r.rotation_deg = rotation_check(store.get(i), store.get(j), r.offset)
-    P, pairs, stage_only = solve_positions(n, pairs, prior, max_residual_px=p.max_residual_px)
+    P, pairs, stage_only = solve_positions(n, pairs, prior, max_residual_px=p.max_residual_px, prior_weights=prior_w)
     if prior is None and len(_components(n, [r for r in pairs if r.used])) > 1:
         raise ValueError("without stage data the tiles do not form one connected group of good matches; give the "
                          ".txt files or exclude unrelated images")
@@ -1082,7 +1432,7 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
     for d in wanted:
         if not by_det[d]:
             raise ValueError(f"no {d} images (detector counts: {detector_counts(all_tiles)})")
-    normalize = p.normalize if p.normalize is not None else (p.blend == "feather")
+    normalize = p.normalize if p.normalize is not None else (p.blend != "none")
     results: dict[str, MosaicResult] = {}
     bse_layout = None
     order = ["BSE", "SE"] if ("SE" in wanted and p.se_layout == "bse") else wanted
@@ -1090,7 +1440,7 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
         tl = sorted(by_det[det], key=lambda t: (t.image_number or 0, t.name))
         if not tl:
             raise ValueError(f"se_layout='bse' needs the BSE tiles in the selection (none found)")
-        scale, notes = check_consistency(tl, p.allow_rescale)
+        scale, notes = check_consistency(tl)
         store = TileStore(tl, scale)
         ps = min(t.pixel_size_um for t in tl) if all(t.pixel_size_um for t in tl) else None
         se_from = None
@@ -1110,11 +1460,12 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
             origin_shift = se_from["origin_shift"]
             Q = P + nud - origin_shift
             canvas = se_from["canvas"]
-            O = np.rint(Q).astype(int)
+            O = (np.rint(Q) if p.blend == "none" else np.floor(Q)).astype(int)
         else:
             origin_shift = (P + nud).min(axis=0)
             Q = P + nud - origin_shift
-            O = np.rint(Q).astype(int)
+            # subpixel placement: integer origin floor(Q) + resampled fraction (raw pixels for blend 'none': rint)
+            O = (np.rint(Q) if p.blend == "none" else np.floor(Q)).astype(int)
             shapes = [store.shape(i) for i in range(len(tl))]
             canvas = (int(max(O[k][0] + shapes[k][0] for k in range(len(tl)))),
                       int(max(O[k][1] + shapes[k][1] for k in range(len(tl)))))
@@ -1128,8 +1479,13 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
         mm_path = out_dir / f".mosaic_{det}.raw"
         mosaic = np.memmap(mm_path, dtype=dtype, mode="w+", shape=canvas)
         try:
-            render(store, O, canvas, mosaic, gains, p.blend, dtype, p.band_px, msg=f"{det}: render",
-                   span=(0.72, 0.9))
+            rinfo = render(store, Q, O, canvas, mosaic, gains, p.blend, dtype, out_dir, seam=p.seam,
+                           blend_band_px=p.blend_band_px, pairs=pairs, band_px=p.band_px, msg=f"{det}: render",
+                           span=(0.72, 0.86))
+            used = [r for r in pairs if r.used]
+            for k, r in enumerate(used):          # ghosting check: residual misalignment after placement
+                _progress(f"{det}: checking overlap {k + 1}/{len(used)}", 0.86 + 0.05 * k / max(1, len(used)))
+                r.after = pair_alignment(store, Q if p.blend != "none" else O.astype(float), r.i, r.j, gains)
             strip_info = {"mode": p.info_strip, "height_px": 0}
             final = mosaic
             if p.info_strip != "none":
@@ -1140,9 +1496,10 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
                 final[: canvas[0]] = mosaic
                 final[canvas[0]:] = strip["image"].astype(dtype)
             _progress(f"{det}: writing", 0.92)
-            table = _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches)
+            table = _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches, bool(p.manual_layout))
             side = _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, strip_info, notes,
                             gains, normalize, se_matches, table)
+            side["render"] = rinfo
             tif = out_dir / f"mosaic_{det}.tif"
             side["tiff"] = write_tiff(tif, np.asarray(final), ps, p.tiff_tile, p.pyramid_min_px,
                                       description={"ti64app": "sem.stitch", "detector": det,
@@ -1275,7 +1632,7 @@ def _make_strip(p: StitchParams, tl: list[TileInfo], O: np.ndarray, canvas, ps, 
     return {"image": img, "info": {"height_px": int(img.shape[0]), **info, "fields": fields}}
 
 
-def _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches) -> dict:
+def _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches, manual: bool = False) -> dict:
     best: dict[int, float] = {}
     for r in pairs:
         if r.used:
@@ -1304,7 +1661,8 @@ def _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches) -> d
             rows["placed_by"].append("BSE layout" + ("" if m["ok"] else " (SE match weak: no shift)"))
         else:
             rows["best_score"].append(round(best.get(k, float("nan")), 3))
-            rows["placed_by"].append("stage only" if k in stage_only else "registration")
+            rows["placed_by"].append(("manual position only" if manual else "stage only") if k in stage_only
+                                     else "registration")
         rows["nudge_dx_px"].append(float(nud[k][1]))
         rows["nudge_dy_px"].append(float(nud[k][0]))
         rows["gain"].append(round(gains[k][0], 4) if gains else 1.0)
@@ -1316,6 +1674,7 @@ def _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, str
              se_matches, table) -> dict:
     stage_tf = _stage_transform(tl, Q, report, ps) if se_matches is None else None
     res = [r.residual_px for r in pairs if r.used and r.residual_px is not None]
+    mis = [r.after["misalignment_px"] for r in pairs if r.used and r.after.get("misalignment_px") is not None]
     vals = lambda attr: sorted({getattr(t, attr) for t in tl if getattr(t, attr) is not None})  # noqa: E731
     return {
         "detector": det,
@@ -1333,9 +1692,13 @@ def _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, str
                    "predicted_px": ([round(r.predicted[1], 1), round(r.predicted[0], 1)] if r.predicted else None),
                    "score": round(r.score, 4), "overlap_px": r.overlap_px, "ok": r.ok, "used": r.used,
                    "residual_px": None if r.residual_px is None else round(r.residual_px, 3), "reason": r.reason,
-                   "rotation_deg": r.rotation_deg} for r in pairs],
+                   "rotation_deg": r.rotation_deg, **r.after} for r in pairs],
         "residual_px": {"max": round(max(res), 3) if res else None,
                         "rms": round(float(np.sqrt(np.mean(np.square(res)))), 3) if res else None},
+        "misalignment_px": {"max": round(max(mis), 3) if mis else None,
+                            "rms": round(float(np.sqrt(np.mean(np.square(mis)))), 3) if mis else None,
+                            "description": "residual shift between the two placed tiles in each used overlap "
+                                           "(subpixel phase correlation after placement; ghosting check)"},
         "stage_only_tiles": [tl[k].name for k in stage_only],
         "stage_map": report,
         "stage_to_mosaic": stage_tf,
@@ -1346,7 +1709,8 @@ def _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, str
                      "stage_tilt_deg": vals("stage_tilt_deg")},
         "blend": p.blend,
         "normalize": normalize,
-        "placement": "integer px (no resampling); subpixel positions in tiles[].x_px / y_px",
+        "placement": ("integer px (raw pixels, no resampling); subpixel positions in tiles[].x_px / y_px"
+                      if p.blend == "none" else "subpixel: tiles[].x_px / y_px, fraction resampled (cubic spline)"),
         "notes": notes,
         "params": p.model_dump(mode="json"),
         "method": "phase correlation + NCC, global least squares (Preibisch 2009 doi:10.1093/bioinformatics/btp184; "

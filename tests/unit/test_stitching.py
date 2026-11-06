@@ -195,8 +195,108 @@ def test_exclude_and_nudge(tmp_path):
 def test_refuses_incompatible_tiles(tmp_path):
     make_tiles(tmp_path, GRID[:2])
     make_tiles(tmp_path, GRID[2:4], mag=8000, start=9790)
-    with pytest.raises(ValueError, match="magnifications differ"):
+    with pytest.raises(ValueError, match="mixes magnifications.*2 stitch sets"):
         stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")
+
+
+def test_stitch_sets_magnification_series(tmp_path):
+    """A JU04-like folder: a magnification series (never stitched together) + two overlapping groups at one
+    magnification that are far apart on the stage (two sets)."""
+    make_tiles(tmp_path, GRID[:3])                                     # 4000x, overlapping
+    make_tiles(tmp_path, GRID[:2], mag=8000, start=9790)               # another magnification, same place
+    far = [(r + 40000.0, c) for r, c in GRID[:2]]                       # 2 mm away on the stage
+    make_tiles(tmp_path, far, start=9800, origin=np.min(np.asarray(GRID), axis=0))
+    make_tiles(tmp_path, [(0.0, 0.0)], mag=23, start=9700)             # an overview: single image
+    sets = stitching.stitch_sets(stitching.scan(tmp_path))
+    by = {tuple(st.image_numbers): st for st in sets}
+    assert (9771, 9772, 9773) in by and (9790, 9791) in by and (9800, 9801) in by and (9700,) in by
+    assert by[(9771, 9772, 9773)].overlapping and not by[(9700,)].overlapping
+    assert by[(9700,)].note.startswith("single image")
+    assert "4000×" in by[(9771, 9772, 9773)].label and "9771–9773" in by[(9771, 9772, 9773)].label
+    files = by[(9790, 9791)].paths
+    res = stitching.stitch(stitching.StitchParams(files=files), tmp_path / "o")["BSE"]
+    assert res.info["n_tiles"] == 2
+
+
+def _truth_on_canvas(base, side, names, pos):
+    """Ground-truth texture sampled on the mosaic canvas (cubic), using tile 0's placement."""
+    from scipy.ndimage import map_coordinates
+    t0 = next(t for t in side["tiles"] if t["name"] == names[0])
+    off = (pos[0][0] - t0["y_px"], pos[0][1] - t0["x_px"])          # canvas -> base coordinates
+    W, H = side["mosaic_px"]
+    yy, xx = np.mgrid[0:H, 0:W].astype(float)
+    return map_coordinates(base, [yy + off[0], xx + off[1]], order=3, mode="nearest")
+
+
+def test_subpixel_placement_no_ghosting(tmp_path):
+    """Subpixel offsets: the mosaic matches the ground truth in the seam bands to within the pixel noise (no double
+    edges), and the residual misalignment after placement is far below a pixel."""
+    noise = 4.0
+    base = _texture(int(max(r for r, _ in GRID)) + TH + 16, int(max(c for _, c in GRID)) + TW + 16, 11)
+    files, pos = make_tiles(tmp_path, GRID, base=base, noise=noise)
+    names = [f.stem for f in files]
+    res = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), normalize=False), tmp_path / "o")["BSE"]
+    side = res.info
+    assert side["render"]["blend"] == "seam" and side["render"]["blend_band_px"] == 32
+    assert "subpixel" in side["placement"]
+    used = [q for q in side["pairs"] if q["used"]]
+    assert used and max(q["misalignment_px"] for q in used) < 0.15, [q["misalignment_px"] for q in used]
+    assert side["misalignment_px"]["max"] < 0.15
+    # in the overlaps, the two placed tiles differ only by noise (sqrt(2) * sigma; mean |N(0, s)| = 0.8 s)
+    for q in used:
+        assert q["diff_mean"] < 1.6 * noise, q
+    m = tifffile.imread(res.tiff).astype(float)
+    gt = _truth_on_canvas(base, side, names, pos)
+    # seam bands = pixels covered by two tiles near the seam: compare there
+    cover = np.zeros(m.shape, int)
+    for t in side["tiles"]:
+        cover[t["y_int_px"] + 2: t["y_int_px"] + TH - 2, t["x_int_px"] + 2: t["x_int_px"] + TW - 2] += 1
+    band = cover >= 2
+    err = np.abs(m - gt)[band]
+    assert err.mean() < noise, err.mean()                # ghosting would add texture-edge errors >> noise
+    # compare: rounding the origins (old behaviour) is visibly worse in the bands
+    tile_err = np.abs(m - gt)[cover == 1].mean()
+    assert err.mean() < 1.2 * tile_err + 0.5
+
+
+def test_min_difference_seam_and_difference_image(tmp_path):
+    files, pos = make_tiles(tmp_path, GRID)
+    res = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), seam="min_difference"), tmp_path / "o")["BSE"]
+    side = res.info
+    assert side["render"]["seam"] == "min_difference" and side["render"]["min_difference_seams"] >= 5
+    q = next(q for q in side["pairs"] if q["used"])
+    img, st = stitching.overlap_difference(side, q["a"], q["b"])
+    assert img.dtype == np.uint8 and img.ndim == 2 and min(img.shape) > 40
+    assert st["misalignment_px"] < 0.2 and st["a"] == q["a"]
+    raw = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), blend="none", seam="min_difference"),
+                           tmp_path / "r")["BSE"]
+    assert "integer" in raw.info["placement"]
+
+
+def test_manual_layout_refine_and_lock(tmp_path):
+    """No stage data: a rough manual arrangement (errors ~ 25 px) is refined within 10 % of the tile size; a locked
+    tile keeps its manual position."""
+    files, pos = make_tiles(tmp_path, GRID, txt=False)
+    rng = np.random.default_rng(3)
+    manual = {f.stem: (float(c + rng.uniform(-25, 25)), float(r + rng.uniform(-25, 25)))
+              for f, (r, c) in zip(files, pos)}
+    lock = files[2].stem
+    res = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), manual_layout=manual, locked=[lock],
+                                                  refine_radius=0.1), tmp_path / "o")["BSE"]
+    side = res.info
+    err = _rel(side, pos, [f.stem for f in files])
+    err = err - err[2]                                       # relative to the locked tile
+    assert np.abs(err).max() < 1.0, err
+    assert "manual layout" in side["stage_map"]["notes"][0] and side["stage_map"]["locked"] == [lock]
+    assert side["params"]["manual_layout"][lock] == list(manual[lock])
+    # positions outside the search radius are not found (search is limited to the radius)
+    bad = dict(manual)
+    bad[files[1].stem] = (manual[files[1].stem][0] + 200.0, manual[files[1].stem][1])
+    res2 = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), manual_layout=bad, refine_radius=0.1),
+                            tmp_path / "o2")["BSE"]
+    t1 = next(t for t in res2.info["tiles"] if t["name"] == files[1].stem)
+    t0 = next(t for t in res2.info["tiles"] if t["name"] == files[0].stem)
+    assert abs((t1["x_px"] - t0["x_px"]) - (pos[1][1] - pos[0][1])) > 50
 
 
 def test_never_mixes_detectors(tmp_path):
@@ -327,3 +427,28 @@ def test_mcp_and_cli(project, tmp_path, capsys, monkeypatch):
     assert out["BSE"]["mosaic_px"][0] >= TW and out["SE"]["strip"]["mode"] == "generate"
     assert cli.main(["stitch", str(tmp_path), "--scan"]) == 0
     assert "BSE 2, SE 2" in capsys.readouterr().err
+
+
+def test_mosaic_export_formats(project, tmp_path):
+    """sem.export (phase 6.6 export dialog): PNG native with scale bar + strip, width at DPI, SVG, PDF; names start
+    with the sample ID."""
+    from PIL import Image
+
+    make_tiles(tmp_path, GRID[:2])
+    st = service.run(project, "sem.stitch", {"folder": str(tmp_path), "info_strip": "generate", "sample_id": "JU05"})
+    side = json.loads((project.root / st.outputs["sidecar_BSE"].path).read_text(encoding="utf-8"))
+    assert st.sample_id == "JU05" and st.outputs["mosaic_BSE"].path.endswith("/JU05_mosaic_BSE.tif")
+    e = service.run(project, "sem.export", {"stitch": st.id, "format": "png"})
+    f = project.root / e.outputs["export"].path
+    w, h = side["mosaic_px"]
+    with Image.open(f) as im:
+        assert im.width == w and im.height == h + side["strip"]["height_px"]
+    assert f.name == "JU05_mosaic_BSE.png"
+    e2 = service.run(project, "sem.export", {"stitch": st.id, "format": "tiff", "mode": "width", "width_mm": 50,
+                                             "dpi": 300, "info_strip": False})
+    meta = json.loads((project.root / e2.outputs["sidecar"].path).read_text(encoding="utf-8"))
+    assert meta["image_px"][0] == round(50 / 25.4 * 300) and not meta["info_strip"]
+    for fmt in ("svg", "pdf"):
+        e3 = service.run(project, "sem.export", {"stitch": st.id, "format": fmt, "scale_bar": False})
+        assert (project.root / e3.outputs["export"].path).stat().st_size > 1000
+    assert service.replay(project).ok

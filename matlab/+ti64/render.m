@@ -1,6 +1,7 @@
 function render(id, h5in, outPng, o)
 % RENDER  Draw a RenderSpec (python/ti64app/backends/base.py) for a stored map with the MATLAB
-%   backend: hex-raster image (ti64.hexRaster), boundary overlay segments, colour bar, legend,
+%   backend: hex-raster image (ti64.hexRaster, brick layout; regular hexagons from ti64.hexRasterize when an exact
+%   figure has >= 4 output pixels per measurement), boundary overlay segments, colour bar, legend,
 %   scale bar, exported with exportgraphics. Map convention: east = +x, y down (setting 2).
 %   h5in: /rgb (n x 3, file order, NaN = white) or /values (n, file order); optional /seg (m x 4:
 %   x1 y1 x2 y2), /seg_rgb (m x 3) and optional /seg_w (m, line widths). o: struct cmap, clim, colorbar_label, seg_width, title,
@@ -38,13 +39,28 @@ n = size(c, 1);
 ok = all(isfinite(c), 2);
 cc = uint8(round(255 * min(max(c(ok, :), 0), 1)));
 rows = find(ok);
-img(R.ind1(rows), :) = cc;
-img(R.ind2(rows), :) = cc;
-img = reshape(img, R.H, R.W, 3);
+% figures with >= 4 output pixels per measurement of a hexagonal map draw REGULAR HEXAGONS (ti64.hexRasterize);
+% coarser figures keep the brick image of ti64.hexRaster (one pixel per measurement cannot show a hexagon)
+[useHex, hg] = hexagonGrid(ebsd, R, o);
+if useHex
+  [xf, yf] = fileOrderXY(ebsd, n);
+  rgba = zeros(n, 4, 'uint8');
+  rgba(rows, 1:3) = cc; rgba(rows, 4) = 255;
+  keep = isfinite(xf);
+  img = ti64.hexRasterize(xf(keep), yf(keep), rgba(keep, :), hg, uint8([255 255 255 255]));
+  img = img(:, :, 1:3);
+  imgX = hg(1) + hg(3) * [0.5, hg(5) - 0.5];
+  imgY = hg(2) + hg(4) * [0.5, hg(6) - 0.5];
+else
+  img(R.ind1(rows), :) = cc;
+  img(R.ind2(rows), :) = cc;
+  img = reshape(img, R.H, R.W, 3);
+  imgX = R.xdata; imgY = R.ydata;
+end
 
 f = figure('Visible', 'off', 'Color', 'w', 'Units', 'centimeters');
 ax = axes(f);
-image(ax, 'XData', R.xdata, 'YData', R.ydata, 'CData', img);
+image(ax, 'XData', imgX, 'YData', imgY, 'CData', img);
 axis(ax, 'image'); set(ax, 'YDir', 'reverse');              % y down, as the map convention
 hold(ax, 'on');
 if ismember('seg', names)
@@ -87,6 +103,38 @@ else
   exportgraphics(f, outPng, 'Resolution', o.dpi, 'BackgroundColor', 'white');
 end
 close(f);
+end
+
+function [useHex, g] = hexagonGrid(ebsd, R, o)
+% true-hexagon raster for exact figures of hexagonal maps with >= 4 output pixels per measurement step
+useHex = false; g = [];
+if ~isa(ebsd, 'EBSDhex') || ~isfield(o, 'exact') || ~o.exact, return; end
+dx = 2 * diff(R.xdata) / max(R.W - 1, 1);                 % hexRaster: half-columns of dx / 2
+dy = diff(R.ydata) / max(R.H - 1, 1);
+x0 = R.xdata(1) - dx / 4; x1 = R.xdata(2) + dx / 4;      % brick extent
+y0 = R.ydata(1) - dy / 2; y1 = R.ydata(2) + dy / 2;
+if isfield(o, 'xlim') && ~any(isnan(o.xlim))
+  xl = sort(double(o.xlim)); yl = sort(double(o.ylim));
+  x0 = max(x0, xl(1)); x1 = min(x1, xl(2)); y0 = max(y0, yl(1)); y1 = min(y1, yl(2));
+end
+k = (double(o.width_cm) / 2.54 * double(o.dpi)) / ((x1 - x0) / dx);   % output pixels per step
+if k < 4, return; end
+kk = ceil(k); p = dx / kk;
+W = ceil((x1 - x0) / p); H = ceil((y1 - y0) / p);
+if double(W) * double(H) > 4e8, return; end               % keep the brick image for huge rasters
+useHex = true; g = [x0 y0 p p W H];
+end
+
+function [xf, yf] = fileOrderXY(ebsd, n)
+% measurement centres in FILE order (MTEX 7 stores grid order; prop.oldId maps back)
+oldId = ebsd.prop.oldId(:);
+real = ~isnan(oldId);
+xf = nan(n, 1); yf = nan(n, 1);
+x = ebsd.x(:); y = ebsd.y(:);
+oid = oldId(real);
+in = oid <= n;
+xr = x(real); yr = y(real);
+xf(oid(in)) = xr(in); yf(oid(in)) = yr(in);
 end
 
 function xy = readXY(h5in, name)

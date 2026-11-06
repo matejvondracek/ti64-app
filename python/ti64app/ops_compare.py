@@ -1,6 +1,6 @@
 """compare.backends: run ONE operation on both backends and show the numbers and both figures side by side.
 
-The two runs happen in a scratch copy of the project (cache/compare_<step>/: project.json, recipe.json, sample
+The two runs happen in a scratch copy of the project (cache/compare_<step>/: project.json, recipe.json, samples/files
 sheets, annotations), so the project's own recipe keeps a single backend and its "newest step" defaults do not
 change. Earlier steps the operation depends on are rebuilt on each backend from the copied recipe (materialize).
 Each figure is drawn by the engine that computed the result (CLAUDE.md); the montage only places the two PNGs
@@ -143,7 +143,7 @@ def scratch_copy(project: Project, name: str) -> Project:
         shutil.rmtree(root)
     root.mkdir(parents=True)
     scratch = Project(root)
-    for d in (scratch.samples_dir, scratch.outputs_dir, scratch.figures_dir, scratch.cache_dir):
+    for d in (scratch.outputs_dir, scratch.figures_dir, scratch.cache_dir):
         d.mkdir(parents=True, exist_ok=True)
     for f in project.outputs_dir.rglob("*"):
         if f.is_file():
@@ -153,8 +153,9 @@ def scratch_copy(project: Project, name: str) -> Project:
                 os.link(f, dst)
             except OSError:
                 shutil.copy2(f, dst)
-    for f in [project.info_path, project.recipe_path, project.root / "annotations.json",
-              *project.samples_dir.glob("*.json")]:
+    from .project import STATE_FILES  # noqa: PLC0415
+
+    for f in [project.root / n for n in STATE_FILES]:
         if f.is_file():
             dst = root / f.relative_to(project.root)
             dst.parent.mkdir(parents=True, exist_ok=True)

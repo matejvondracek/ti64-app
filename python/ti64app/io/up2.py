@@ -65,3 +65,29 @@ def read_patterns(path: str | Path, start: int, count: int, header: Up2Header | 
     mm = np.memmap(path, dtype="<u2", mode="r", offset=header.data_offset,
                    shape=(header.n_patterns, header.pattern_height, header.pattern_width))
     return np.array(mm[start:start + count])
+
+
+def row_length(header: Up2Header, row: int) -> int:
+    """Patterns in one scan row: hex grids alternate n_cols (even rows, 0-based) and n_cols - 1 (odd rows)."""
+    return header.n_cols - (1 if header.hex_grid and row % 2 else 0)
+
+
+def pattern_index(header: Up2Header, row: int, col: int) -> int:
+    """File index of the pattern at scan row / column (0-based)."""
+    if not (0 <= row < header.n_rows) or not (0 <= col < row_length(header, row)):
+        raise IndexError(f"row {row}, column {col} is outside the scan ({header.n_rows} rows)")
+    if header.hex_grid:
+        return (row // 2) * (2 * header.n_cols - 1) + (header.n_cols if row % 2 else 0) + col
+    return row * header.n_cols + col
+
+
+def pattern_position(header: Up2Header, row: int, col: int) -> tuple[float, float]:
+    """(x, y) in um of a scan point (hex grids: odd rows shifted by half a step)."""
+    x = (col + (0.5 if header.hex_grid and row % 2 else 0.0)) * header.x_step_um
+    return x, row * header.y_step_um
+
+
+def read_pattern(path: str | Path, row: int, col: int, header: Up2Header | None = None) -> np.ndarray:
+    """One pattern (uint16, height x width) at scan row / column; reads only its bytes."""
+    header = header or read_header(path)
+    return read_patterns(path, pattern_index(header, row, col), 1, header)[0]

@@ -102,6 +102,17 @@ PHASE_RGB = {1: (0.53, 0.81, 0.98), 2: (0.56, 0.74, 0.56)}    # MTEX default Lig
 BETA_GB_RGB = (0.0, 0.0, 0.0)                                 # prior-beta boundaries: black, 2x width (EBSD_part2)
 
 
+class OverlayStyle(BaseModel):
+    """Line style of one overlay class (viewer + exports): colour override and a width factor (1 = default)."""
+    color: str | None = None                  # "#rrggbb"; None = default colour (Burgers types keep their colours)
+    width: float = Field(1.0, gt=0, le=20)
+
+
+def _hex_rgb(c: str) -> tuple[float, float, float]:
+    c = c.lstrip("#")
+    return tuple(int(c[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
 # ---- grains -----------------------------------------------------------------------------------
 class GrainsCalcParams(BaseModel):
     map_id: str
@@ -200,13 +211,22 @@ def _ipf_vector(sheet, direction: str, custom) -> tuple[float, float, float]:
 
 
 def overlay_segments(ctx: OpContext, map_id: str, overlays: list[str], grains: str | None = None,
-                     recon: str | None = None, line_width: float = 1.0) -> dict:
+                     recon: str | None = None, line_width: float = 1.0, styles: dict | None = None) -> dict:
     """Boundary / crack overlays as vector data (same for figures, viewer and exports).
     hagb / lagb / interface / burgers: boundary table of a grains.calc step (newest of the map by default);
     beta_gb: prior-beta grain boundaries of a recon.run step (newest by default); crack: crack paths drawn as
-    annotations. Returns seg (x1 y1 x2 y2), rgb (m, 3), widths (m,), legend, per-class lengths and the
-    resolved step ids. Segments are in draw order (first = bottom)."""
+    annotations. styles: {class: OverlayStyle} colour / width factor per overlay class (GUI settings).
+    Returns seg (x1 y1 x2 y2), rgb (m, 3), widths (m,), legend, per-class lengths and the resolved step ids.
+    Segments are in draw order (first = bottom)."""
     from .annotations import load_annotations, rgb_of  # noqa: PLC0415
+
+    sty = {k: (v if isinstance(v, OverlayStyle) else OverlayStyle.model_validate(v)) for k, v in (styles or {}).items()}
+
+    def col(ov, default):
+        return _hex_rgb(sty[ov].color) if ov in sty and sty[ov].color else default
+
+    def wf(ov):
+        return sty[ov].width if ov in sty else 1.0
 
     parts: list[tuple[dict, np.ndarray, float]] = []          # (seg, rgb (m,3), width)
     legend: list = []
@@ -226,22 +246,28 @@ def overlay_segments(ctx: OpContext, map_id: str, overlays: list[str], grains: s
     # grain-boundary classes: segments in boundary-table order, a segment in several requested classes
     # takes the colour of the LAST one (as the phase-2 figure op, so recorded figures replay identically)
     gclasses = [o for o in overlays if o in ("hagb", "lagb", "interface", "burgers")]
+    per_class = len({wf(o) for o in gclasses}) > 1         # different widths: one part per class, in list order
     if gclasses:
         sel = np.zeros(len(gb["x1"]), bool)
         rgb = np.zeros((len(gb["x1"]), 3))
         for ov in gclasses:
             if ov == "burgers":
+                ms = np.zeros(len(gb["x1"]), bool)
                 for k, ang in enumerate(BURGERS_TYPES, start=1):
                     m = cls[f"burgers_{k}"]
-                    rgb[m], sel = BURGERS_RGB[k - 1], sel | m
+                    rgb[m], sel, ms = BURGERS_RGB[k - 1], sel | m, ms | m
                     legend.append((f"{ang:g}°", BURGERS_RGB[k - 1]))
                     lengths[f"{ang:g}°"] = float(gb["length_um"][m].sum())
             else:
-                m = cls[ov]
-                rgb[m], sel = GB_STYLE[ov][1], sel | m
-                legend.append(GB_STYLE[ov])
+                m = ms = cls[ov]
+                c = col(ov, GB_STYLE[ov][1])
+                rgb[m], sel = c, sel | m
+                legend.append((GB_STYLE[ov][0], c))
                 lengths[GB_STYLE[ov][0]] = float(gb["length_um"][m].sum())
-        parts.append(({k: gb[k][sel] for k in ("x1", "y1", "x2", "y2")}, rgb[sel], line_width))
+            if per_class:
+                parts.append(({k: gb[k][ms] for k in ("x1", "y1", "x2", "y2")}, rgb[ms], line_width * wf(ov)))
+        if not per_class:
+            parts.append(({k: gb[k][sel] for k in ("x1", "y1", "x2", "y2")}, rgb[sel], line_width * wf(gclasses[0])))
     for ov in overlays:
         if ov in gclasses:
             continue
@@ -251,9 +277,10 @@ def overlay_segments(ctx: OpContext, map_id: str, overlays: list[str], grains: s
             rz = step_npz(ctx, rid, "recon")
             b = {k[3:]: v for k, v in rz.items() if k.startswith("gb_")}
             m = (b["grain1"] > 0) & (b["grain2"] > 0)
-            parts.append(({k: b[k][m] for k in ("x1", "y1", "x2", "y2")}, np.tile(BETA_GB_RGB, (int(m.sum()), 1)),
-                          2 * line_width))
-            legend.append(("prior β GB", BETA_GB_RGB))
+            c = col("beta_gb", BETA_GB_RGB)
+            parts.append(({k: b[k][m] for k in ("x1", "y1", "x2", "y2")}, np.tile(c, (int(m.sum()), 1)),
+                          2 * line_width * wf("beta_gb")))
+            legend.append(("prior β GB", c))
             lengths["prior β GB"] = float(b["length_um"][m].sum())
             used["recon"] = rid
         elif ov == "crack":
@@ -263,8 +290,9 @@ def overlay_segments(ctx: OpContext, map_id: str, overlays: list[str], grains: s
                    "y1": np.concatenate([x[:-1, 1] for x in xs]) if xs else np.zeros(0),
                    "x2": np.concatenate([x[1:, 0] for x in xs]) if xs else np.zeros(0),
                    "y2": np.concatenate([x[1:, 1] for x in xs]) if xs else np.zeros(0)}
-            rgb = (np.concatenate([np.tile(rgb_of(a), (len(a.xy) - 1, 1)) for a in cr]) if cr else np.zeros((0, 3)))
-            parts.append((seg, rgb, 2 * line_width))
+            rgb = (np.concatenate([np.tile(col("crack", rgb_of(a)), (len(a.xy) - 1, 1)) for a in cr]) if cr
+                   else np.zeros((0, 3)))
+            parts.append((seg, rgb, 2 * line_width * wf("crack")))
             legend.append(("crack", rgb_of(cr[0]) if cr else (0.88, 0.0, 0.0)))
             lengths["crack"] = float(sum(np.hypot(*np.diff(x, axis=0).T).sum() for x in xs))
             used["crack_ids"] = ",".join(a.id for a in cr)

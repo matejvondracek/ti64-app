@@ -1,0 +1,1143 @@
+"""EBSD tab (docs/gui_mockups/02_ebsd.jpg). Left: scrollable accordion of edit sections (Load + cleanup, Maps and IPF
+key, Grains and boundaries, KAM / GND, Prior-beta reconstruction + sweep, Grain size, Annotations, OIM comparison,
+any operation), then History and Compare backends; Export and Compare to original at the bottom. Right: "Sample /
+file" with a dropdown, the tiled map viewer (zoom / pan, overlays, annotations) and a Results tab for figures and
+tables.
+
+Numbers are input boxes with increment arrows (no sliders), units in the labels, every option has a hover
+explanation (tips.py). Apply runs the step with a progress bar and adds one undoable recipe step. Values typed but
+not applied are kept as drafts in gui_state.json and restored on reopen ("not applied")."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+from nicegui import run as ng_run
+from nicegui import ui
+
+from .. import layers as lay
+from .. import service
+from ..annotations import ROI_TYPES, Annotation, load_annotations, roi_box
+from ..backends import backend_status
+from ..project import Project
+from ..settings import IpfKeySetting, load_settings, save_preferences
+from . import dialogs, tiles
+from .export_dialog import export_dialog
+from ..legends import default_item
+from .history_panel import compare_section, history_section, ops_section
+from .shell import check_interrupted, error, header
+from .state import GuiState, stable
+from .tips import tip
+from .viewer import TOOLS, MapViewer, shapes_of
+
+IPF_KEYS = ["ipfHKLKey", "ipfTSLKey", "ipfHSVKey", "ipfSpotKey"]
+DIRECTIONS = ["X", "Y", "Z", "build", "custom"]
+RECON_FIG_KINDS = ["parent_ipf", "alpha_parent_gb", "fit", "variant", "packet", "mis_map", "parent_key",
+                   "mis_hist", "fit_hist", "ecd_hist", "n_variants_hist"]
+DEFAULT_OV_COLOR = {"hagb": "#000000", "lagb": "#a6a6a6", "interface": "#d91a1a", "beta_gb": "#000000",
+                    "crack": "#e00000"}
+
+
+def key_url(pngs) -> str:
+    """The IPF key PNG(s) of a layer as one data URL (side by side), for the legend on the map."""
+    import base64  # noqa: PLC0415
+    import io  # noqa: PLC0415
+
+    from ..legends import key_image  # noqa: PLC0415
+
+    im = key_image(420, pngs)
+    if im is None:
+        return ""
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+GS_FIG_KINDS = ["alpha_ecd", "alpha_ecd_area", "lath_thickness", "lath_minor_axis", "colony_ecd", "colony_ecd_area",
+                "beta_ecd", "beta_width", "beta_length", "colony_map"]
+
+
+def map_options(p: Project, kinds=("ang",)) -> dict[str, str]:
+    """Files for the 'Sample / file' dropdown, grouped (sorted) by sample."""
+    files = [m for m in p.files() if m.kind in kinds]
+    files.sort(key=lambda m: (m.sample_id is None, m.sample_id or "", Path(m.file).name.lower()))
+    return {m.id: f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}" for m in files}
+
+
+class Section:
+    """One accordion section: registers its inputs, keeps unapplied values as drafts (gui_state.json)."""
+
+    def __init__(self, gs: GuiState, key: str, title: str, icon: str, opened: bool = False) -> None:
+        self.gs, self.key, self.title = gs, key, title
+        self.fields: dict[str, ui.element] = {}
+        self.defaults: dict = {}
+        self.exp = ui.expansion(group="ebsd", value=opened).classes("w-full ti-section").mark(f"sec_{key}")
+        with self.exp.add_slot("header"):
+            with ui.row().classes("w-full items-center no-wrap gap-3"):
+                ui.icon(icon, size="22px").classes("text-primary")
+                ui.label(title).classes("font-semibold grow")
+                self.chip = ui.label("● not applied").classes("ti-draft").tooltip(
+                    "Values were changed but not applied yet (kept when the app closes).")
+        self.drafts = dict(gs.get("drafts", key, default={}) or {})
+
+    def __enter__(self):
+        self.exp.__enter__()
+        return self
+
+    def __exit__(self, *a):
+        self.exp.__exit__(*a)
+        self._caption()
+
+    def _caption(self) -> None:
+        self.chip.set_visibility(bool(self.drafts))
+
+    def _reg(self, name: str, w, default):
+        self.fields[name] = w
+        self.defaults[name] = default
+        if name in self.drafts:
+            try:
+                w.value = self.drafts[name]
+            except Exception:  # noqa: BLE001
+                self.drafts.pop(name, None)
+
+        def changed(e, name=name):
+            v = e.value if hasattr(e, "value") else w.value
+            if v == self.defaults[name]:
+                self.drafts.pop(name, None)
+            else:
+                self.drafts[name] = v
+            self.gs.set("drafts", self.key, dict(self.drafts))
+            self._caption()
+        w.on_value_change(changed)
+        return w
+
+    def num(self, name: str, label: str, value, tipkey: str | None = None, step: float = 1.0, **kw):
+        w = ui.number(label, value=value, step=step, **kw).classes("w-full").tooltip(tip(tipkey or name)) \
+            .mark(f"{self.key}_{name}")
+        return self._reg(name, w, value)
+
+    def check(self, name: str, label: str, value: bool, tipkey: str | None = None):
+        w = ui.checkbox(label, value=value).tooltip(tip(tipkey or name)).mark(f"{self.key}_{name}")
+        return self._reg(name, w, value)
+
+    def select(self, name: str, options, value, label: str, tipkey: str | None = None, **kw):
+        w = ui.select(options, value=value, label=label, **kw).classes("w-full").tooltip(tip(tipkey or name)) \
+            .mark(f"{self.key}_{name}")
+        return self._reg(name, w, value)
+
+    def text(self, name: str, label: str, value: str, tipkey: str | None = None):
+        w = ui.input(label, value=value).classes("w-full").tooltip(tip(tipkey or name)).mark(f"{self.key}_{name}")
+        return self._reg(name, w, value)
+
+    def v(self, name: str):
+        return self.fields[name].value
+
+    def applied(self) -> None:
+        self.drafts.clear()
+        self.gs.pop("drafts", self.key)
+        self._caption()
+
+
+def ebsd_page() -> None:
+    p = header("EBSD")
+    if p is None:
+        ui.navigate.to("/")
+        return
+    gs = GuiState(p)
+    gs.set("tab", "/ebsd")
+    check_interrupted(p)
+    opts = map_options(p)
+    sel = gs.get("selected_file")
+    st: dict = {"map": sel if sel in opts else next(iter(opts), None), "layer": None, "view": None, "busy": False,
+                "mtab": "alpha", "ovsel": [], "legends": []}
+    viewer: dict = {"v": None}
+    ui.add_css("""
+      .ti64-pixelated img { image-rendering: pixelated; }
+      .ti64-label span { font: 600 13px sans-serif; white-space: nowrap; text-shadow: 0 0 3px #fff; }
+      .ti64-tip { font-size: 11px; padding: 0 4px; }
+      .ti64-scalebar { background: rgba(255,255,255,.85); padding: 3px 6px 2px; border-radius: 4px; }
+      .ti64-scalebar .bar { height: 5px; background: #000; }
+      .ti64-scalebar .lab { font: 11px sans-serif; text-align: center; }
+      .ti-ovgrid { display: grid; grid-auto-flow: column; grid-template-rows: repeat(4, auto); gap: 4px 18px;
+                   padding: 10px 12px; }
+    """)
+
+    # ---- page layout ------------------------------------------------------------------------------------------
+    with ui.row().classes("w-full no-wrap gap-0 items-stretch").style("height: calc(100vh - 56px)"):
+        left = ui.column().classes("h-full gap-0 shrink-0 bg-white border-r").style("width: 360px") \
+            .mark("ebsd_left")
+        right = ui.column().classes("h-full grow gap-0 min-w-0")
+    with left:
+        menu = ui.scroll_area().classes("w-full grow").mark("edit_menu")
+        busy_row = ui.row().classes("w-full items-center px-3 gap-2 no-wrap")
+        with busy_row:
+            prog = ui.linear_progress(show_value=False).props("indeterminate rounded color=primary") \
+                .classes("grow").mark("apply_progress")
+            busy_lab = ui.label().classes("text-xs ti-muted whitespace-nowrap")
+        busy_row.set_visibility(False)
+        with ui.row().classes("w-full p-3 gap-2 no-wrap border-t"):
+            ui.button("Export", icon="ios_share", on_click=lambda: do_export()).classes("grow").mark("export_btn")
+            cmp_btn = ui.button("Compare to original", icon="compare").props("outline").classes("grow") \
+                .mark("compare_original").tooltip("Hold the button (mouse or Space / Enter) to see the unedited loaded "
+                                                   "map in the same view; release to return.")
+    # hold-to-compare, client-side only (no server round trip). The release listeners go on the document in the capture
+    # phase: Quasar's button swallows keyup of Space / Enter, and the pointer may be released outside the button.
+    release = "() => window.ti64Viewer && getElement(window.ti64Viewer)?.showAlt(false)"
+    cmp_btn.on("pointerdown", js_handler="""(e) => {
+        const v = window.ti64Viewer && getElement(window.ti64Viewer); if (!v) return;
+        v.showAlt(true);
+        const up = () => { v.showAlt(false); document.removeEventListener('pointerup', up, true);
+                           document.removeEventListener('pointercancel', up, true); };
+        document.addEventListener('pointerup', up, true); document.addEventListener('pointercancel', up, true); }""")
+    cmp_btn.on("keydown", js_handler="""(e) => {
+        if ((e.key !== ' ' && e.key !== 'Enter') || e.repeat) return;
+        e.preventDefault();
+        const v = window.ti64Viewer && getElement(window.ti64Viewer); if (!v) return;
+        v.showAlt(true);
+        const up = (u) => { if (u.key === ' ' || u.key === 'Enter') { v.showAlt(false);
+                            document.removeEventListener('keyup', up, true); } };
+        document.addEventListener('keyup', up, true); }""")
+    cmp_btn.on("blur", js_handler=release)
+    cmp_btn.on("pointerleave", js_handler="(e) => { if (e.buttons === 0) (" + release + ")(); }")
+
+    with right:
+        with ui.row().classes("w-full items-center gap-2 px-3 py-1 bg-white border-b").style("flex-wrap: wrap"):
+            msel = ui.select(opts, value=st["map"], label="Sample / file").classes("w-64") \
+                .props("dense options-dense").mark("ebsd_file").tooltip("Switch to another map of the project "
+                                                                        "(grouped by sample)")
+            kind = ui.select({}, label="map").classes("w-40").props("dense").mark("viewer_kind").tooltip(tip("layer"))
+            ov_btn = ui.button("Overlays", icon="layers").props("outline dense no-caps no-wrap") \
+                .mark("viewer_overlays")
+            with ov_btn:
+                ov_tip = ui.tooltip("Boundaries and crack paths on the map, with their colour and line width.")
+                ov_menu = ui.menu().props("anchor='bottom left' self='top left'").mark("overlay_menu")
+            with ui.row().classes("gap-0 no-wrap items-center").mark("legend_toggles"):
+                lg_btns = {}
+                for k, ic, lab in (("scale_bar", "straighten", "scale bar"), ("colorbar", "gradient",
+                                                                                "colour bar / legend"),
+                                   ("ipf_key", "donut_large", "IPF colour key")):
+                    lg_btns[k] = ui.button(icon=ic, on_click=lambda k=k: toggle_legend(k)) \
+                        .props("dense flat round").mark(f"legend_btn_{k}") \
+                        .tooltip(f"Show / hide the {lab} on the map (drag it, resize it at its corner); exports show "
+                                 "it exactly there")
+            tool = ui.select(TOOLS, value="pan", label="tool").classes("w-32").props("dense").mark("viewer_tool")
+            ui.space()
+            hist_toggle = ui.button(icon="history", on_click=lambda: toggle_history()).props("flat round dense") \
+                .mark("history_toggle").tooltip("Show / hide the History panel (right of the map)")
+        mtabs = ui.tabs().classes("w-full bg-white border-b").props("dense align=left no-caps")
+        with mtabs:
+            t_alpha = ui.tab("alpha", label="α map", icon="map").mark("mtab_alpha")
+            t_beta = ui.tab("beta", label="prior β", icon="hub").mark("mtab_beta")
+            ui.tab("results", label="Results", icon="insights").mark("rtab_results")
+        with ui.row().classes("w-full grow no-wrap gap-0 items-stretch min-h-0"):
+            with ui.column().classes("grow gap-0 min-w-0 h-full") as map_col:
+                holder = ui.column().classes("w-full grow gap-0 min-h-0").mark("map_holder")
+                with ui.row().classes("w-full items-center no-wrap gap-3 px-3 bg-white border-t").style("height: 30px"):
+                    status = ui.label("").classes("text-xs ti-muted truncate grow min-w-0").mark("viewer_status")
+                    legend = ui.row().classes("items-center gap-2 no-wrap min-w-0 overflow-hidden shrink") \
+                        .style("max-width: 55%").mark("viewer_legend")
+            with ui.scroll_area().classes("grow h-full") as res_col:
+                results = ui.column().classes("w-full gap-3 p-3").mark("results_panel")
+                with results:
+                    ui.label("Figures and tables of Apply / Draw appear here.").classes("text-sm ti-muted")
+            res_col.set_visibility(False)
+            hist_col = ui.column().classes("h-full shrink-0 bg-white border-l gap-0").style("width: 290px") \
+                .mark("history_panel")
+            with hist_col:
+                with ui.row().classes("w-full items-center px-3 py-2 border-b no-wrap"):
+                    ui.icon("history", size="20px").classes("text-primary")
+                    hist_title = ui.label("History").classes("font-semibold grow")
+                hist_box = ui.column().classes("w-full grow gap-2 p-2 no-wrap min-w-0") \
+                    .style("overflow-y: auto; overflow-x: hidden")
+    hist_col.set_visibility(gs.get("history_open", default=True))
+
+    def toggle_history():
+        on = not hist_col.visible
+        hist_col.set_visibility(on)
+        gs.set("history_open", on)
+        if viewer["v"]:
+            viewer["v"].run_method("invalidate")
+
+    if st["map"] is None:
+        with holder:
+            with ui.column().classes("p-8 gap-3"):
+                ui.label("No EBSD map in this project yet.").classes("text-lg")
+                ui.label("Add an .ang file on the Files tab and enter its map sheet (input state, build direction).")
+                ui.button("Go to the Files tab", icon="folder", on_click=lambda: ui.navigate.to("/files"))
+        return
+
+    # ---- running steps -----------------------------------------------------------------------------------------
+    async def run_step(op: str, params: dict, label: str, backend: str | None = None, with_map: bool = True):
+        if st["busy"]:
+            ui.notify("Another step is still running.", type="warning")
+            return None
+        st["busy"] = True
+        busy_lab.text = f"{label} ({backend or p.info().backend})…"
+        busy_row.set_visibility(True)
+        try:
+            prm = {"map_id": st["map"], **params} if with_map else params
+            step = await ng_run.io_bound(service.run, p, op, prm, backend)
+            ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
+            if hooks.get("history"):
+                hooks["history"]()
+            return step
+        except Exception as e:  # noqa: BLE001
+            error(e, f"{label} failed")
+            return None
+        finally:
+            st["busy"] = False
+            busy_row.set_visibility(False)
+    run_step = stable(run_step)
+
+    def set_tab(t: str) -> None:
+        map_col.set_visibility(t != "results")
+        res_col.set_visibility(t == "results")
+        st["switching"] = True
+        mtabs.value = t
+        st["switching"] = False
+
+    def show_image(path: Path, title: str, focus: bool = True) -> None:
+        with results:
+            with ui.column().classes("ti-card p-3 w-full gap-1"):
+                ui.label(title).classes("font-semibold")
+                ui.image(str(path)).classes("w-full max-w-4xl").props("fit=contain")
+        if focus:
+            set_tab("results")
+
+    def show_block(fn, title: str, focus: bool = True) -> None:
+        with results:
+            with ui.column().classes("ti-card p-3 w-full gap-1"):
+                ui.label(title).classes("font-semibold")
+                fn()
+        if focus:
+            set_tab("results")
+
+    # ---- viewer helpers ----------------------------------------------------------------------------------------
+    ipf_w: dict = {}
+    vs: dict = {}
+
+    def layer_params(source: str | None = None, k: str | None = None) -> lay.LayerParams:
+        d: dict = {"kind": k or kind.value}
+        if d["kind"] in ("ipf", "parent_ipf") and ipf_w:
+            d["ipf_keys"] = {ph: IpfKeySetting(key=kk.value, direction=dd.value,
+                                               custom_vector=tuple(float(c.value or 0) for c in vs["cv"])
+                                               if dd.value == "custom" else None).model_dump(mode="json")
+                             for ph, (kk, dd) in ipf_w.items()}
+        if vs.get("cmin") is not None and vs["cmin"].value is not None and vs["cmax"].value is not None:
+            d["clim"] = (float(vs["cmin"].value), float(vs["cmax"].value))
+        if source:
+            d["source"] = source
+        return lay.LayerParams(**d)
+
+    def tabkey() -> str:
+        return st["mtab"] if st["mtab"] in ("alpha", "beta") else "alpha"
+
+    # overlay styles (colour / width factor per class), per project
+    def ov_style() -> dict:
+        return dict(gs.get("overlay_style") or {})
+
+    def refresh_overlay_menu(available: list[str]):
+        ov_menu.clear()
+        sty = ov_style()
+        with ov_menu:
+            ui.label("Overlays (tick to show; colour and line width per type)").classes("text-xs ti-muted px-3 pt-2")
+            with ui.element("div").classes("ti-ovgrid").mark("overlay_grid"):
+                for o in available:
+                    s_ = sty.get(o, {})
+                    with ui.row().classes("items-center no-wrap gap-1"):
+                        cb = ui.checkbox(lay.OVERLAY_LABELS[o], value=o in st["ovsel"]).props("dense") \
+                            .classes("min-w-[8.5rem]").mark(f"ov_{o}")
+                        cb.on_value_change(lambda e, o=o: toggle_overlay(o, e.value))
+                        if o != "burgers":
+                            ci = ui.color_input(value=s_.get("color") or DEFAULT_OV_COLOR.get(o, "#000000"),
+                                                preview=True).props("dense hide-bottom-space").classes("w-28") \
+                                .mark(f"ov_color_{o}").tooltip("Line colour")
+                            ci.on_value_change(lambda e, o=o: set_ov_style(o, color=e.value or None))
+                        wn = ui.number(value=s_.get("width", 1.0), min=0.25, max=10, step=0.25, format="%g") \
+                            .props("dense hide-bottom-space").classes("w-20").mark(f"ov_width_{o}") \
+                            .tooltip("Line width factor (1 = default; the map shows it in screen pixels, exports scale "
+                                     "it to their resolution)")
+                        wn.on_value_change(lambda e, o=o: set_ov_style(o, width=float(e.value or 1)))
+        ov_label()
+
+    def ov_label():
+        """'Overlays (2)' on the button (one line); the names in its tooltip."""
+        names = ", ".join(lay.OVERLAY_LABELS[o] for o in st["ovsel"])
+        ov_btn.text = f"Overlays ({len(st['ovsel'])})" if st["ovsel"] else "Overlays"
+        ov_tip.text = (f"Shown: {names}. " if names else "No overlay shown. ") +             "Boundaries and crack paths on the map, with their colour and line width."
+
+    async def toggle_overlay(o: str, on: bool):
+        cur = [x for x in st["ovsel"] if x != o] + ([o] if on else [])
+        st["ovsel"] = [x for x in lay.OVERLAYS if x in cur]
+        ov_label()
+        await show_overlays()
+
+    async def set_ov_style(o: str, **kw):
+        sty = ov_style()
+        cur = dict(sty.get(o, {}))
+        cur.update(kw)
+        sty[o] = cur
+        gs.set("overlay_style", sty)
+        if o in st["ovsel"]:
+            await show_overlays()
+
+    # legends on the map (WYSIWYG for exports)
+    def legend_items() -> list[dict]:
+        return list(st["legends"])
+
+    def save_legends():
+        gs.set("legends", st["map"], tabkey(), st["legends"])
+        for k, b in lg_btns.items():
+            b.props(f"color={'primary' if any(i['kind'] == k for i in st['legends']) else 'grey-7'}")
+
+    async def toggle_legend(k: str):
+        on = not any(i["kind"] == k for i in st["legends"])
+        if not on:
+            st["legends"] = [i for i in st["legends"] if i["kind"] != k]
+        else:
+            st["legends"] = st["legends"] + [default_item(k).model_dump()]
+        save_legends()
+        if viewer["v"]:
+            viewer["v"].set(legends=legend_items())
+            if on and k == "ipf_key" and st["layer"] is not None:     # the key is drawn by the backend on demand
+                viewer["v"].set(legend_data=await legend_data(st["layer"]))
+
+    def on_legends(e):
+        st["legends"] = [dict(i) for i in e.args.get("items", [])]
+        save_legends()
+        if viewer["v"]:
+            viewer["v"]._props["legends"] = legend_items()
+
+    async def legend_data(L: lay.Layer) -> dict:
+        info = L.info
+        d: dict = {"colorbar": None, "swatches": [], "key_url": ""}
+        if info.get("colorbar"):
+            d["colorbar"] = {"stops": info["colorbar"][:: max(1, len(info["colorbar"]) // 32)],
+                             "lo": (info.get("clim") or [None, None])[0], "hi": (info.get("clim") or [None, None])[1],
+                             "label": info.get("colorbar_label") or ""}
+        elif info.get("legend"):
+            d["swatches"] = [list(x) for x in info["legend"][:14]]
+        if kind.value in ("ipf", "parent_ipf") and any(i["kind"] == "ipf_key" for i in st["legends"]):
+            try:
+                pngs = await ng_run.io_bound(lay.key_pngs, p, st["map"], layer_params())
+                if pngs:
+                    d["key_url"] = key_url(pngs)
+            except Exception as e:  # noqa: BLE001
+                error(e, "Could not draw the IPF key")
+        return d
+
+    def refresh_annotations():
+        items = load_annotations(p, st["map"])
+        if viewer["v"]:
+            viewer["v"].set(shapes=shapes_of(items))
+        if "ann_list" in vs:
+            ann_list = vs["ann_list"]
+            ann_list.clear()
+            with ann_list:
+                if not items:
+                    ui.label("No annotations yet. Pick a drawing tool in the 'tool' list of the map toolbar.").classes("text-xs ti-muted")
+                for a in items:
+                    with ui.row().classes("items-center gap-1 no-wrap w-full"):
+                        ui.label(f"{a.type} {a.text}".strip()).classes("text-sm grow truncate")
+                        if a.type in ROI_TYPES:
+                            b = roi_box(a)
+                            ui.button(icon="zoom_in", on_click=lambda b=b: viewer["v"] and viewer["v"].run_method(
+                                "zoomTo", *b)).props("dense flat round size=sm").tooltip("Zoom to this ROI")
+                            ui.button(icon="content_cut", on_click=lambda a=a: crop_dialog(a)) \
+                                .props("dense flat round size=sm").tooltip("Crop the map to this ROI (new map)")
+                        ui.button(icon="delete", on_click=lambda a=a: delete_annotation(a.id)) \
+                            .props("dense flat round size=sm").tooltip("Delete").mark(f"del_{a.id}")
+
+    async def save_items(items: list[Annotation], label: str):
+        step = await run_step("annotations.set", {"items": [a.model_dump(mode="json") for a in items]}, label)
+        if step:
+            refresh_annotations()
+            if "crack" in st["ovsel"]:
+                await show_overlays()
+
+    async def delete_annotation(aid: str):
+        await save_items([a for a in load_annotations(p, st["map"]) if a.id != aid], "annotation deleted")
+
+    async def on_shape(e):
+        d = e.args
+        t, xy = d["type"], [tuple(q) for q in d["xy"]]
+        text = vs["ann_text"].value or "" if "ann_text" in vs else ""
+        if t == "text" and not text:
+            ui.notify("Enter the text first (Annotations section, field 'text / name').", type="warning")
+            return
+        if t in ROI_TYPES and not text:
+            text = f"ROI{1 + sum(a.type in ROI_TYPES for a in load_annotations(p, st['map']))}"
+        a = Annotation(map_id=st["map"], type=t, xy=xy, text=text,
+                       color=(vs["ann_color"].value or "") if "ann_color" in vs else "",
+                       width_pt=float((vs["ann_w"].value if "ann_w" in vs else 1.5) or 1.5))
+        await save_items(load_annotations(p, st["map"]) + [a], f"{t} added")
+
+    def crop_dialog(a: Annotation):
+        with ui.dialog() as dlg, ui.card().classes("w-[30rem] max-w-full"):
+            ui.label(f"Crop {st['map']} to ROI {a.text or a.id}").classes("text-lg font-semibold")
+            ui.label("Writes maps/<new id>.ang in the project (rows inside the ROI's bounding box) and links it to the "
+                     "same sample with this map's sheet.").classes("text-sm ti-muted")
+            nid = ui.input("New map ID", value=f"{st['map']}_{a.text or a.id}").classes("w-full")
+
+            async def go():
+                dlg.close()
+                step = await run_step("ebsd.crop", {"new_map_id": nid.value, "roi_id": a.id}, "crop")
+                if step:
+                    ui.notify(f"Map {nid.value}: {step.metrics.get('n_points')} points; pick it in the Sample / file "
+                              "list.", type="positive")
+                    msel.options = map_options(p)
+                    msel.update()
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                ui.button("Crop", icon="content_cut", on_click=go).mark("crop_go")
+        dlg.open()
+
+    def on_probe(e):
+        x, y = e.args["xy"][0]
+        L = st["layer"].layout
+        i = int(L.sample(np.array([x]), np.array([y]))[0])
+        if i < 0:
+            status.text = f"x {x:.2f} µm, y {y:.2f} µm: no measurement"
+            return
+        s_ = p.recipe().step(st["layer"].info["source"])
+        with np.load(p.root / s_.outputs["ebsd"].path, allow_pickle=False) as z:
+            ph = int(z["phase"][i])
+            q = z["quat"][i]
+            props = {k[5:]: float(z[k][i]) for k in z.files
+                     if k.startswith("prop_") and k[5:] in ("ci", "iq", "recon_fit", "parent_grain")}
+        c = st["layer"].colors[i]
+        names = {0: "not indexed", 1: "α", 2: "β"}
+        status.text = (f"x {x:.2f} µm, y {y:.2f} µm | point {i} | {names.get(ph, ph)} | "
+                       + " ".join(f"{k} {v:.3g}" for k, v in props.items())
+                       + f" | q ({', '.join(f'{v:.4f}' for v in q)}) | colour #{c[0]:02x}{c[1]:02x}{c[2]:02x}")
+
+    def on_measure(e):
+        (x0, y0), (x1, y1) = e.args["xy"]
+        d = float(np.hypot(x1 - x0, y1 - y0))
+        ang = float(np.degrees(np.arctan2(y1 - y0, x1 - x0)))
+        status.text = f"distance {d:.2f} µm, angle from +x toward +y {ang:.1f}°  ({x0:.1f}, {y0:.1f}) → ({x1:.1f}, {y1:.1f})"
+        ui.notify(f"{d:.2f} µm", type="info")
+
+    def on_view(e):
+        st["view"] = e.args
+        gs.set("view", st["map"], {k: e.args[k] for k in ("x0", "x1", "y0", "y1")})
+
+    def show_legend(L: lay.Layer):
+        legend.clear()
+        info = L.info
+        with legend:
+            if info.get("colorbar"):
+                stops = ", ".join(info["colorbar"][:: max(1, len(info["colorbar"]) // 32)])
+                lo, hi = info["clim"]
+                ui.label(f"{lo:.3g}").classes("text-xs")
+                ui.html(f'<div style="height:12px;width:160px;border-radius:3px;background:linear-gradient(to right,{stops})"></div>') \
+                    .mark("viewer_colorbar")
+                ui.label(f"{hi:.3g} {info.get('colorbar_label') or ''}").classes("text-xs")
+            for lab, col in (info.get("legend") or [])[:6]:
+                ui.html(f'<div style="width:12px;height:10px;background:{col};border:1px solid #999"></div>')
+                ui.label(lab).classes("text-xs")
+            if info.get("keys"):
+                ui.label(" · ".join(f"{ph.replace('Ti ', '')}: {k['key']} ∥ {k['direction']}"
+                                    for ph, k in info["keys"].items())).classes("text-xs ti-muted")
+            ui.label(f"coloured by {info.get('backend')}").classes("text-xs ti-muted")
+
+    async def show_overlays():
+        if st["layer"] is None or viewer["v"] is None:
+            return
+        ovs = []
+        lp = layer_params()
+        lw = float((vs["lw"].value if "lw" in vs else 1.0) or 1.0)
+        sty = ov_style()
+        for name in st["ovsel"]:
+            try:
+                O = await ng_run.io_bound(lay.get_overlay, p, st["map"], name, lp, None, sty.get(name))
+                ovs.append({"url": tiles.overlay_url(tiles.register_overlay(O, st["layer"].layout), lw), "opacity": 1})
+            except Exception as e:  # noqa: BLE001
+                error(e, f"overlay {name}")
+        viewer["v"].set(overlays=ovs)
+        gs.set("overlays", st["map"], tabkey(), list(st["ovsel"]))
+
+    async def prepare_original(L: lay.Layer):
+        """Layer of the unedited loaded map (same kind if possible) for Compare to original."""
+        load = service.latest_step(p, ("ebsd.load",), map_id=st["map"])
+        if load is None or viewer["v"] is None:
+            return
+        if L.info.get("source") == load.id:
+            viewer["v"].set(alt_layer_url=tiles.layer_url(tiles.register_layer(L)))
+            return
+        k = kind.value if kind.value in ("ipf", "phase", "ci", "iq", "fit") else "ipf"
+        try:
+            O = await ng_run.io_bound(lay.get_layer, p, st["map"], layer_params(source=load.id, k=k))
+            if viewer["v"] is not None:
+                viewer["v"].set(alt_layer_url=tiles.layer_url(tiles.register_layer(O)))
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def show():
+        if not kind.value:
+            return
+        try:
+            L = await ng_run.io_bound(lay.get_layer, p, st["map"], layer_params())
+        except Exception as e:  # noqa: BLE001
+            error(e, f"Could not colour the {kind.value} map")
+            return
+        if L is None:                                 # app shutting down (io_bound returns None)
+            return
+        st["layer"] = L
+        gs.set("layer", st["map"], tabkey(), kind.value)
+        ext = list(L.layout.extent)
+        if viewer["v"] is None or viewer["v"]._props["base"] != L.layout.cw:
+            holder.clear()
+            with holder:
+                v = MapViewer(L.layout.cw, ext).classes("w-full h-full").mark("map_viewer")
+                v._props["initial_view"] = gs.get("view", st["map"])
+                v.on("shape", on_shape)
+                v.on("probe", on_probe)
+                v.on("measure", on_measure)
+                v.on("view", on_view)
+                v.on("legends", on_legends)
+                v.on("compare", lambda e: status.set_text("showing the ORIGINAL loaded map (release to return)"
+                                                          if e.args.get("on") else ""))
+                v.on("shape_click", lambda e: status.set_text(f"annotation {e.args['id']}"))
+                viewer["v"] = v
+            ui.run_javascript(f"window.ti64Viewer = {v.id}")
+        viewer["v"].set(layer_url=tiles.layer_url(tiles.register_layer(L)), extent=ext,
+                        layer_opacity=float((vs["opacity"].value if "opacity" in vs else 1.0) or 1.0),
+                        tool=tool.value, legends=legend_items(), legend_data=await legend_data(L),
+                        hex_grid=bool(L.layout.hex), cell_um=float(L.layout.dx))
+        show_legend(L)
+        refresh_annotations()
+        await show_overlays()
+        status.text = (f"{st['map']}: {L.layout.lut.shape[0]} rows, {'hex' if L.layout.hex else 'square'} grid, "
+                       f"step {L.layout.dx:.3g} µm; {L.info.get('title', '')}")
+        await prepare_original(L)
+
+    def not_ready(text: str, button: str | None = None, action=None):
+        holder.clear()
+        viewer["v"] = None
+        with holder:
+            with ui.column().classes("p-8 gap-3"):
+                ui.label(text).classes("text-base").mark("viewer_placeholder")
+                if button:
+                    ui.button(button, on_click=action).mark("placeholder_btn")
+
+    async def select_map(m: str, draw: bool = True, tab: str | None = None):
+        st["map"] = m
+        gs.set("selected_file", m)
+        try:
+            p.sample(m)
+        except (KeyError, ValueError) as e:
+            not_ready(str(e).strip("'\""), "Go to the Files tab", lambda: ui.navigate.to("/files"))
+            kind.options = {}
+            kind.update()
+            refresh_overlay_menu([])
+            return
+        av = lay.available(p, m)
+        has_beta = "recon.run" in {s.op for s in p.recipe().steps if not s.stale and s.params.get("map_id") == m}
+        t_beta.set_visibility(has_beta)
+        t = tab or (mtabs.value if mtabs.value in ("alpha", "beta") else None) or gs.get("mtab", m) or "alpha"
+        if t == "beta" and not has_beta:
+            t = "alpha"
+        st["mtab"] = t
+        gs.set("mtab", m, t)
+        set_tab(t)
+        kinds = [k for k in av["layers"] if (k in lay.RECON_KINDS) == (t == "beta")]
+        kind.options = {k: lay.LAYER_LABELS[k] for k in kinds}
+        saved = gs.get("layer", m)
+        saved = saved.get(t) if isinstance(saved, dict) else (saved if t == "alpha" else None)
+        kind.set_value(saved if saved in kinds else ("parent_ipf" if t == "beta" and "parent_ipf" in kinds
+                                                      else (kinds[0] if kinds else None)))
+        kind.update()
+        ov_av = [o for o in av["overlays"] if t == "beta" or o != "beta_gb"]
+        saved_ov = gs.get("overlays", m)
+        # the prior-beta map shows NO boundaries until the user ticks them
+        saved_ov = saved_ov.get(t) if isinstance(saved_ov, dict) else (saved_ov if t == "alpha" else [])
+        st["ovsel"] = [o for o in (saved_ov or []) if o in ov_av]
+        refresh_overlay_menu(ov_av)
+        st["legends"] = [dict(i) for i in (gs.get("legends", m, t) or [default_item("scale_bar").model_dump()])]
+        save_legends()
+        hist_title.text = f"History · {'prior β map' if t == 'beta' else 'α map'}"
+        if hooks.get("history"):
+            hooks["history"]()
+        if not av["loaded"]:
+            not_ready(f"{m} is not loaded yet.", "Load map", lambda: load_section_apply())
+            return
+        if draw:
+            await show()
+
+    # ---- edit menu ---------------------------------------------------------------------------------------------
+    def lastp(op: str) -> dict:
+        s = service.latest_step(p, (op,), map_id=st["map"])
+        return s.params if s else {}
+
+    def g(d, *keys, default=None):
+        for k in keys:
+            if not isinstance(d, dict) or d.get(k) is None:
+                return default
+            d = d[k]
+        return d
+    # the edit menu starts from the values of the last applied step of this map (else the defaults)
+    lc = lastp("ebsd.cleanup").get("overrides") or {}
+    lg, lk = lastp("grains.calc"), lastp("map.compute")
+    lr, ls = lastp("recon.run").get("params") or {}, lastp("grainsize.run")
+    hooks: dict = {"history": None}
+
+    with menu:
+        with ui.column().classes("w-full gap-0"):
+            sheet_lab = ui.label().classes("text-xs ti-muted px-4 pt-2")
+
+            # 1 load + cleanup
+            with Section(gs, "cleanup", "Load and cleanup", "cleaning_services", opened=True) as sc:
+                ui.label("Cleanup preset follows the input state (raw: CI < 0.1 removed; OIM-cleaned: no CI filter); "
+                         "noise at 3°, indexed grains ≤ 2 px removed, voids ≤ 4 px filled.").classes("text-xs ti-muted")
+                sc.num("ci_threshold", "CI threshold (empty = preset)", g(lc, "ci_threshold"), step=0.05, min=0, max=1)
+                sc.num("noise_angle_deg", "noise angle [°]", g(lc, "noise_angle_deg", default=3.0), step=0.5, min=0)
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sc.num("noise_max_indexed_px", "max noise grain [px]", g(lc, "noise_max_indexed_px", default=2),
+                           step=1, min=0)
+                    sc.num("noise_max_void_px", "max void filled [px]", g(lc, "noise_max_void_px", default=4),
+                           step=1, min=0)
+                sc.check("fill", "fill removed points from neighbours", g(lc, "fill", default=True))
+                sc.check("spike_removal", "wild-spike removal", g(lc, "spike_removal", default=False))
+                sc.num("spike_angle_deg", "spike angle [°]", g(lc, "spike_angle_deg", default=5.0), step=0.5, min=0)
+                sc.check("hq_filter", "smoothing filter (halfQuadraticFilter)", g(lc, "hq_filter", default=False))
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sc.num("hq_alpha", "filter strength", g(lc, "hq_alpha", default=0.5), step=0.1, min=0)
+                    sc.num("hq_threshold_deg", "filter limit [°]", g(lc, "hq_threshold_deg", default=15.0), step=1,
+                           min=0)
+
+                async def load_section_apply():
+                    step = await run_step("ebsd.load", {}, "load map")
+                    if step:
+                        await select_map(st["map"])
+
+                async def apply_cleanup():
+                    if not lay.available(p, st["map"])["loaded"]:
+                        await load_section_apply()
+                    ov = {k: sc.v(k) for k in ("noise_angle_deg", "noise_max_indexed_px", "noise_max_void_px", "fill",
+                                               "spike_removal", "spike_angle_deg", "hq_filter", "hq_alpha",
+                                               "hq_threshold_deg")}
+                    for k in ("noise_max_indexed_px", "noise_max_void_px"):
+                        ov[k] = int(ov[k] or 0)
+                    if sc.v("ci_threshold") is not None:
+                        ov["ci_threshold"] = float(sc.v("ci_threshold"))
+                    step = await run_step("ebsd.cleanup", {"overrides": ov}, "cleanup")
+                    if step:
+                        sc.applied()
+                        await select_map(st["map"])
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Load map", icon="download", on_click=load_section_apply).props("outline") \
+                        .mark("run_load")
+                    ui.button("Apply", icon="check", on_click=apply_cleanup).mark("run_cleanup")
+
+            # 2 maps and IPF key
+            with Section(gs, "ipf", "Maps and IPF key", "palette") as si:
+                s = load_settings().figure
+                for ph in ("Ti (alpha)", "Ti (beta)"):
+                    k = s.ipf.get(ph) or IpfKeySetting()
+                    short = ph[4:-1]
+                    with ui.row().classes("w-full no-wrap gap-2 items-end"):
+                        ui.label({"alpha": "α", "beta": "β"}[short]).classes("w-4 pb-2")
+                        ipf_w[ph] = (si.select(f"key_{short}", IPF_KEYS, k.key, "IPF key", "ipf_key"),
+                                     si.select(f"dir_{short}", DIRECTIONS, k.direction, "reference direction", "ipf_dir"))
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    vs["cv"] = [si.num(f"cv_{c}", f"custom {c}", v, "ipf_dir", step=0.1)
+                                for c, v in zip("xyz", (s.ipf["Ti (alpha)"].custom_vector or (0.0, 0.0, 1.0)))]
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    vs["cmin"] = si.num("cmin", "colour min", None, "clim", step=0.1)
+                    vs["cmax"] = si.num("cmax", "colour max", None, "clim", step=0.1)
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    vs["opacity"] = si.num("opacity", "opacity (0-1)", 1.0, step=0.1, min=0, max=1)
+                    vs["lw"] = si.num("lw", "overlay line width [px]", 1.0, "line_width", step=0.5, min=0.5, max=6)
+                ui.label("Scale bar, colour bar and IPF key: the legend buttons in the map toolbar (next to 'Overlays') show them on the map; "
+                         "drag them into place, the export puts them exactly there.").classes("text-xs ti-muted")
+
+                async def apply_ipf():
+                    await show()
+                    fk = kind.value if kind.value in ("ipf", "phase", "ci", "iq", "fit", "kam", "grod", "gos", "gnd",
+                                                      "boundaries", "burgers") else None
+                    if fk:
+                        lp = layer_params()
+                        step = await run_step("figure", {"kind": fk, "overlays": list(st["ovsel"]),
+                                                         **({"ipf_keys": lp.ipf_keys} if lp.ipf_keys else {}),
+                                                         **({"clim": lp.clim} if lp.clim else {})}, f"figure {fk}")
+                        if step:
+                            show_image(p.root / step.outputs["figure"].path, f"{fk} figure ({step.backend})",
+                                       focus=False)
+                    si.applied()
+
+                def save_default():
+                    stt = load_settings()
+                    for ph, (kk, dd) in ipf_w.items():
+                        stt.figure.ipf[ph] = IpfKeySetting(
+                            key=kk.value, direction=dd.value,
+                            custom_vector=tuple(float(c.value or 0) for c in vs["cv"]) if dd.value == "custom" else None,
+                            key_in_figure=stt.figure.ipf.get(ph, IpfKeySetting()).key_in_figure)
+                    ui.notify(f"IPF keys saved as default ({save_preferences(stt)})", type="positive")
+
+                async def draw_key():
+                    ph = "Ti (beta)" if kind.value == "parent_ipf" else "Ti (alpha)"
+                    kk, dd = ipf_w[ph]
+                    prm = {"kind": "ipf_key", "phases": [ph], "key": kk.value, "direction": dd.value}
+                    if dd.value == "custom":
+                        prm["custom_vector"] = [float(c.value or 0) for c in vs["cv"]]
+                    step = await run_step("figure", prm, "IPF key")
+                    if step:
+                        show_image(p.root / step.outputs["figure"].path, f"IPF key {ph} ({step.backend})")
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Apply", icon="check", on_click=apply_ipf).mark("viewer_apply")
+                    ui.button("IPF key", icon="donut_large", on_click=draw_key).props("outline").mark("viewer_ipfkey")
+                    ui.button("Save as default", on_click=save_default).props("flat")
+
+            # 3 grains and boundaries
+            with Section(gs, "grains", "Grains and boundaries", "border_style") as sg:
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sg.num("hagb_deg", "HAGB [°]", g(lg, "grains", "hagb_deg", default=15.0), step=1, min=0)
+                    sg.num("lagb_deg", "LAGB [°]", g(lg, "grains", "lagb_deg", default=2.0), step=0.5, min=0)
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sg.num("alpha", "gap bridging α", g(lg, "grains", "alpha", default=3.1), step=0.1, min=0)
+                    sg.num("min_px", "min. grain [px]", g(lg, "grains", "min_px", default=1), "grain_min_px", step=1,
+                           min=1)
+                sg.num("burgers_tol_deg", "Burgers tolerance [°]", g(lg, "boundaries", "burgers_tol_deg", default=3.0),
+                       step=0.5, min=0)
+
+                async def apply_grains():
+                    step = await run_step("grains.calc", {
+                        "grains": {"hagb_deg": sg.v("hagb_deg"), "lagb_deg": sg.v("lagb_deg"), "alpha": sg.v("alpha"),
+                                   "min_px": int(sg.v("min_px") or 1)},
+                        "boundaries": {"burgers_tol_deg": sg.v("burgers_tol_deg")}}, "grains")
+                    if step:
+                        sg.applied()
+                        n = step.metrics.get("n_grains")
+                        await select_map(st["map"], tab="alpha")
+                        if "hagb" not in st["ovsel"]:
+                            await toggle_overlay("hagb", True)
+                            refresh_overlay_menu([o for o in lay.available(p, st["map"])["overlays"] if o != "beta_gb"])
+                        if n:
+                            status.text = f"{int(n)} grains"
+                ui.button("Apply", icon="check", on_click=apply_grains).mark("run_grains")
+
+            # 4 KAM / GND
+            with Section(gs, "kam", "KAM / GND", "blur_on") as sk:
+                sk.select("kind", {"kam": "KAM", "grod": "GROD", "gos": "GOS", "gnd": "GND"},
+                          g(lk, "kind", default="kam"), "map", "kam_kind")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sk.num("kam_order", "KAM order", g(lk, "kam_order", default=1), step=1, min=1, max=5)
+                    sk.num("kam_threshold_deg", "KAM cutoff [°]", g(lk, "kam_threshold_deg", default=5.0), step=0.5,
+                           min=0)
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sk.select("gnd_stencil", ["1hop", "oneSided", "full"], g(lk, "gnd_stencil", default="1hop"),
+                              "GND stencil")
+                    sk.num("poisson", "Poisson's ratio", g(lk, "poisson", default=0.34), step=0.01, min=0, max=0.5)
+
+                async def apply_kam():
+                    step = await run_step("map.compute", {"kind": sk.v("kind"), "kam_order": int(sk.v("kam_order") or 1),
+                                                          "kam_threshold_deg": sk.v("kam_threshold_deg"),
+                                                          "gnd_stencil": sk.v("gnd_stencil"),
+                                                          "poisson": sk.v("poisson")}, sk.v("kind").upper())
+                    if step:
+                        sk.applied()
+                        await select_map(st["map"], draw=False)
+                        if sk.v("kind") in kind.options:
+                            kind.set_value(sk.v("kind"))
+                        await show()
+                ui.button("Apply", icon="check", on_click=apply_kam).mark("run_map")
+
+            # 5 reconstruction
+            with Section(gs, "recon", "Prior-β reconstruction", "hub") as sr:
+                meth = g(lr, "method", default="variantGraph")
+                vg = meth == "variantGraph"
+                sr.select("method", ["variantGraph", "graph"], meth, "method")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sr.num("threshold", "threshold [°]", g(lr, "vgThreshold" if vg else "graphThreshold",
+                                                            default=5.0 if vg else 2.0), "vgThreshold", step=0.5, min=0)
+                    sr.num("tolerance", "tolerance [°]", g(lr, "vgTolerance" if vg else "graphTolerance", default=1.5),
+                           "vgTolerance", step=0.1, min=0)
+                sr.num("segAngle", "α grain angle [°]", g(lr, "segAngle", default=1.5), step=0.1, min=0)
+                sr.select("orMode", {"limit": "refined OR if ≤ limit, else Burgers", "burgers": "ideal Burgers",
+                                     "refined": "refined OR always"}, g(lr, "orMode", default="limit"),
+                          "orientation relationship")
+                sr.num("orMaxDev", "refined-OR limit [°]", g(lr, "orMaxDev", default=1.0), step=0.1, min=0)
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sr.select("mergeMode", ["single", "progressive"], g(lr, "mergeMode", default="single"), "merge")
+                    sr.num("mergeThreshold", "merge threshold [°]", g(lr, "mergeThreshold", default=3.0), step=0.5,
+                           min=0)
+                sr.num("inclusionMaxSize", "inclusions < [px]", g(lr, "inclusionMaxSize", default=5), step=1, min=0)
+
+                def rparams() -> dict:
+                    d = {"method": sr.v("method"), "segAngle": sr.v("segAngle"), "orMode": sr.v("orMode"),
+                         "orMaxDev": sr.v("orMaxDev"), "mergeMode": sr.v("mergeMode"),
+                         "mergeThreshold": sr.v("mergeThreshold"), "inclusionMaxSize": int(sr.v("inclusionMaxSize") or 0)}
+                    if sr.v("method") == "variantGraph":
+                        d.update(vgThreshold=sr.v("threshold"), vgTolerance=sr.v("tolerance"))
+                    else:
+                        d.update(graphThreshold=sr.v("threshold"), graphTolerance=sr.v("tolerance"))
+                    return d
+
+                async def apply_recon():
+                    step = await run_step("recon.run", {"params": rparams()}, "reconstruction")
+                    if step:
+                        sr.applied()
+                        # the summary goes to Results, but the prior-beta MAP gets the focus (its own map tab)
+                        show_block(lambda: recon_summary(p, step), f"Reconstruction {step.id} ({step.backend})",
+                                   focus=False)
+                        gs.set("layer", st["map"], "beta", "parent_ipf")
+                        await select_map(st["map"], draw=True, tab="beta")
+                        ui.notify("Prior-β map shown on the 'prior β' tab; the numbers are on the Results tab.",
+                                  type="info")
+                ui.button("Apply", icon="check", on_click=apply_recon).mark("run_recon")
+                ui.separator().classes("my-2")
+                ui.label("Figures").classes("text-sm font-semibold")
+                with ui.row().classes("w-full no-wrap gap-2 items-end"):
+                    rfk = sr.select("fig", RECON_FIG_KINDS, "parent_ipf", "figure", "recon_fig")
+
+                    async def recon_fig():
+                        step = await run_step("recon.figure", {"kind": rfk.value}, f"figure {rfk.value}")
+                        if step:
+                            show_image(p.root / step.outputs["figure"].path, f"{rfk.value} ({step.backend})")
+                    ui.button("Draw", icon="brush", on_click=recon_fig).props("outline").mark("run_recon_fig")
+                ui.label("Parameter sweep").classes("text-sm font-semibold mt-2")
+                sr.text("sweep_thr", "thresholds [°]", "5, 8", "sweep_thr")
+                sr.text("sweep_merge", "merge thresholds [°]", "0.5, 3, 6", "sweep_merge")
+
+                async def sweep():
+                    name = "vgThreshold" if sr.v("method") == "variantGraph" else "graphThreshold"
+                    step = await run_step("recon.sweep", {"base": {**rparams(), "sweep": []},
+                                                          "grid": {name: _floats(sr.v("sweep_thr")),
+                                                                   "mergeThreshold": _floats(sr.v("sweep_merge"))}},
+                                          "sweep")
+                    if step:
+                        show_block(lambda: sweep_table(p, step), f"Parameter sweep {step.id}")
+                ui.button("Run sweep", icon="tune", on_click=sweep).props("outline").mark("run_sweep")
+
+            # 6 grain size
+            with Section(gs, "grainsize", "Grain size", "straighten") as sz:
+                ui.label("Laths = grains at the boundary angle below; prior β uses the newest reconstruction.") \
+                    .classes("text-xs ti-muted")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sz.num("hagb", "lath boundary [°]", 15.0, "gs_hagb", step=1, min=0)
+                    sz.num("min_px", "min. grain [px]", g(ls, "min_px", default=5), "gs_min_px", step=1, min=1)
+                sz.check("exclude_edge", "exclude edge grains", g(ls, "exclude_edge", default=True))
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sz.num("lath_min_aspect", "lath aspect ≥", g(ls, "lath_min_aspect", default=2.0), step=0.5, min=1)
+                    sz.num("colony_tol", "colony tol. [°]", g(ls, "colony", "burgers_tol_deg", default=3.0), step=0.5,
+                           min=0)
+                sz.num("beta_line_spacing_um", "β line spacing [µm]", g(ls, "beta_line_spacing_um", default=1.0),
+                       step=0.5, min=0.1)
+
+                async def apply_gs():
+                    g = await run_step("grains.calc", {"grains": {"hagb_deg": sz.v("hagb")}}, "grains")
+                    if not g:
+                        return
+                    step = await run_step("grainsize.run", {
+                        "min_px": int(sz.v("min_px") or 1), "exclude_edge": sz.v("exclude_edge"),
+                        "lath_min_aspect": sz.v("lath_min_aspect"), "colony": {"burgers_tol_deg": sz.v("colony_tol")},
+                        "beta_line_spacing_um": sz.v("beta_line_spacing_um")}, "grain size")
+                    if step:
+                        sz.applied()
+                        show_block(lambda: grainsize_summary(p, step), f"Grain size {step.id} ({step.backend})")
+                ui.button("Apply", icon="check", on_click=apply_gs).mark("run_gs")
+                with ui.row().classes("w-full no-wrap gap-2 items-end mt-2"):
+                    gfk = sz.select("fig", GS_FIG_KINDS, "alpha_ecd", "figure", "gs_fig")
+
+                    async def gs_fig():
+                        s_ = service.latest_step(p, ("grainsize.run",), map_id=st["map"])
+                        step = await run_step("grainsize.figure", {"kind": gfk.value}, f"figure {gfk.value}",
+                                              s_.backend if s_ else None)
+                        if step:
+                            show_image(p.root / step.outputs["figure"].path, f"{gfk.value} ({step.backend})")
+                    ui.button("Draw", icon="brush", on_click=gs_fig).props("outline").mark("run_gs_fig")
+
+                async def gs_oim():
+                    f = await dialogs.open_files("OIM grain file", gs.get("last_folder") or "",
+                                                 [("Text", "*.txt;*.csv")], multiple=False)
+                    if not f:
+                        return
+                    s_ = service.latest_step(p, ("grainsize.run",), map_id=st["map"])
+                    step = await run_step("grainsize.compare_oim", {"file": f[0]}, "OIM grain-size comparison",
+                                          s_.backend if s_ else None)
+                    if step:
+                        show_image(p.root / step.outputs["comparison"].path, "Grain size vs OIM")
+                ui.button("Compare with an OIM grain file…", icon="fact_check", on_click=gs_oim).props("flat") \
+                    .tooltip(tip("gs_oim"))
+
+            # 7 annotations
+            with Section(gs, "annotations", "Annotations and ROIs", "edit"):
+                ui.label("Pick a drawing tool in the 'tool' list of the map toolbar. 2-point tools: click start and end; polylines / crack / "
+                         "ROI polygon: click points, double-click or Enter to finish; Esc cancels.") \
+                    .classes("text-xs ti-muted")
+                vs["ann_text"] = ui.input("text / name").classes("w-full").mark("ann_text")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    vs["ann_color"] = ui.color_input("colour", value="").classes("grow")
+                    vs["ann_w"] = ui.number("width [pt]", value=1.5, step=0.5, min=0.25).classes("w-28")
+                vs["ann_list"] = ui.column().classes("w-full gap-0").mark("ann_list")
+
+            # 8 OIM image comparison
+            with Section(gs, "oim", "Compare with an OIM image", "image_search"):
+                ck = ui.select({"ipf": "IPF map", "ci": "CI map"}, value="ipf", label="kind").classes("w-full")
+
+                async def oim():
+                    f = await dialogs.open_files("OIM screenshot / export", gs.get("last_folder") or "",
+                                                 [("Images", "*.png;*.jpg;*.tif;*.bmp")], multiple=False)
+                    if f:
+                        step = await run_step("compare.oim", {"image": f[0], "kind": ck.value}, "OIM comparison")
+                        if step:
+                            show_image(p.root / step.outputs["comparison"].path, "Comparison with OIM")
+                ui.button("Choose image and compare…", icon="compare", on_click=oim).props("outline")
+
+            # 9 any operation (advanced)
+            with ui.expansion("Any operation (advanced)", icon="build", group="ebsd").classes("w-full ti-section") \
+                    .mark("sec_ops"):
+                ops_section(p, lambda: st["map"], run_step, show_image)
+
+            # compare backends (History is the panel right of the map)
+            with ui.expansion("Compare backends", icon="compare_arrows", group="ebsd").classes("w-full ti-section") \
+                    .mark("sec_compare"):
+                compare_section(p, lambda: st["map"], show_block, run_step, backend_status())
+
+    def sheet_info():
+        try:
+            sh = p.sample(st["map"])
+            sheet_lab.text = (f"{sh.specimen_id}: {'OIM-cleaned' if sh.input_state == 'oim_cleaned' else 'raw'}, "
+                              f"BD {tuple(round(c, 3) for c in sh.build_direction.unit_vector)}")
+        except (KeyError, ValueError):
+            sheet_lab.text = "map sheet incomplete (Files tab)"
+
+    async def on_map_change(e):
+        await select_map(e.value)
+        sheet_info()
+    msel.on_value_change(on_map_change)
+    kind.on_value_change(lambda e: show() if e.value else None)
+    tool.on_value_change(lambda e: viewer["v"] and viewer["v"].set(tool=e.value))
+    vs["opacity"].on_value_change(lambda e: viewer["v"] and viewer["v"].set(layer_opacity=float(e.value or 1)))
+    vs["lw"].on_value_change(lambda e: show_overlays())
+
+    async def on_mtab(e):
+        if st.get("switching"):
+            return
+        if e.value == "results":
+            set_tab("results")
+        elif e.value != st["mtab"] or not map_col.visible:
+            await select_map(st["map"], tab=e.value)
+    mtabs.on_value_change(on_mtab)
+    with hist_box:
+        hooks["history"] = history_section(p, run_step, current_map=lambda: st["map"], current_tab=tabkey,
+                                           on_changed=lambda: select_map(st["map"]))
+
+    async def undo_key(e):
+        if e.action.keydown and e.modifiers.ctrl and e.key.name in ("z", "y"):
+            lab = service.undo(p) if e.key.name == "z" else service.redo(p)
+            ui.notify((("undone: " if e.key.name == "z" else "redone: ") + lab) if lab else "nothing to undo / redo",
+                      type="positive" if lab else "warning")
+            if lab:
+                ui.navigate.reload()
+    ui.keyboard(on_key=undo_key, ignore=["input", "select", "button", "textarea"])
+
+    async def do_export():
+        if st["layer"] is None:
+            ui.notify("Load the map first.", type="warning")
+            return
+        items = [a for a in load_annotations(p, st["map"]) if a.type in ROI_TYPES]
+        rois = {a.id: f"ROI {a.text or a.id}" for a in items}
+        L = st["layer"].layout
+        geometry = {"extent": list(L.extent), "step": [L.dx, L.dy], "hex": bool(L.hex),
+                    "roi_boxes": {a.id: roi_box(a) for a in items}}
+        sty = {k: v for k, v in ov_style().items() if k in st["ovsel"]}
+        await export_dialog(p, gs, kind="map", map_id=st["map"], layer=layer_params().model_dump(mode="json"),
+                            overlays=list(st["ovsel"]), view=st["view"], rois=rois, run_step=run_step,
+                            geometry=geometry, legends=legend_items(), overlay_style=sty)
+    do_export = stable(do_export)
+
+    sheet_info()
+    ui.timer(0.05, lambda: select_map(st["map"]), once=True)
+
+
+def _floats(text: str) -> list[float]:
+    return [float(t) for t in str(text).replace(";", ",").split(",") if t.strip()]
+
+
+def _table(rows: list[tuple[str, str]], marker: str):
+    ui.table(columns=[{"name": "k", "label": "", "field": "k", "align": "left"},
+                      {"name": "v", "label": "", "field": "v", "align": "left"}],
+             rows=[{"k": k, "v": str(v)} for k, v in rows]).props("dense flat wrap-cells").classes("w-full").mark(marker)
+
+
+def recon_summary(p: Project, step) -> None:
+    s = json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8"))
+    dev = s.get("or_dev_deg")
+    or_txt = (f"{s['or_used']} (refined OR deviates {dev:.2f}° from Burgers; {s['or_rule']})"
+              if dev is not None else f"{s['or_used']} ({s['or_rule']})")
+    rows = [("backend", s["backend"]), ("OR", or_txt),
+            ("prior β grains ≥ ECD min (all fragments)", f"{s['n_grains_min_ecd']} ({s['n_grains_all']})"),
+            ("reconstructed α area", f"{100 * s['rec_frac']:.1f} %"),
+            ("mean fit / fit > bad", f"{s['mean_fit_deg']:.2f}° / {100 * s['bad_fit_frac']:.1f} %"),
+            ("fit quantiles 10/25/50/75/90 %", ", ".join(f"{v:.2f}" for v in s["fit_quantiles"])),
+            ("area-weighted ECD", f"{s['ecd_aw_um']:.1f} µm"),
+            ("bridged steps / split noise", f"{s['bridged_pct']:.1f} % / {s['split_pct']:.1f} %")]
+    gs_ = s["grain_shape"]
+    if gs_.get("aspect_along_across"):
+        rows.append(("caliper along / across BD (area-w., edge grains excluded)",
+                     f"{gs_['along_bd_um']['area_weighted_mean']:.1f} / {gs_['across_bd_um']['area_weighted_mean']:.1f} µm, "
+                     f"aspect {gs_['aspect_along_across']['area_weighted_mean']:.2f} (n = {gs_['n_used']})"))
+    rows += [("warning", w) for w in gs_.get("warnings", [])]
+    _table(rows, "recon_summary")
+    cols = ["config"] + s["sweep_columns"]
+    ui.label("merge sweep").classes("font-semibold mt-2")
+    ui.table(columns=[{"name": c, "label": c, "field": c} for c in cols],
+             rows=[{"config": f"{m} {t:g}°", **{c: (f"{v:.1f}" if isinstance(v, float) else v)
+                                                for c, v in zip(cols[1:], r)}}
+                   for (m, t), r in zip(s["sweep_configs"], s["sweep"])]).props("dense flat")
+
+
+def sweep_table(p: Project, step) -> None:
+    t = json.loads((p.root / step.outputs["table"].path).read_text(encoding="utf-8"))
+    cols = ["run", "params", "grains", "all", "recFrac %", "fit p50", "fit p90", "ECDaw", "bridged %", "split %"]
+    ui.table(columns=[{"name": c, "label": c, "field": c} for c in cols], rows=[{
+        "run": r["run"], "params": ", ".join(f"{k} {v}" for k, v in r["params"].items()),
+        "grains": r["n_grains_min_ecd"], "all": r["n_grains_all"], "recFrac %": f"{100 * r['rec_frac']:.1f}",
+        "fit p50": f"{r['fit_quantiles'][2]:.2f}", "fit p90": f"{r['fit_quantiles'][4]:.2f}",
+        "ECDaw": f"{r['ecd_aw_um']:.1f}", "bridged %": f"{r['bridged_pct']:.1f}", "split %": f"{r['split_pct']:.1f}"}
+        for r in t["runs"]]).props("dense flat").mark("sweep_table")
+    with ui.grid(columns=3).classes("w-full"):
+        for k in sorted(o for o in step.outputs if o.startswith("thumb_")):
+            ui.image(str(p.root / step.outputs[k].path))
+
+
+def _fmt(v, nd=2) -> str:
+    return "–" if v is None else (f"{v:.{nd}f}" if isinstance(v, float) else str(v))
+
+
+def grainsize_summary(p: Project, step) -> None:
+    s = json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8"))
+
+    def stat(d, aw=True):
+        if not d:
+            return "–"
+        t = f"mean {_fmt(d['mean'])}, median {_fmt(d['median'])} µm (n = {d['n']})"
+        if aw and d.get("area_weighted"):
+            t += f"; area-weighted {_fmt(d['area_weighted']['mean'])} µm"
+        ln = d.get("lognormal") or {}
+        if ln.get("sigma"):
+            t += f"; log-normal median {_fmt(ln['median'])}, σ {_fmt(ln['sigma'])}"
+        return t
+    a, c, b, rb = s["alpha"], s["colony"], s.get("prior_beta"), s["retained_beta"]
+    rows = [("backend / rules", f"{s['backend']}; {s['rules']}"),
+            ("lath partition", f"grains.calc {s['grains']}: HAGB {s['lath_partition']['hagb_deg']:g}°"),
+            ("alpha grain ECD", stat(a["ecd"])),
+            ("lath thickness, intercept ⊥ long axis", stat(a["thickness_intercept"], False)),
+            ("lath thickness, minor axis 2b", stat(a["thickness_minor_axis"], False)),
+            ("colony ECD", stat(c["ecd"]) + f" ({c['n_alpha_grains_merged']} alpha grains merged)")]
+    if b:
+        rows.append(("prior-β ECD", stat(b["ecd"])))
+        for k, lab in (("across_bd", "prior-β width (across BD)"), ("along_bd", "prior-β length (along BD)")):
+            if k in b:
+                rows.append((lab, f"E112 mean intercept {_fmt(b[k]['mean_e112_um'], 1)} µm "
+                                  f"({b[k]['n_complete']} complete + {b[k]['n_truncated']} edge chords)"))
+    rows.append(("retained β (indexed fraction)", f"loaded {100 * rb['loaded']['fraction']:.3f} %, "
+                                                  f"analysed map {100 * rb['source_map']['fraction']:.3f} %"))
+    rows += [("warning", w) for w in s["warnings"]]
+    _table(rows, "gs_summary")
+    for k, r in step.outputs.items():
+        if r.kind in ("csv", "xlsx"):
+            ui.label(f"{k}: {p.root / r.path}").classes("text-xs ti-muted break-all")

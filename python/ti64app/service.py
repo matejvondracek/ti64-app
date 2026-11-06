@@ -107,7 +107,7 @@ def _sample_set(ctx: OpContext) -> None:
     if not f.is_file():
         raise FileNotFoundError(f"map file not found: {f}")
     ctx.add_input(f)
-    write_json(ctx.project.samples_dir / f"{sheet.map_id}.json", sheet.model_dump(mode="json"))
+    ctx.project.set_sheet(sheet)             # sample (specimen) + linked file with its map sheet (phase 6.6)
     ctx.output("sample", "json", sheet.model_dump(mode="json"))
 
 
@@ -256,13 +256,18 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
     spec = OPS[op_name]
     params = params.model_dump(mode="json") if isinstance(params, BaseModel) else dict(params)
     params = spec.params.model_validate(params).model_dump(mode="json")
+    if record and step_id is None and op_name != "sample.set" and params.get("map_id"):
+        record_sheet(project, params["map_id"])
     be = _backend(project, spec, backend)
     step = RecipeStep(op=op_name, params=params, backend=be.name if be else None,
                       versions=be.versions() if be else {"app": __version__})
     if step_id:
         step.id = step_id
-    ctx = OpContext(project, step, params, be, project.outputs_dir / step.id)
+    step.sample_id = step_sample(project, op_name, params)
+    ctx = OpContext(project, step, params, be, project.step_dir(step.id, step.sample_id))
     before = history.snapshot(project) if record else None     # undo point (state files only)
+    if record:
+        _mark_running(project, step)
     t0 = time.perf_counter()
     try:
         spec.func(ctx)
@@ -272,17 +277,70 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
         shutil.rmtree(ctx.out_dir, ignore_errors=True)
         if before:
             history.discard(project, before)
+        if record:
+            project.clear_interrupted()
         raise
     step.metrics = {**ctx.metrics, "seconds": round(time.perf_counter() - t0, 2), **_memory_GB()}
     if record:
+        project.clear_interrupted()
+        for i in step.inputs:                    # size + mtime of linked files when used ("changed" warning)
+            if not isinstance(i, str):
+                project.touch_file(i.path)
         r = project.recipe()
-        if op_name == "sample.set":      # a changed sample sheet makes everything on that map stale
+        if op_name == "sample.set":      # a changed sheet makes everything on that map stale (not: notes, names)
             mid = params["map_id"]
-            r.mark_stale(lambda s: s.params.get("map_id") == mid)
+            prev = [s for s in r.steps if s.op == "sample.set" and s.params.get("map_id") == mid and not s.stale]
+            if not prev or any(prev[-1].params.get(k) != params.get(k) for k in SHEET_RESULT_KEYS):
+                r.mark_stale(lambda s: s.params.get("map_id") == mid)
+            else:
+                r.mark_stale(lambda s: s.op == "sample.set" and s.params.get("map_id") == mid)
         r.add(step)
         project.save_recipe(r)
         history.commit(project, f"{op_name} {step.params.get('map_id', '')} ({step.id})".replace("  ", " "), before)
     return step
+
+
+SHEET_RESULT_KEYS = ("map_file", "input_state", "build_direction", "bending", "position")
+
+
+def record_sheet(project: Project, map_id: str) -> RecipeStep | None:
+    """Sheets are edited on the Files tab (autosaved project state, phase 6.6). Before a recorded op uses a map, its
+    current effective sheet is recorded as a sample.set step if it differs from the last recorded one, so the recipe
+    alone replays the project (a new project gets the same sheets)."""
+    try:
+        sheet = project.sample(map_id).model_dump(mode="json")
+    except (KeyError, ValueError):
+        return None                               # the op itself reports what is missing
+    last = latest_step(project, ("sample.set",), map_id=map_id)
+    if last is not None and {k: last.params.get(k) for k in sheet} == sheet:
+        return None
+    return run(project, "sample.set", sheet)
+
+
+def step_sample(project: Project, op_name: str, params: dict) -> str | None:
+    """Sample (specimen) ID a step belongs to: explicit sample_id, the sample of its map, or the sheet's specimen."""
+    if params.get("sample_id"):
+        return params["sample_id"]
+    if op_name == "sample.set":
+        return params.get("specimen_id")
+    if op_name == "compare.backends":
+        return project.sample_of((params.get("params") or {}).get("map_id"))
+    if op_name == "sem.export" and params.get("stitch"):          # the sample of the exported mosaic
+        try:
+            return project.recipe().step(params["stitch"]).sample_id
+        except KeyError:
+            return None
+    return project.sample_of(params.get("map_id"))
+
+
+def _mark_running(project: Project, step: RecipeStep) -> None:
+    """running.json: if the app closes during the step, the next open reports it as interrupted (offer rerun)."""
+    import os  # noqa: PLC0415
+
+    write_json(project.root / "running.json",
+               {"op": step.op, "params": step.params, "step_id": step.id, "sample_id": step.sample_id,
+                "backend": step.backend, "pid": os.getpid(), "pid_started": psutil.Process().create_time(),
+                "started": datetime.now().isoformat(timespec="seconds")})
 
 
 def switch_backend(project: Project, backend: str) -> int:

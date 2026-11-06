@@ -270,6 +270,31 @@ class MatlabBackend:
         return (np.asarray(d["rgba"]).astype(np.uint8).reshape(-1, 4),
                 {"clim": (lo, hi), "cmap": spec.cmap, "colorbar": np.asarray(d["lut"]).astype(np.uint8).reshape(-1, 4)})
 
+    def cell_image(self, x, y, colors, grid, background):
+        """Regular hexagonal cells drawn by MATLAB (+ti64/hexImage.m -> hexRasterize.m)."""
+        import h5py  # noqa: PLC0415
+
+        fd, tin = tempfile.mkstemp(suffix=".h5", prefix="ti64_hx_")
+        os.close(fd)
+        fd, tout = tempfile.mkstemp(suffix=".h5", prefix="ti64_hy_")
+        os.close(fd)
+        os.remove(tout)
+        try:
+            with h5py.File(tin, "w") as f:
+                f["x"] = np.asarray(x, float).ravel()
+                f["y"] = np.asarray(y, float).ravel()
+                f["rgba"] = np.asarray(colors, np.uint8).reshape(-1, 4)
+                f["grid"] = np.array([grid.x0, grid.y0, grid.px, grid.py, grid.W, grid.H], float)
+                f["bg"] = np.asarray(background, np.uint8).ravel()
+            self.call("ti64.hexImage", tin, tout, nargout=0)
+            with h5py.File(tout, "r") as f:
+                img = f["img"][()]                       # MATLAB H x W x 4 (column-major) -> 4 x W x H here
+        finally:
+            for t in (tin, tout):
+                if os.path.exists(t):
+                    os.remove(t)
+        return np.ascontiguousarray(np.transpose(img, (2, 1, 0))).astype(np.uint8)
+
     def render_key(self, handle, phase: str, key: str, vec, out_png, dpi: int = 300):
         out_png = Path(out_png)
         out_png.parent.mkdir(parents=True, exist_ok=True)

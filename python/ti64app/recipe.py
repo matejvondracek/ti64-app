@@ -10,6 +10,7 @@ Replay (ti64app.service.replay) uses the recorded backend unless the user overri
 from __future__ import annotations
 
 import json
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,6 +42,7 @@ class RecipeStep(BaseModel):
     outputs: dict[str, OutputRef] = Field(default_factory=dict)
     timestamp: str = Field(default_factory=_now)
     backend: str | None = None       # None for backend-independent steps (sample sheet, up2 header, BSE)
+    sample_id: str | None = None     # sample (specimen) the step belongs to (phase 6.6)
     versions: dict[str, str] = Field(default_factory=dict)
     metrics: dict[str, float] = Field(default_factory=dict)
     stale: bool = False
@@ -68,6 +70,10 @@ class Recipe(BaseModel):
         return n
 
     def save(self, path: Path) -> None:
+        """Atomic write; a project's previous recipe.json is kept in .history/recipe/ (last KEEP_VERSIONS)."""
+        path = Path(path)
+        if path.name == "recipe.json" and path.is_file() and (path.parent / "project.json").is_file():
+            _keep_version(path)
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.model_dump(), indent=1, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
@@ -75,3 +81,20 @@ class Recipe(BaseModel):
     @classmethod
     def load(cls, path: Path) -> "Recipe":
         return cls.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+KEEP_VERSIONS = 20
+
+
+def _keep_version(path: Path) -> None:
+    d = path.parent / ".history" / "recipe"
+    d.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+    shutil.copy2(path, d / f"recipe_{stamp}.json")
+    for old in sorted(d.glob("recipe_*.json"))[:-KEEP_VERSIONS]:
+        old.unlink(missing_ok=True)
+
+
+def recipe_versions(project_root: Path) -> list[Path]:
+    """Saved versions of a project's recipe.json, newest first (for recovery)."""
+    return sorted((Path(project_root) / ".history" / "recipe").glob("recipe_*.json"), reverse=True)

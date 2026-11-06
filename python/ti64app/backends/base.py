@@ -287,6 +287,13 @@ class AnalysisBackend(Protocol):
     def render_chart(self, spec: "ChartSpec", out_png: Path) -> Path: ...
 
     # map viewer + pixel-exact export (phase 5)
+    def cell_image(self, x: np.ndarray, y: np.ndarray, colors: np.ndarray, grid, background) -> np.ndarray:
+        """(H, W, 4) uint8 image of a HEXAGONAL-grid map with every measurement (centres x, y in um, file order;
+        RGBA colours (n, 4) uint8, alpha 0 = background) drawn as its regular hexagonal cell into `grid`
+        (raster.PixelGrid, square pixels). Exports with >= 4 pixels per measurement (decisions D20): pymtex with
+        the Python hexagon rasteriser (raster.hexagon_image), MATLAB with matlab/+ti64/hexRasterize.m."""
+        ...
+
     def measurement_colors(self, spec: RenderSpec) -> tuple[np.ndarray, dict]:
         """(n, 4) uint8 RGBA colour of every measurement (file order) as this backend draws `spec`:
         spec.rgb as given, or spec.values through the backend's colour map `spec.cmap` (MATLAB colormaps

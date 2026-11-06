@@ -1,16 +1,19 @@
 """Undo / redo of project actions (GUI and MCP).
 
 Every recorded action (service.run with record=True, a backend switch) is bracketed by snapshots of the
-project's small STATE files: project.json, recipe.json, samples/*.json, annotations.json. Undo restores the
+project's small STATE files: project.json, recipe.json, samples.json, files.json, annotations.json. Undo restores the
 state before the last action, redo the state after it. Step outputs (outputs/<step>/, maps/*.ang) are not
 copied: they stay on disk while an undone step can still be redone, and are deleted when a new action
-discards the redo stack. The stack lives in cache/history/ (at most MAX_UNDO actions).
+discards the redo stack. The stack lives in .history/undo/ (at most MAX_UNDO actions) and survives closing the
+app and "Clear cache".
 """
 from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .project import Project
@@ -19,17 +22,39 @@ MAX_UNDO = 50
 
 
 def _dir(project: Project) -> Path:
-    return project.cache_dir / "history"
+    return project.history_dir / "undo"
 
 
 def _state_files(project: Project) -> list[Path]:
-    files = [project.info_path, project.recipe_path, project.root / "annotations.json"]
-    files += sorted(project.samples_dir.glob("*.json"))
-    return [f for f in files if f.is_file()]
+    from .project import STATE_FILES  # noqa: PLC0415
+
+    return [project.root / f for f in STATE_FILES if (project.root / f).is_file()]
+
+
+_GROUP = threading.local()
+
+
+@contextmanager
+def group(project: Project, label: str):
+    """Several recorded actions as ONE undo entry (e.g. a reorder that re-runs steps): inner snapshots / commits are
+    skipped; the entry is committed at the end, also when an inner action fails (the state may have changed)."""
+    before = snapshot(project)
+    _GROUP.depth = getattr(_GROUP, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _GROUP.depth -= 1
+        commit(project, label, before)
+
+
+def _grouped() -> bool:
+    return getattr(_GROUP, "depth", 0) > 0
 
 
 def snapshot(project: Project) -> str:
-    """Copy the state files; returns the snapshot id."""
+    """Copy the state files; returns the snapshot id ("" inside a group)."""
+    if _grouped():
+        return ""
     sid = uuid.uuid4().hex[:10]
     d = _dir(project) / sid
     d.mkdir(parents=True)
@@ -42,6 +67,10 @@ def snapshot(project: Project) -> str:
 
 def _restore(project: Project, sid: str) -> None:
     d = _dir(project) / sid
+    if project.recipe_path.is_file():
+        from .recipe import _keep_version  # noqa: PLC0415
+
+        _keep_version(project.recipe_path)
     for f in _state_files(project):                       # files that did not exist in the snapshot go
         if not (d / f.relative_to(project.root)).is_file():
             f.unlink()
@@ -58,9 +87,9 @@ def _load(project: Project) -> dict:
 
 
 def _save(project: Project, st: dict) -> None:
-    f = _dir(project) / "stack.json"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(json.dumps(st, indent=1), encoding="utf-8")
+    from .project import write_json  # noqa: PLC0415
+
+    write_json(_dir(project) / "stack.json", st)
 
 
 def _step_ids(project: Project, sid: str) -> set[str]:
@@ -79,7 +108,9 @@ def _drop(project: Project, entries: list[dict]) -> None:
     for e in entries:
         for sid in (e["before"], e["after"]):
             for step in _step_ids(project, sid) - current - keep:
-                shutil.rmtree(project.outputs_dir / step, ignore_errors=True)
+                d = project.find_step_dir(step)
+                if d is not None:
+                    shutil.rmtree(d, ignore_errors=True)
     for e in entries:
         for sid in (e["before"], e["after"]):
             if not any(sid in (u["before"], u["after"]) for u in _load(project)["undo"]):
@@ -88,6 +119,8 @@ def _drop(project: Project, entries: list[dict]) -> None:
 
 def commit(project: Project, label: str, before: str) -> None:
     """Record an action whose state before was `before` (a snapshot id); clears the redo stack."""
+    if _grouped() or not before:
+        return
     after = snapshot(project)
     st = _load(project)
     redo, st["redo"] = st["redo"], []
@@ -103,7 +136,8 @@ def commit(project: Project, label: str, before: str) -> None:
 
 
 def discard(project: Project, before: str) -> None:
-    shutil.rmtree(_dir(project) / before, ignore_errors=True)
+    if before:
+        shutil.rmtree(_dir(project) / before, ignore_errors=True)
 
 
 def undo(project: Project) -> str | None:

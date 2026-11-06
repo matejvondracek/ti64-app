@@ -22,17 +22,21 @@ dependencies = [
   "orix>=0.15",
   "tifffile>=2026.10",
   "pillow>=13.0",
+  "pypdf>=7.0",                      # legends on PDF exports
 ]
 
 [project.optional-dependencies]
 matlab = ["matlabengine==25.2.*"]          # MATLAB R2025b + MTEX 7.2
 patterns = ["pyebsdindex>=0.3.10", "kikuchipy>=0.13"]
-gui = ["nicegui>=3.18"]
+gui = ["nicegui>=3.18", "pywebview>=6.2"]          # desktop window (Edge WebView2 on Windows)
 mcp = ["mcp>=2.3"]
 dev = ["pytest>=9.2", "anyio>=4.15", "httpx>=0.28", "playwright>=1.64"]
 
 [project.scripts]
 ti64 = "ti64app.cli:main"
+
+[project.gui-scripts]
+ti64-gui = "ti64app.gui.desktop:main"      # Scripts	i64-gui.exe: no console, no conda activate needed
 
 [tool.setuptools.packages.find]
 where = ["python"]

@@ -104,5 +104,12 @@ def save_preferences(settings: Settings, paths: dict[str, str] | None = None) ->
     old = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
     d = settings.model_dump(mode="json", include={"backend", "figure"})
     d["paths"] = old.get("paths", {}) if paths is None else {k: v for k, v in paths.items() if k in Paths.model_fields}
-    p.write_text(json.dumps(d, indent=1), encoding="utf-8")
+    tmp = p.with_name(f".{p.name}.tmp")                 # atomic: temp file + rename
+    tmp.write_text(json.dumps(d, indent=1), encoding="utf-8")
+    tmp.replace(p)
     return p
+
+
+def logs_dir() -> Path:
+    """GUI log files (the desktop app has no console): %APPDATA%/ti64app/logs (next to the preferences)."""
+    return preferences_path().parent / "logs"

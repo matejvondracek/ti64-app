@@ -1,4 +1,4 @@
-"""Command-line interface: ti64 backends | gui | mcp | run <recipe.json> | replay <project> | ops | stitch <folder>."""
+"""Command-line interface: ti64 backends | gui [--browser] | mcp | run <recipe.json> | replay <project> | ops | stitch <folder>."""
 from __future__ import annotations
 
 import argparse
@@ -78,7 +78,7 @@ def cmd_stitch(a) -> int:
     params = {"folder": str(Path(folder).absolute()) if folder else None,
               "files": [str(Path(f).absolute()) for f in files] if files else None,
               "detector": a.detector, "se_layout": a.se_layout, "info_strip": a.info_strip, "blend": a.blend,
-              "exclude": a.exclude or [], "strip_px": a.strip_px, "allow_rescale": a.allow_rescale}
+              "exclude": a.exclude or [], "strip_px": a.strip_px, "seam": a.seam, "blend_band_px": a.band}
 
     def show(msg: str, frac: float) -> None:
         print(f"\r{msg:<40} {frac * 100:5.1f} %", end="", file=sys.stderr, flush=True)
@@ -111,9 +111,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("backends", help="show which analysis backends are available")
     sub.add_parser("ops", help="list the service operations (same as the MCP tools)")
-    g = sub.add_parser("gui", help="start the GUI on http://127.0.0.1:<port>")
-    g.add_argument("--port", type=int, default=8064)
-    g.add_argument("--project")
+    g = sub.add_parser("gui", help="start the GUI: desktop window, or --browser on http://127.0.0.1:<port>")
+    g.add_argument("--browser", action="store_true", help="serve in the browser (development, tests, Claude)")
+    g.add_argument("--port", type=int, default=None)
+    g.add_argument("--project", help="project root folder or name under projects/")
+    g.add_argument("--no-show", action="store_true", help="--browser: do not open a browser tab")
     sub.add_parser("mcp", help="run the MCP server (stdio)")
     r = sub.add_parser("run", help="run a recipe file (a project's recipe.json or a list of steps) into a project")
     r.add_argument("recipe", help="recipe.json")
@@ -132,10 +134,12 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--se-layout", choices=["own", "bse"], default="own",
                     help="bse: place the SE tiles with the BSE layout (aligned mosaics)")
     st.add_argument("--info-strip", choices=["none", "keep", "generate"], default="none")
-    st.add_argument("--blend", choices=["feather", "none"], default="feather")
+    st.add_argument("--blend", choices=["seam", "feather", "none"], default="seam",
+                    help="seam: blend in a narrow band around each seam (default); feather: whole overlap; none: raw")
+    st.add_argument("--seam", choices=["midline", "min_difference"], default="midline")
+    st.add_argument("--band", type=int, default=32, help="blending band width around a seam (px)")
     st.add_argument("--exclude", nargs="*", help="file stems or image numbers to leave out")
     st.add_argument("--strip-px", type=int, help="manual data-bar height (px)")
-    st.add_argument("--allow-rescale", action="store_true")
     st.add_argument("--project", help="target project (default: new stitch_<folder>_<time>)")
     st.add_argument("--scan", action="store_true", help="only show the detector counts / data bars, do not stitch")
     st.add_argument("--json", action="store_true")
@@ -152,7 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     elif a.cmd == "gui":
         from .gui.app import main as gui_main  # noqa: PLC0415
 
-        gui_main(port=a.port, project=a.project)
+        gui_main(port=a.port, project=a.project, browser=a.browser,
+                 argv=["--no-show"] if a.no_show else [])
     elif a.cmd == "mcp":
         from .mcp_server import main as mcp_main  # noqa: PLC0415
 

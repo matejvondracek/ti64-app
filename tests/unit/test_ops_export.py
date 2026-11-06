@@ -158,7 +158,7 @@ def test_undo_redo(tmp_path, crop1000_ju02):
     assert len(load_annotations(p, MAP)) == 1
     assert service.undo(p).startswith("annotations.set")
     assert load_annotations(p, MAP) == [] and [s.op for s in p.recipe().steps] == ["sample.set"]
-    assert (p.outputs_dir / s1.id).is_dir()                # kept while redo is possible
+    assert p.find_step_dir(s1.id) == p.outputs_dir / f"EBMX-1_{s1.id}"   # kept while redo is possible
     assert service.redo(p).startswith("annotations.set") and len(load_annotations(p, MAP)) == 1
     service.undo(p)
     service.undo(p)                                        # sample sheet gone too
@@ -167,7 +167,7 @@ def test_undo_redo(tmp_path, crop1000_ju02):
     service.redo(p)
     assert p.samples()[0].map_id == MAP
     service.run(p, "annotations.set", {"map_id": MAP, "items": []})    # new action drops the redo stack
-    assert history.status(p)["redo"] == [] and not (p.outputs_dir / s1.id).exists()
+    assert history.status(p)["redo"] == [] and p.find_step_dir(s1.id) is None
     n = service.switch_backend(p, "matlab")
     assert p.info().backend == "matlab" and n == 0
     service.undo(p)

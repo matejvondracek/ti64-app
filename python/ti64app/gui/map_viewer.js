@@ -20,6 +20,13 @@ export default {
     shapes: Array,             // [{id, type, xy: [[x, y], ...], color, text, width_pt}]
     tool: String,
     scale_bar: Boolean,
+    alt_layer_url: String,     // "Compare to original": the unedited loaded map, shown while the button is held
+    initial_view: Object,      // {x0, x1, y0, y1} restored on reopen (gui_state.json)
+    legends: Array,            // [{kind: scale_bar|colorbar|ipf_key, x, y, w}] fractions of the view (null = old
+                               // scale-bar control); dragged / resized here, exported exactly so (legends.py)
+    legend_data: Object,       // {colorbar: {stops, lo, hi, label} | null, swatches: [[label, hex]], key_url}
+    hex_grid: Boolean,         // hexagonal map: the zoom indicator says whether cells are drawn as brick or hexagons
+    cell_um: Number,           // measurement step dx (um)
     resourcePath: String,
   },
   data() {
@@ -48,10 +55,15 @@ export default {
     this.overlayLayers = [];
     this.setLayer();
     this.setOverlays();
-    this.fit();
+    const v = this.initial_view;
+    if (v && isFinite(v.x0) && v.x1 > v.x0 && v.y1 > v.y0) this.zoomTo(v.x0, v.y0, v.x1, v.y1, 0); else this.fit();
     this.drawShapes();
     this.makeScaleBar();
-    this.map.on("zoomend", () => { this.drawShapes(); this.updateScaleBar(); this.emitView(); });
+    this.makeOverlayUi();
+    this.map.on("zoomend", () => { this.drawShapes(); this.updateScaleBar(); this.renderLegends(); this.updateZoomInfo();
+                                   this.emitView(); });
+    this.resizeObs = new ResizeObserver(() => this.renderLegends());
+    this.resizeObs.observe(this.$el);
     this.map.on("moveend", () => this.emitView());
     this.map.on("click", (e) => this.onClick(e));
     this.map.on("dblclick", (e) => this.finishMulti(e));
@@ -65,6 +77,7 @@ export default {
   },
   unmounted() {
     document.removeEventListener("keydown", this.keyHandler);
+    if (this.resizeObs) this.resizeObs.disconnect();
     if (this.map) this.map.remove();
   },
   watch: {
@@ -79,6 +92,10 @@ export default {
     },
     scale_bar() { this.updateScaleBar(); },
     extent() { this.fit(); },
+    legends: { handler() { this.updateScaleBar(); this.renderLegends(); }, deep: true },
+    legend_data: { handler() { this.renderLegends(); }, deep: true },
+    hex_grid() { this.updateZoomInfo(); },
+    cell_um() { this.updateZoomInfo(); },
   },
   methods: {
     ll(x, y) { return L.latLng(y, x); },
@@ -90,8 +107,28 @@ export default {
       if (!this.map || !this.extent) return;
       this.map.fitBounds(this.bounds(), { padding: [10, 10] });
     },
-    zoomTo(x0, y0, x1, y1) {
-      this.map.fitBounds(L.latLngBounds(this.ll(x0, y0), this.ll(x1, y1)), { padding: [20, 20] });
+    zoomTo(x0, y0, x1, y1, pad = 20) {
+      this.map.fitBounds(L.latLngBounds(this.ll(x0, y0), this.ll(x1, y1)), { padding: [pad, pad] });
+    },
+    // hold-to-compare: swap the base layer for the original (unedited) map in the same view and zoom
+    showAlt(on) {
+      if (!this.map || !this.alt_layer_url) return;
+      if (on && !this.altLayer) {
+        this.altLayer = L.tileLayer(this.alt_layer_url, this.tileOptions(1, 2)).addTo(this.map);
+        if (this.baseLayer) this.baseLayer.setOpacity(0);
+        for (const l of this.overlayLayers) l.setOpacity(0);
+        this.shapeLayer.remove();
+        this.$el.classList.add("ti64-showing-original");
+        this.$emit("compare", { on: true });
+      } else if (!on && this.altLayer) {
+        this.map.removeLayer(this.altLayer);
+        this.altLayer = null;
+        if (this.baseLayer) this.baseLayer.setOpacity(this.layer_opacity ?? 1);
+        for (const l of this.overlayLayers) l.setOpacity(1);
+        this.shapeLayer.addTo(this.map);
+        this.$el.classList.remove("ti64-showing-original");
+        this.$emit("compare", { on: false });
+      }
     },
     getView() {
       const b = this.map.getBounds();
@@ -212,7 +249,7 @@ export default {
     updateScaleBar() {
       if (!this.scaleCtl) return;
       const el = this.scaleCtl.getContainer();
-      el.style.display = this.scale_bar ? "" : "none";
+      el.style.display = this.scale_bar && !this.legends ? "" : "none";
       const umPerPx = this.pxToUm(1);
       const target = 120 * umPerPx;
       const p = Math.pow(10, Math.floor(Math.log10(target)));
@@ -220,6 +257,161 @@ export default {
       for (const m of [5, 2, 1]) { if (m * p <= target) { len = m * p; break; } }
       el.querySelector(".bar").style.width = `${len / umPerPx}px`;
       el.querySelector(".lab").textContent = len >= 1000 ? `${len / 1000} mm` : `${+len.toPrecision(3)} µm`;
+    },
+    niceLength(maxUm) {
+      const p = Math.pow(10, Math.floor(Math.log10(maxUm)));
+      for (const m of [5, 2, 1]) if (m * p <= maxUm) return m * p;
+      return p / 2;
+    },
+    barLabel(L) {
+      if (L >= 1000) return `${+(L / 1000).toPrecision(3)} mm`;
+      if (L < 1) return `${+(L * 1000).toPrecision(3)} nm`;
+      return `${+L.toPrecision(3)} µm`;
+    },
+    // ---- legends on the map (drag to move, drag the corner to resize; positions = fractions of the view) --------
+    makeOverlayUi() {
+      this.legendBox = document.createElement("div");
+      this.legendBox.style.cssText = "position:absolute;inset:0;pointer-events:none;z-index:750;overflow:hidden";
+      this.$el.appendChild(this.legendBox);
+      this.zoomInfo = document.createElement("div");
+      this.zoomInfo.className = "ti64-zoominfo";
+      this.zoomInfo.setAttribute("tabindex", "0");
+      this.zoomInfo.setAttribute("data-testid", "viewer_zoominfo");
+      this.zoomInfo.style.cssText = "position:absolute;left:50%;transform:translateX(-50%);top:8px;z-index:760;" +
+        "font:11px sans-serif;white-space:nowrap;" +
+        "background:rgba(255,255,255,.9);padding:2px 8px;border-radius:10px;border:1px solid #cbd5e1;cursor:help";
+      this.$el.appendChild(this.zoomInfo);
+      // hover / keyboard-focus tooltip drawn in the page (the explanation of brick vs hexagons)
+      this.zoomTip = document.createElement("div");
+      this.zoomTip.setAttribute("data-testid", "viewer_zoomtip");
+      this.zoomTip.style.cssText = "position:absolute;left:50%;transform:translateX(-50%);top:34px;z-index:770;" +
+        "max-width:380px;font:13px 'Segoe UI',sans-serif;line-height:1.35;color:#fff;background:#4b5563;" +
+        "padding:6px 10px;border-radius:6px;display:none;pointer-events:none";
+      this.$el.appendChild(this.zoomTip);
+      const show = () => { this.zoomTip.textContent = this.zoomInfo.dataset.tip || ""; this.zoomTip.style.display = ""; };
+      const hide = () => { this.zoomTip.style.display = "none"; };
+      this.zoomInfo.addEventListener("mouseenter", show);
+      this.zoomInfo.addEventListener("focus", show);
+      this.zoomInfo.addEventListener("mouseleave", hide);
+      this.zoomInfo.addEventListener("blur", hide);
+      this.renderLegends();
+      this.updateZoomInfo();
+    },
+    updateZoomInfo() {
+      if (!this.zoomInfo || !this.map) return;
+      const umPerPx = this.pxToUm(1);
+      const cellPx = (this.cell_um || 0) / umPerPx;
+      let txt = `${Math.round(100 * Math.pow(2, this.map.getZoom()))} %`;
+      let tip = "Zoom of the view (100 % = one screen pixel per image pixel).";
+      if (this.cell_um) {
+        txt += ` · cell ${cellPx >= 10 ? cellPx.toFixed(0) : cellPx.toFixed(1)} px`;
+        if (this.hex_grid) {
+          txt += cellPx >= 8 ? " · hexagons" : " · brick";
+          tip = "Hexagonal grid. Brick: each measurement is drawn as a rectangle (one step wide, one row high) and " +
+                "every other row is shifted by half a step, like hexRaster in EBSD_part2.m - exact, but the cell " +
+                "corners look square. Hexagons: from 8 screen pixels per cell on, each measurement is drawn as its " +
+                "true regular hexagon (neighbouring rows offset by half a cell). The analysis always uses the " +
+                "hexagonal grid; this only changes the drawing. Exports: native and 2x are brick, 4x and larger " +
+                "are hexagons.";
+        } else {
+          tip = "Square grid: one square cell per measurement.";
+        }
+      }
+      this.zoomInfo.textContent = txt;
+      this.zoomInfo.dataset.tip = tip;
+      this.zoomInfo.setAttribute("aria-label", `${txt}. ${tip}`);
+      this.zoomInfo.dataset.mode = this.hex_grid ? (cellPx >= 8 ? "hexagons" : "brick") : "square";
+    },
+    legendHtml(it, wpx) {
+      const d = this.legend_data || {};
+      const box = (cap, pad) => `background:rgba(255,255,255,.9);border-radius:${cap / 2}px;padding:${pad};color:#000`;
+      if (it.kind === "scale_bar") {
+        const umPerPx = this.pxToUm(1);
+        const L = this.niceLength(0.8 * wpx * umPerPx);
+        const cap = Math.max(9, wpx / 14);
+        return `<div style="${box(cap, `${cap * 0.35}px 0 ${cap * 0.6}px`)};text-align:center;font:600 ${cap}px sans-serif">` +
+               `${this.barLabel(L)}<div style="height:${cap * 0.65}px;width:${L / umPerPx}px;background:#000;` +
+               `margin:${cap * 0.25}px auto 0"></div></div>`;
+      }
+      if (it.kind === "colorbar") {
+        const cap = Math.max(9, wpx / 22);
+        const cb = d.colorbar;
+        if (cb && cb.stops && cb.stops.length) {
+          const f = (v) => (v === null || v === undefined ? "" : String(+(+v).toPrecision(3)));
+          return `<div style="${box(cap, `${cap * 0.8}px ${cap}px ${cap * 0.4}px`)};font:${cap}px sans-serif">` +
+                 `<div style="height:${cap * 1.4}px;border:1px solid #000;background:linear-gradient(to right,` +
+                 `${cb.stops.join(",")})"></div><div style="display:flex;justify-content:space-between">` +
+                 `<span>${f(cb.lo)}</span><span>${f(cb.hi)}</span></div>` +
+                 `<div style="text-align:center;font-size:${cap * 0.9}px">${cb.label || ""}</div></div>`;
+        }
+        if (d.swatches && d.swatches.length) {
+          return `<div style="${box(cap, `${cap * 0.5}px ${cap}px`)};font:${cap}px sans-serif">` +
+                 d.swatches.map(([l, c]) => `<div style="display:flex;align-items:center;gap:${cap * 0.6}px;` +
+                   `margin:${cap * 0.25}px 0"><span style="display:inline-block;width:${cap * 1.4}px;` +
+                   `height:${cap * 1.2}px;background:${c};border:1px solid #666"></span>${l}</div>`).join("") + "</div>";
+        }
+        return `<div style="${box(9, "4px")};font:11px sans-serif">no colour bar: this map is coloured by ` +
+               "orientation (show the IPF key)</div>";
+      }
+      if (it.kind === "ipf_key") {
+        if (d.key_url) return `<img src="${d.key_url}" draggable="false" style="width:100%;display:block;` +
+                              `background:#fff;border-radius:4px;pointer-events:none">`;
+        return `<div style="${box(9, "4px")};font:11px sans-serif">IPF key: only on IPF maps</div>`;
+      }
+      return "";
+    },
+    renderLegends() {
+      if (!this.legendBox || !this.map) return;
+      this.legendBox.innerHTML = "";
+      const items = this.legends || [];
+      const W = this.$el.clientWidth, H = this.$el.clientHeight;
+      items.forEach((it, i) => {
+        const box = document.createElement("div");
+        const wpx = Math.max(30, it.w * W);
+        box.className = "ti64-legend";
+        box.dataset.kind = it.kind;
+        box.setAttribute("data-testid", `legend_${it.kind}`);
+        box.style.cssText = `position:absolute;left:${it.x * W}px;top:${it.y * H}px;width:${wpx}px;` +
+                            "pointer-events:auto;cursor:move;user-select:none;outline:1px dashed transparent";
+        box.title = "Drag to move it, drag the blue corner to resize it. Exports put it exactly here.";
+        const handle = document.createElement("div");
+        handle.style.cssText = "position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;background:#2563eb;" +
+                               "border:2px solid #fff;border-radius:3px;cursor:nwse-resize";
+        const fill = (w) => { box.innerHTML = this.legendHtml(it, w); box.appendChild(handle); };
+        fill(wpx);
+        box.onmouseenter = () => { box.style.outlineColor = "#2563eb"; };
+        box.onmouseleave = () => { box.style.outlineColor = "transparent"; };
+        const start = (e, mode) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.map.dragging.disable();
+          const r0 = { x: e.clientX, y: e.clientY, left: it.x * W, top: it.y * H, w: wpx };
+          const move = (m) => {
+            if (mode === "move") {
+              box.style.left = `${Math.min(Math.max(r0.left + m.clientX - r0.x, 0), W - 20)}px`;
+              box.style.top = `${Math.min(Math.max(r0.top + m.clientY - r0.y, 0), H - 20)}px`;
+            } else {
+              const nw = Math.min(Math.max(r0.w + m.clientX - r0.x, 40), W);
+              box.style.width = `${nw}px`;
+              fill(nw);
+            }
+          };
+          const up = () => {
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", up);
+            this.map.dragging.enable();
+            const nw = parseFloat(box.style.width), nl = parseFloat(box.style.left), nt = parseFloat(box.style.top);
+            const next = (this.legends || []).map((o, j) => (j === i ? { ...o, x: nl / W, y: nt / H, w: nw / W } : o));
+            this.$emit("legends", { items: next });
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", up);
+        };
+        box.addEventListener("pointerdown", (e) => start(e, e.target === handle ? "resize" : "move"));
+        box.addEventListener("click", (e) => e.stopPropagation());
+        box.addEventListener("dblclick", (e) => e.stopPropagation());
+        this.legendBox.appendChild(box);
+      });
     },
   },
 };
