@@ -81,8 +81,8 @@ def _recon_run(ctx: OpContext) -> None:
     cq = np.where((st == RECON_TRANSFORMED)[:, None], child["quat"], np.nan)
     var = ti_variants(cq, grain_mean_parent(pg, rd.grain))
     vstats = variant_stats(pg, var["variant"], var["packet"], fit, p.variant_min_share)
-    shape = grain_shape(pmap.x, pmap.y, pg, rd.grain, sheet.build_direction.unit_vector, pmap.step_um,
-                        p.min_px, p.params.histMinECD)
+    bd = sheet.build_direction.unit_vector if sheet.build_direction else None     # None: shape vs BD skipped
+    shape = grain_shape(pmap.x, pmap.y, pg, rd.grain, bd, pmap.step_um, p.min_px, p.params.histMinECD)
     ok = ~np.isnan(var["c_dev_deg"])
     summary = {k: res[k] for k in SUMMARY_KEYS if k in res}
     summary.update(
@@ -98,7 +98,8 @@ def _recon_run(ctx: OpContext) -> None:
                   "c_dev_deg_p50_p90": np.percentile(var["c_dev_deg"][ok], [50, 90]).tolist() if ok.any() else None,
                   "a_dev_deg_p50_p90": np.percentile(var["a_dev_deg"][ok], [50, 90]).tolist() if ok.any() else None,
                   **{k: v for k, v in vstats.items() if k != "grains"}},
-        grain_shape=shape["summary"])
+        grain_shape=shape["summary"],
+        needs=[] if bd is not None else ["build direction"])
     ctx.params.update(source=src)
     ctx.metrics.update(recon_s=round(t1 - t0, 2), n_parent_grains=int(len(rd.grain["id"])),
                        rec_frac=round(float(res["rec_frac"]), 4))

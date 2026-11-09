@@ -37,9 +37,10 @@ server = MCPServer(
     instructions=(
         "EBSD/BSE analysis of EBM Ti-6Al-4V (alpha + retained beta) with two interchangeable backends "
         "(pymtex = MTEX for Python, default; matlab = MATLAB + MTEX 7.2). Work inside a project (create_project / "
-        "projects). Before loading a map, enter its sample sheet with set_sample_sheet: the build direction is "
-        "REQUIRED and must come from the user, never guessed; so is the input state (raw / OIM-cleaned) and any 4PB "
-        "geometry. Typical chain: set_sample_sheet -> load_map -> cleanup_map -> calc_grains -> reconstruct_beta -> "
+        "projects). Link a map with set_sample_sheet (map file + input state raw / OIM-cleaned are enough to load "
+        "it). The build direction, the specimen and any 4PB geometry must come from the user, never guessed; they are "
+        "only needed by the steps that use them (IPF along the build direction, prior-beta length / width along BD, "
+        "4PB), which say so when they are missing. Typical chain: set_sample_sheet -> load_map -> cleanup_map -> calc_grains -> reconstruct_beta -> "
         "grain_size -> export_map. Every action is a recipe step (resource ti64://projects/{project}/recipe), "
         "undoable and replayable. compare_backends runs one step on both backends and shows numbers + both figures. "
         "Map frame: x right, y down (EDAX setting 2); build-direction angle from +x toward +y. Units: um, deg, MPa; "
@@ -220,8 +221,8 @@ def suggest_sample_defaults(map_file: str) -> dict[str, str]:
 def set_sample_sheet(
     project: str,
     map_file: str,
-    specimen_id: str,
     input_state: Literal["raw", "oim_cleaned"],
+    specimen_id: str | None = None,
     build_direction_angle_deg: float | None = None,
     build_direction_vector: list[float] | None = None,
     map_id: str | None = None,
@@ -237,8 +238,9 @@ def set_sample_sheet(
     map_y_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] | None = None,
     notes: str = "",
 ) -> dict[str, Any]:
-    """Enter the sample sheet of one map (creates the project if needed). Build direction is required (angle in
-    deg from map +x toward +y, or a 3-vector in map coordinates) and must be given by the user. 4PB: give all
+    """Enter the sample sheet of one map (creates the project if needed). Only map_file and input_state are needed
+    to load the map. The build direction (angle in deg from map +x toward +y, or a 3-vector in map coordinates) and
+    the specimen must be given by the user, never guessed; leave them out until known (steps that need them say so). 4PB: give all
     four geometry values (mm) or none; load in N. Position: map origin in the sample frame (mm) and the sample
     axes along map +x / +y. A relative map_file is resolved against the server's working directory."""
     bend = None
@@ -252,13 +254,14 @@ def set_sample_sheet(
     if any(v is not None for v in (origin_X_mm, origin_Y_mm, origin_Z_mm, map_x_axis, map_y_axis)):
         pos = MapPosition(**_clean(dict(origin_X_mm=origin_X_mm, origin_Y_mm=origin_Y_mm, origin_Z_mm=origin_Z_mm,
                                         map_x_axis=map_x_axis, map_y_axis=map_y_axis)))
-    bd = BuildDirection(angle_deg=build_direction_angle_deg,
-                        vector=tuple(build_direction_vector) if build_direction_vector else None)
+    bd = (BuildDirection(angle_deg=build_direction_angle_deg,
+                         vector=tuple(build_direction_vector) if build_direction_vector else None)
+          if build_direction_angle_deg is not None or build_direction_vector else None)
     sheet = SampleSheet(map_id=map_id or map_id_from_file(map_file), specimen_id=specimen_id,
                         map_file=map_file, input_state=input_state, build_direction=bd,
                         bending=bend, position=pos, notes=notes)
     step = service.run(_project(project, create=True), "sample.set", sheet)
-    return {**_step_summary(step), "map_id": sheet.map_id, "build_direction_unit": bd.unit_vector}
+    return {**_step_summary(step), "map_id": sheet.map_id, "build_direction_unit": bd.unit_vector if bd else None}
 
 
 @server.tool()
@@ -270,7 +273,8 @@ def get_sample_sheet(project: str, map_id: str) -> dict[str, Any]:
 # ---- loaders --------------------------------------------------------------------------------
 @server.tool()
 def load_map(project: str, map_id: str, backend: Backend | None = None) -> dict[str, Any]:
-    """Load a map's .ang (its sample sheet must exist; EDAX setting 2) with the project backend or `backend`."""
+    """Load a map's .ang (EDAX setting 2) with the project backend or `backend`. The map must be linked in the
+    project (set_sample_sheet with map_file + input_state); sample and build direction are not needed to load."""
     p = _project(project)
     step = service.run(p, "ebsd.load", {"map_id": map_id}, backend=backend)
     return {**_step_summary(step), "meta": _json_out(p, step, "meta")}
@@ -282,6 +286,30 @@ def read_up2_header(project: str, file: str) -> dict[str, Any]:
     p = _project(project)
     step = service.run(p, "up2.header", {"file": file})
     return {**_step_summary(step), "header": _json_out(p, step, "header")}
+
+
+@server.tool()
+def up2_overview(project: str, file: str, step: int = 2, channel: Literal["iq", "vbse"] = "iq",
+                 flatten: bool = True) -> dict[str, Any]:
+    """Overview map of a .up2 pattern file (pattern quality IQ or virtual BSE), computed by streaming the file in
+    chunks (every `step`-th scan row / column; 2 = half the file read, ~1 min for 43 GB; 1 = all patterns) and cached
+    in the project's cache folder (same cache as the View tab). Returns the PNG path, the grid and value ranges.
+    A viewer cache, not a recipe step (like the viewer tiles)."""
+    from PIL import Image  # noqa: PLC0415
+
+    from .modules import up2_overview as uo  # noqa: PLC0415
+
+    p = _project(project)
+    ov = uo.compute(file, p.cache_dir, step)
+    png = uo.cache_path(p.cache_dir, file, step).with_name(
+        uo.cache_path(p.cache_dir, file, step).stem + f"_{channel}{'_flat' if flatten else ''}.png")
+    Image.fromarray(ov.image(channel, flatten=flatten)).save(png)
+    import numpy as np  # noqa: PLC0415
+
+    a = ov.channel(channel)
+    return {"png": str(png), "shape_rows_cols": list(a.shape), "pixel_um": list(ov.pixel_um), "step": ov.step,
+            "seconds": round(ov.seconds, 1), "channel": uo.CHANNELS[channel],
+            "percentiles_1_50_99": [float(v) for v in np.nanpercentile(a, (1, 50, 99))]}
 
 
 @server.tool()
@@ -592,7 +620,8 @@ def scan_sem_images(folder: str | None = None, files: list[str] | None = None,
                         "strip_source": t.strip_source, "pixel_size_um": t.pixel_size_um,
                         "magnification": t.magnification, "stage_xy_mm": [t.stage_x_mm, t.stage_y_mm],
                         "warnings": t.warnings} for t in tiles],
-            "stitch_sets": [{"id": st.id, "label": st.label, "files": st.paths, "note": st.note}
+            "stitch_sets": [{"id": st.id, "label": st.label, "files": st.paths, "note": st.note,
+                             "stage_check": stitching.stage_analysis([t for t in tiles if t.path in set(st.paths)])}
                             for st in stitching.stitch_sets(tiles)]}
 
 
@@ -627,6 +656,7 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
                         "pixel_size_um": side["pixel_size_um"], "residual_px": side["residual_px"],
                         "stage_only_tiles": side["stage_only_tiles"], "strip": side["strip"],
                         "stage_map": side["stage_map"].get("chosen"),
+                        "notes": side.get("notes", []),            # unknown stage axis, possible / confirmed repeats
                         "weak_pairs": [q for q in side["pairs"] if not q["ok"]],
                         "tiles": [{k: t[k] for k in ("name", "x_px", "y_px", "best_score", "placed_by")}
                                   for t in side["tiles"]]}
@@ -635,15 +665,18 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
 
 @server.tool()
 def export_mosaic(project: str, stitch: str, detector: Literal["BSE", "SE"] = "BSE",
-                  format: Literal["png", "tiff", "svg", "pdf"] = "png", mode: Literal["native", "width"] = "native",
+                  format: Literal["png", "tiff", "svg", "pdf", "bigtiff"] = "png",
+                  mode: Literal["native", "width", "scale"] = "native", scale: float = 1.0,
                   width_mm: float = 120.0, dpi: int = 600, scale_bar: bool = True, info_strip: bool = True,
                   name: str = "") -> dict[str, Any]:
-    """Export a stitched mosaic (step id of stitch_images) as PNG / TIFF / SVG / PDF: native pixels or a width in mm
-    at a DPI, with an optional scale bar (from the mosaic pixel size) and the mosaic's info strip. The file stays in
-    the project (path returned) with a JSON sidecar giving the pixel size of the exported image."""
+    """Export a stitched mosaic (step id of stitch_images) as PNG / TIFF / SVG / PDF or a tiled BigTIFF with pyramid
+    (any size): native pixels, a fraction of the original (mode 'scale', scale 0.5 / 0.25 / 0.125) or a width in mm
+    at a DPI, with an optional scale bar (from the mosaic pixel size; left out when the info strip, which has its own,
+    is included) and the mosaic's info strip. Sizes that do not fit in memory are refused with the alternatives. The
+    file stays in the project (path returned) with a JSON sidecar giving the pixel size of the exported image."""
     p = _project(project)
     step = service.run(p, "sem.export", {"stitch": stitch, "detector": detector, "format": format, "mode": mode,
-                                         "width_mm": width_mm, "dpi": dpi, "scale_bar": scale_bar,
+                                         "scale": scale, "width_mm": width_mm, "dpi": dpi, "scale_bar": scale_bar,
                                          "info_strip": info_strip, "name": name})
     return {**_step_summary(step), "file": _path(p, step, "export"), "sidecar": _json_out(p, step, "sidecar")}
 
@@ -770,6 +803,9 @@ def main() -> None:
     import anyio  # noqa: PLC0415
     from mcp.server.stdio import stdio_server  # noqa: PLC0415
 
+    from .logs import setup_logging  # noqa: PLC0415
+
+    setup_logging("mcp")                      # stdout is the MCP wire: log to %APPDATA%/ti64app/logs
     stdin, stdout = _private_wire()
 
     async def serve() -> None:

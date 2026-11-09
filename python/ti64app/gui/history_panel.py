@@ -20,6 +20,56 @@ from .shell import error
 from .state import autosave, stable
 
 
+# ---- progress of a recipe run (replay, recipe file) ----------------------------------------------------------
+async def run_with_progress(title: str, fn, n_hint: int | None = None):
+    """Run fn(on_step, should_stop) in a worker thread with a progress dialog: "step 3 of 9: Grains and boundaries
+    (pymtex)", a progress bar, the elapsed time and Cancel (stops before the next step; the running step finishes).
+    Returns fn's result (None if it raised; the error is shown)."""
+    import time  # noqa: PLC0415
+
+    st = {"k": 0, "n": n_hint or 0, "label": "starting…", "stop": False, "t0": time.perf_counter()}
+
+    def on_step(k, n, s):
+        st.update(k=k, n=n, label=f"step {k + 1} of {n}: {OP_LABEL.get(s.op, s.op)}"
+                                  + (f" ({s.backend})" if s.backend else ""))
+
+    with ui.dialog().props("persistent") as dlg, ui.card().classes("w-[30rem] max-w-full gap-2").mark("replay_dialog"):
+        ui.label(title).classes("text-lg font-semibold")
+        lab = ui.label(st["label"]).classes("text-sm").mark("replay_step")
+        bar = ui.linear_progress(value=0, show_value=False).props("rounded color=primary").mark("replay_bar")
+        with ui.row().classes("w-full items-center no-wrap"):
+            el = ui.label("0 s").classes("text-xs ti-muted grow").mark("replay_elapsed")
+
+            def cancel():
+                st["stop"] = True
+                cb.disable()
+                cb.text = "Stopping after this step…"
+            cb = ui.button("Cancel", icon="close", on_click=cancel).props("flat").mark("replay_cancel")
+
+    def tick():
+        lab.text = st["label"]
+        bar.value = (st["k"] / st["n"]) if st["n"] else 0
+        s = int(time.perf_counter() - st["t0"])
+        el.text = f"elapsed {s // 60} min {s % 60:02d} s" if s >= 60 else f"elapsed {s} s"
+    timer = ui.timer(0.3, tick)
+    dlg.open()
+    try:
+        return await ng_run.io_bound(fn, on_step, lambda: st["stop"])
+    except Exception as e:  # noqa: BLE001
+        error(e, f"{title} failed")
+        return None
+    finally:
+        timer.cancel()
+        dlg.close()
+
+
+def _report_text(rep) -> str:
+    s = int(rep.seconds)
+    t = f"{s // 60} min {s % 60:02d} s" if s >= 60 else f"{rep.seconds:.1f} s"
+    return (f"{len(rep.steps)} step{'s' if len(rep.steps) != 1 else ''} in {t}"
+            + (" (cancelled)" if rep.cancelled else ""))
+
+
 # ---- History ------------------------------------------------------------------------------------------------
 OP_LABEL = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "Grains and boundaries",
             "map.compute": "KAM / GND map", "figure": "Figure", "export.map": "Export", "annotations.set": "Annotations",
@@ -38,7 +88,9 @@ def tab_steps(p: Project, map_id: str | None, tab: str, include_stale: bool = Tr
     def is_beta(s) -> bool:
         lay = s.params.get("layer") if isinstance(s.params.get("layer"), dict) else {}
         return (s.op in RECON_OPS or (s.op == "export.map" and lay.get("kind") in RECON_KINDS)
-                or (s.op == "figure" and s.params.get("kind") in RECON_KINDS))
+                or (s.op == "figure" and s.params.get("kind") in RECON_KINDS)
+                or (s.op == "grainsize.run" and s.params.get("target") == "prior_beta")
+                or (s.op == "grainsize.figure" and str(s.params.get("kind", "")).startswith("beta")))
     out = [s for s in p.recipe().steps if map_id and s.params.get("map_id") == map_id and s.op != "sample.set"
            and (include_stale or not s.stale)]
     return [s for s in out if is_beta(s) == (tab == "beta")]
@@ -82,6 +134,16 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
         ui.label(("Prior-β map" if tab == "beta" else "α map") + f" {mid or ''}: {len(live)} step{'' if len(live) == 1 else 's'}"
                  + (f" (+ {len(steps) - len(live)} stale)" if len(steps) > len(live) else "")
                  + ". Drag a step onto another to change the order.").classes("text-xs ti-muted").mark("history_info")
+        with ui.row().classes("w-full items-center gap-1 no-wrap"):
+            ui.button("Delete all steps…", icon="delete_sweep", on_click=lambda: confirm_delete(False)) \
+                .props("flat dense no-caps size=sm color=negative").mark("delete_all_steps") \
+                .tooltip("Remove the steps of this map tab from the recipe (asks first; Undo brings them back)")
+            n_stale = len(steps) - len(live)
+            if n_stale:
+                ui.button(f"Delete stale steps ({n_stale})…", icon="layers_clear",
+                          on_click=lambda: confirm_delete(True)) \
+                    .props("flat dense no-caps size=sm").mark("delete_stale_steps") \
+                    .tooltip("Remove the stale (crossed-out) steps of this map tab (asks first; Undo brings them back)")
         lst = ui.column().classes("w-full gap-0").mark("recipe_table")
         with lst:
             if not steps:
@@ -158,23 +220,33 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
             rep_out = ui.column().classes("w-full")
 
             async def do_replay():
-                n = ui.notification("Replaying the recipe in a scratch copy…", spinner=True, timeout=None)
-                try:
-                    rep = await ng_run.io_bound(service.replay, p, be.value or None, None, stale.value, None)
-                    rep_out.clear()
-                    with rep_out:
-                        ui.label("Replay reproduced all outputs" if rep.ok else "Replay found differences") \
-                            .classes("font-semibold " + ("text-green-800" if rep.ok else "text-amber-800")) \
-                            .mark("replay_result")
-                        for c in rep.input_changes:
-                            ui.label(c).classes("text-xs text-amber-800")
-                        bad = [c for c in rep.checks if c.status in ("different", "missing")]
-                        for c in bad[:20]:
-                            ui.label(f"{c.op} {c.output}: {c.status} {c.detail}").classes("text-xs")
-                except Exception as e:  # noqa: BLE001
-                    error(e, "Replay failed")
-                finally:
-                    n.dismiss()
+                rep = await run_with_progress(
+                    "Replaying the recipe in a scratch copy",
+                    lambda on_step, stop: service.replay(p, be.value or None, None, stale.value, None, on_step, stop))
+                if rep is None:
+                    return
+                rep_out.clear()
+                with rep_out:
+                    other = sum(c.status == "other_backend" for c in rep.checks)
+                    head = ("Replay cancelled" if rep.cancelled else
+                            "Replay reproduced all outputs" if rep.ok and not other else
+                            "Replay finished" if rep.ok else "Replay found differences")
+                    ui.label(f"{head}: {_report_text(rep)}") \
+                        .classes("font-semibold " + ("text-green-800" if rep.ok and not rep.cancelled
+                                                     else "text-amber-800")).mark("replay_result")
+                    if other:
+                        ui.label(f"{other} output(s) come from another backend than recorded: not compared value by "
+                                 "value (backends agree only within the conformance tolerances).") \
+                            .classes("text-xs ti-muted")
+                    for c in rep.input_changes:
+                        ui.label(c).classes("text-xs text-amber-800")
+                    bad = [c for c in rep.checks if c.status in ("different", "missing")]
+                    for c in bad[:20]:
+                        ui.label(f"{c.op} {c.output}: {c.status} {c.detail}").classes("text-xs")
+                    slow = sorted(rep.steps, key=lambda r: -r.seconds)[:5]
+                    if slow:
+                        ui.label("slowest steps: " + ", ".join(f"{OP_LABEL.get(r.op, r.op)} {r.seconds:.1f} s"
+                                                               for r in slow)).classes("text-xs ti-muted")
             ui.button("Replay", icon="replay", on_click=stable(do_replay)).props("outline dense").mark("replay")
 
             async def do_run_file():
@@ -182,19 +254,20 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
                                              multiple=False)
                 if not f:
                     return
-                n = ui.notification("Running the recipe…", spinner=True, timeout=None)
                 try:
                     steps_ = service.load_recipe_file(f[0])
-                    rec = Path(f[0]).parent if (Path(f[0]).parent / "project.json").is_file() else None
-                    rep = await ng_run.io_bound(service.run_recipe, p, steps_, be.value or None, stale.value, None,
-                                                rec)
-                    ui.notify(f"{len(rep.steps)} steps run" + ("" if rep.ok else " (some outputs differ)"),
-                              type="positive" if rep.ok else "warning")
-                    body.refresh()
                 except Exception as e:  # noqa: BLE001
-                    error(e, "Could not run the recipe file")
-                finally:
-                    n.dismiss()
+                    error(e, "Could not read the recipe file")
+                    return
+                rec = Path(f[0]).parent if (Path(f[0]).parent / "project.json").is_file() else None
+                rep = await run_with_progress(
+                    "Running the recipe file",
+                    lambda on_step, stop: service.run_recipe(p, steps_, be.value or None, stale.value, None, rec,
+                                                             on_step=on_step, should_stop=stop))
+                if rep is not None:
+                    ui.notify(_report_text(rep) + ("" if rep.ok else " (some outputs differ)"),
+                              type="positive" if rep.ok and not rep.cancelled else "warning")
+                body.refresh()
             ui.button("Run a recipe file…", icon="playlist_play", on_click=stable(do_run_file)) \
                 .props("outline dense").mark("run_recipe")
             vers = recipe_versions(p.root)
@@ -220,6 +293,57 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
     def select(sid: str):
         st["sel"] = None if st["sel"] == sid else sid
         body.refresh()
+
+    def confirm_delete(stale_only: bool):
+        mid, tab = current_map(), current_tab()
+        tab_name = ("prior-β map" if tab == "beta" else "α map") + f" of {mid}"
+        shown = [s for s in tab_steps(p, mid, tab) if s.stale or not stale_only]
+        if stale_only:
+            shown = [s for s in shown if s.stale]
+        everything = [s for s in p.recipe().steps if s.stale or not stale_only]
+        with ui.dialog() as dlg, ui.card().classes("w-[32rem] max-w-full gap-2").mark("delete_dialog"):
+            ui.label("Delete stale steps?" if stale_only else "Delete all steps?").classes("text-lg font-semibold")
+            whole = ui.checkbox(f"the whole project (all maps, images and stitches: {len(everything)} "
+                                f"{'stale ' if stale_only else ''}steps), not only the {tab_name}",
+                                value=False).mark("delete_whole")
+            info = ui.label().classes("text-sm").mark("delete_info")
+
+            def plan():
+                ids = [s.id for s in (everything if whole.value else shown)]
+                return service.plan_delete(p, ids, only_unused=stale_only)
+
+            def describe(_=None):
+                pl = plan()
+                n = len(pl["delete"])
+                t = (f"{n} step{'s' if n != 1 else ''} will be removed from the recipe"
+                     + (f" ({len(pl['dependents'])} of them use a deleted step)" if pl["dependents"] else "")
+                     + (f"; {len(pl['kept'])} stale step(s) stay because current steps use them" if pl["kept"] else "")
+                     + ". Their files stay in the project folder. Undo (Ctrl+Z or the undo button at the top of "
+                       "History) brings them back.")
+                info.text = t
+                ok.set_enabled(n > 0)
+            whole.on_value_change(describe)
+
+            async def go():
+                dlg.close()
+                pl = plan()
+                try:
+                    res = service.delete_steps(p, pl["delete"], "delete stale steps" if stale_only
+                                               else "delete all steps")
+                    ui.notify(f"{len(res['delete'])} step(s) deleted; Undo brings them back.", type="positive")
+                except Exception as e:  # noqa: BLE001
+                    error(e, "Could not delete the steps")
+                body.refresh()
+                if on_changed:
+                    r = on_changed()
+                    if hasattr(r, "__await__"):
+                        await r
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dlg.close).props("flat").mark("delete_cancel")
+                ok = ui.button("Delete", icon="delete", on_click=stable(go)).props("color=negative") \
+                    .mark("delete_ok")
+            describe()
+        dlg.open()
 
     def dropped(target: str | None):
         src = st["drag"]

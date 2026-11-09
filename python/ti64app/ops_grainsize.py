@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 from .backends.base import ChartSpec, ColonyParams, GrainParams, ReconData, ReconParams, RenderSpec
 from .modules.grain_size import (GridIndex, directional_intercepts, dist_stats, hist_edges, lath_intercepts,
                                  lognormal_pdf, moment_ellipse, per_label_mean, read_oim_grain_file)
-from .modules.recon_analysis import bd_in_plane, grain_shape
+from .modules.recon_analysis import BD_MISSING, bd_in_plane, grain_shape
 from .ops_ebsd import resolve_source, step_npz
 from .ops_recon import _json
 from .service import OpContext, latest_step, op
@@ -60,6 +60,9 @@ def _phase_ids(ctx: OpContext, map_id: str) -> dict[str, int]:
 # ---- grainsize.run ------------------------------------------------------------------------------
 class GrainSizeParams(BaseModel):
     map_id: str
+    target: Literal["all", "alpha", "prior_beta"] = "all"   # GUI: the map tab it is started from (alpha: alpha
+                                              # grains / laths / colonies; prior_beta: prior-beta grains of the newest
+                                              # reconstruction, no alpha segmentation needed); all = both (MCP / CLI)
     grains: str | None = None                 # grains.calc step = lath partition (threshold set there, default 15°)
     recon: str | None = None                  # recon.run step for prior beta (default newest of the map, if any)
     use_recon: bool = True                    # False: no prior-beta part even if a reconstruction exists
@@ -115,6 +118,8 @@ def _grainsize_run(ctx: OpContext) -> None:
     half-counting at the map edge, + per-grain calipers), retained-beta fraction. Log-normal fits; CSV tables
     and an XLSX workbook per map."""
     p = GrainSizeParams.model_validate(ctx.params)
+    if p.target == "prior_beta":
+        return _grainsize_beta_only(ctx, p)
     sheet = ctx.project.sample(p.map_id)
     gsrc = resolve_source(ctx, p.map_id, p.grains, ("grains.calc",))
     gstep = ctx.project.recipe().step(gsrc)
@@ -129,6 +134,7 @@ def _grainsize_run(ctx: OpContext) -> None:
     pid = _phase_ids(ctx, p.map_id)
     alpha, beta = pid.get("alpha", 1), pid.get("beta", 2)
     warnings: list[str] = []
+    needs: list[str] = []                     # sheet values the user still has to enter for the full result
     gi = GridIndex(x, y, step)
 
     # -- alpha grains (laths) ---------------------------------------------------------------------
@@ -212,61 +218,14 @@ def _grainsize_run(ctx: OpContext) -> None:
 
     # -- prior beta -----------------------------------------------------------------------------------
     rid = None
-    if p.use_recon:
+    if p.use_recon and p.target == "all":
         rid = p.recon or getattr(latest_step(ctx.project, ("recon.run",), map_id=p.map_id), "id", None)
     beta_part: dict[str, Any] | None = None
     beta_table: dict[str, np.ndarray] | None = None
     beta_chords: dict[str, np.ndarray] = {}
     if rid:
-        rstep = ctx.project.recipe().step(rid)
-        ctx.step.inputs.append(f"{rid}:recon")
-        rp = ReconParams(**rstep.params["params"])
-        pm = step_npz(ctx, rid, "ebsd")
-        rd = ReconData.from_arrays(step_npz(ctx, rid, "recon"))
-        pg = pm["prop_parent_grain"].astype(np.int64)
-        bx, by = pm["x"], pm["y"]
-        bgi = gi if (bx.size == x.size and np.array_equal(bx, x) and np.array_equal(by, y)) else GridIndex(bx, by, step)
-        min_ecd = p.beta_min_ecd_um if p.beta_min_ecd_um is not None else rp.histMinECD
-        shape = grain_shape(bx, by, pg, rd.grain, sheet.build_direction.unit_vector, step, p.min_px, min_ecd)
-        st = pm["prop_recon_state"].astype(int)
-        rb["reconstruction"] = {"step": rid, "retained_beta_px": int((st == 4).sum()),
-                                "fraction_of_kept": float((st == 4).sum() / max(int((st >= 2).sum()), 1))}
-        u, out_deg = bd_in_plane(sheet.build_direction.unit_vector)
-        rg = rd.grain
-        bused = ((rg["n_px"] >= p.min_px) & (rg["ecd_um"] >= min_ecd)
-                 & (~rg["is_edge"].astype(bool) if p.exclude_edge else True))
-        beta_table = {"id": rg["id"].astype(np.int64), "n_px": rg["n_px"], "area_um2": rg["area_um2"],
-                      "ecd_um": rg["ecd_um"], "is_edge": rg["is_edge"].astype(bool), "used": bused,
-                      "caliper_along_bd_um": shape["table"]["along_bd_um"],
-                      "caliper_across_bd_um": shape["table"]["across_bd_um"], "aspect": shape["table"]["aspect"]}
-        beta_part = {"recon": rid, "recon_backend": rstep.backend, "or_used": json.loads(
-            (ctx.project.root / rstep.outputs["summary"].path).read_text(encoding="utf-8")).get("or_used"),
-            "min_ecd_um": min_ecd, "ecd": dist_stats(rg["ecd_um"][bused], rg["area_um2"][bused]),
-            "caliper": shape["summary"], "bd_out_of_plane_deg": out_deg}
-        if u is not None and out_deg <= 20.0:
-            bd_deg = float(np.degrees(np.arctan2(u[1], u[0])))
-            # chords only in grains >= min_ecd (fragments end chords like any boundary but are not counted)
-            count = np.zeros(int(max(pg.max(initial=0), rg["id"].max(initial=0))) + 1, bool)
-            count[rg["id"][(rg["ecd_um"] >= min_ecd) & (rg["n_px"] >= p.min_px)].astype(np.int64)] = True
-            for name, ang in (("across_bd", bd_deg + 90.0), ("along_bd", bd_deg)):
-                c = directional_intercepts(bgi, pg, ang, p.beta_line_spacing_um, sample, count)
-                full = ~c["truncated"]
-                beta_chords[f"{name}_um"] = c["length_um"][full]
-                beta_chords[f"{name}_label"] = c["label"][full]
-                beta_table[f"mean_chord_{name}_um"] = per_label_mean(c["label"][full], c["length_um"][full],
-                                                                     beta_table["id"])
-                beta_part[name] = {"direction_deg": c["direction_deg"], "mean_e112_um": c["mean_e112_um"],
-                                   "n_complete": c["n_complete"], "n_truncated": c["n_truncated"],
-                                   # length-weighted fit: ragged lath-scale boundaries between large grains
-                                   # give many short chords that dominate the number distribution (D14)
-                                   "complete_chords": dist_stats(c["length_um"][full], c["length_um"][full])}
-            n_trunc = beta_part["along_bd"]["n_truncated"]
-            if n_trunc > beta_part["along_bd"]["n_complete"]:
-                warnings.append("most chords along BD are cut by the map edge: prior-beta length along BD is a "
-                                "lower bound (columnar grains longer than the map)")
-        else:
-            warnings.append(f"build direction is {out_deg:.0f}° out of the map plane: no intercepts along/across BD")
-
+        beta_part, beta_table, beta_chords = _prior_beta_part(ctx, p, rid, sheet, gi, x, y, step, sample, rb, warnings,
+                                                              needs)
     p.grains, p.recon = gsrc, rid               # resolved steps: replay passes them explicitly
 
     # -- summary table ----------------------------------------------------------------------------
@@ -286,29 +245,13 @@ def _grainsize_run(ctx: OpContext) -> None:
     if beta_part:
         rows.append(_row("prior_beta_ecd", "um", "ECD of prior-beta grains (reconstruction)", beta_part["ecd"],
                          rules=f"{rules}; ECD >= {beta_part['min_ecd_um']:g} um"))
-        for name, lab in (("across_bd", "width"), ("along_bd", "length")):
-            if name in beta_part:
-                b = beta_part[name]
-                rows.append(_row(f"prior_beta_{lab}_intercept", "um",
-                                 f"complete chords {name.replace('_', ' ')} in grains with ECD >= "
-                                 f"{min_ecd:g} um (direction {b['direction_deg']:.1f}°, spacing "
-                                 f"{p.beta_line_spacing_um:g} um); E112 mean incl. edge chords counted half; "
-                                 "area_weighted_* columns = line-length-weighted",
-                                 b["complete_chords"], e112_mean=b["mean_e112_um"], n_truncated=b["n_truncated"]))
-        cs = beta_part["caliper"]
-        for key, lab in (("across_bd_um", "width"), ("along_bd_um", "length")):
-            if cs.get(key):
-                rows.append(_row(f"prior_beta_{lab}_caliper", "um", "per-grain caliper " + key[:-3].replace("_", " "),
-                                 {"n": cs["n_used"], "mean": cs[key]["mean"], "median": cs[key]["median"],
-                                  "area_weighted": {"mean": cs[key]["area_weighted_mean"],
-                                                    "lognormal": {"mu": None, "sigma": None}}},
-                                 rules=f"{rules}; ECD >= {cs['min_ecd_um']:g} um"))
+        rows += _beta_rows(p, beta_part, rules)
     for k in ("loaded", "source_map"):
         rows.append(_row(f"retained_beta_fraction_{k}", "1", "indexed beta pixels / indexed pixels (area fraction)",
                          None, value=rb[k]["fraction"], note=RESOLUTION_NOTE))
     summary_table = _rows_to_table(rows)
 
-    summary = {"backend": ctx.backend.name, "map_id": p.map_id, "input_state": sheet.input_state,
+    summary = {"backend": ctx.backend.name, "map_id": p.map_id, "target": p.target, "input_state": sheet.input_state,
                "grains": gsrc, "source_map": msrc, "step_um": step, "grid": grid, "rules": rules,
                "lath_partition": gp.model_dump(mode="json"), "params": p.model_dump(mode="json"),
                "alpha": {"n_grains": int(is_alpha.sum()), "n_used": n_used, "n_laths": int(is_lath.sum()),
@@ -316,7 +259,7 @@ def _grainsize_run(ctx: OpContext) -> None:
                          "thickness_minor_axis": s_minor, "chords_pooled": s_chord},
                "colony": {"n_colonies": int(c_alpha.sum()), "n_used": int(c_used.sum()),
                           "n_alpha_grains_merged": n_merged, "ecd": s_colony},
-               "prior_beta": beta_part, "retained_beta": rb, "warnings": warnings}
+               "prior_beta": beta_part, "retained_beta": rb, "warnings": warnings, "needs": needs}
     ctx.params.update(grains=gsrc, recon=rid)
     ctx.metrics.update(n_laths=int(is_lath.sum()), n_colonies=int(c_used.sum()))
     sheets = {"Summary": summary_table, "Alpha grains": lath_table, "Colonies": colony_table}
@@ -333,6 +276,128 @@ def _grainsize_run(ctx: OpContext) -> None:
     ctx.output("workbook", "xlsx", sheets)
     ctx.output("pixels", "npz", {"colony_id": cpix, "lath_colony": lath_colony})
     ctx.output("chords", "npz", {"lath_label": li["chord_label"], "lath_um": li["chord_um"], **beta_chords})
+
+
+def _prior_beta_part(ctx: OpContext, p: GrainSizeParams, rid: str, sheet, gi, x, y, step: float, sample: float,
+                     rb: dict, warnings: list, needs: list):
+    """Prior-beta grain size of a reconstruction: ECD, calipers and intercepts along / across the build direction."""
+    beta_chords: dict[str, np.ndarray] = {}
+    rstep = ctx.project.recipe().step(rid)
+    ctx.step.inputs.append(f"{rid}:recon")
+    rp = ReconParams(**rstep.params["params"])
+    pm = step_npz(ctx, rid, "ebsd")
+    rd = ReconData.from_arrays(step_npz(ctx, rid, "recon"))
+    pg = pm["prop_parent_grain"].astype(np.int64)
+    bx, by = pm["x"], pm["y"]
+    bgi = gi if (bx.size == x.size and np.array_equal(bx, x) and np.array_equal(by, y)) else GridIndex(bx, by, step)
+    min_ecd = p.beta_min_ecd_um if p.beta_min_ecd_um is not None else rp.histMinECD
+    bd = sheet.build_direction.unit_vector if sheet.build_direction else None
+    shape = grain_shape(bx, by, pg, rd.grain, bd, step, p.min_px, min_ecd)
+    st = pm["prop_recon_state"].astype(int)
+    rb["reconstruction"] = {"step": rid, "retained_beta_px": int((st == 4).sum()),
+                            "fraction_of_kept": float((st == 4).sum() / max(int((st >= 2).sum()), 1))}
+    u, out_deg = bd_in_plane(bd) if bd is not None else (None, None)
+    rg = rd.grain
+    bused = ((rg["n_px"] >= p.min_px) & (rg["ecd_um"] >= min_ecd)
+             & (~rg["is_edge"].astype(bool) if p.exclude_edge else True))
+    beta_table = {"id": rg["id"].astype(np.int64), "n_px": rg["n_px"], "area_um2": rg["area_um2"],
+                  "ecd_um": rg["ecd_um"], "is_edge": rg["is_edge"].astype(bool), "used": bused,
+                  "caliper_along_bd_um": shape["table"]["along_bd_um"],
+                  "caliper_across_bd_um": shape["table"]["across_bd_um"], "aspect": shape["table"]["aspect"]}
+    beta_part = {"recon": rid, "recon_backend": rstep.backend, "or_used": json.loads(
+        (ctx.project.root / rstep.outputs["summary"].path).read_text(encoding="utf-8")).get("or_used"),
+        "min_ecd_um": min_ecd, "ecd": dist_stats(rg["ecd_um"][bused], rg["area_um2"][bused]),
+        "caliper": shape["summary"], "bd_out_of_plane_deg": out_deg}
+    if bd is None:
+        warnings.append(BD_MISSING)
+        needs.append("build direction")
+    elif u is not None and out_deg <= 20.0:
+        bd_deg = float(np.degrees(np.arctan2(u[1], u[0])))
+        # chords only in grains >= min_ecd (fragments end chords like any boundary but are not counted)
+        count = np.zeros(int(max(pg.max(initial=0), rg["id"].max(initial=0))) + 1, bool)
+        count[rg["id"][(rg["ecd_um"] >= min_ecd) & (rg["n_px"] >= p.min_px)].astype(np.int64)] = True
+        for name, ang in (("across_bd", bd_deg + 90.0), ("along_bd", bd_deg)):
+            c = directional_intercepts(bgi, pg, ang, p.beta_line_spacing_um, sample, count)
+            full = ~c["truncated"]
+            beta_chords[f"{name}_um"] = c["length_um"][full]
+            beta_chords[f"{name}_label"] = c["label"][full]
+            beta_table[f"mean_chord_{name}_um"] = per_label_mean(c["label"][full], c["length_um"][full],
+                                                                 beta_table["id"])
+            beta_part[name] = {"direction_deg": c["direction_deg"], "mean_e112_um": c["mean_e112_um"],
+                               "n_complete": c["n_complete"], "n_truncated": c["n_truncated"],
+                               # length-weighted fit: ragged lath-scale boundaries between large grains
+                               # give many short chords that dominate the number distribution (D14)
+                               "complete_chords": dist_stats(c["length_um"][full], c["length_um"][full])}
+        n_trunc = beta_part["along_bd"]["n_truncated"]
+        if n_trunc > beta_part["along_bd"]["n_complete"]:
+            warnings.append("most chords along BD are cut by the map edge: prior-beta length along BD is a "
+                            "lower bound (columnar grains longer than the map)")
+    else:
+        warnings.append(f"build direction is {out_deg:.0f}° out of the map plane: no intercepts along/across BD")
+
+    return beta_part, beta_table, beta_chords
+
+
+def _grainsize_beta_only(ctx: OpContext, p: GrainSizeParams) -> None:
+    """grainsize.run started from the prior-beta map tab: prior-beta grains only (no alpha segmentation)."""
+    sheet = ctx.project.sample(p.map_id)
+    rid = p.recon or getattr(latest_step(ctx.project, ("recon.run",), map_id=p.map_id), "id", None)
+    if not rid:
+        raise KeyError(f"no prior-beta reconstruction of {p.map_id}: run the reconstruction first "
+                       "(EBSD tab, section 'Prior-β reconstruction', Apply)")
+    pm = step_npz(ctx, rid, "ebsd")
+    x, y = pm["x"], pm["y"]
+    step, grid = grid_info(x, y)
+    sample = p.sample_um or step / 4
+    gi = GridIndex(x, y, step)
+    warnings: list[str] = []
+    needs: list[str] = []
+    rb: dict[str, Any] = {"note": RESOLUTION_NOTE}
+    beta_part, beta_table, beta_chords = _prior_beta_part(ctx, p, rid, sheet, gi, x, y, step, sample, rb, warnings,
+                                                          needs)
+    rules = _rules(p)
+    rows = [_row("prior_beta_ecd", "um", "ECD of prior-beta grains (reconstruction)", beta_part["ecd"],
+                 rules=f"{rules}; ECD >= {beta_part['min_ecd_um']:g} um")]
+    rows += _beta_rows(p, beta_part, rules)
+    summary_table = _rows_to_table(rows)
+    p.recon = rid
+    summary = {"backend": ctx.backend.name, "map_id": p.map_id, "target": "prior_beta",
+               "input_state": sheet.input_state, "grains": None, "source_map": rid, "step_um": step, "grid": grid,
+               "rules": rules, "lath_partition": None, "params": p.model_dump(mode="json"), "alpha": None,
+               "colony": None, "prior_beta": beta_part, "retained_beta": rb, "warnings": warnings, "needs": needs}
+    ctx.params.update(recon=rid)
+    ctx.metrics.update(n_beta_grains=int(beta_table["used"].sum()))
+    sheets = {"Summary": summary_table, "Prior beta": beta_table,
+              "Parameters": {"parameter": np.array(list(_flat(summary["params"])), dtype=object),
+                             "value": np.array([str(v) for v in _flat(summary["params"]).values()], dtype=object)}}
+    ctx.output("summary", "json", _json(summary))
+    ctx.output("summary_table", "csv", summary_table)
+    ctx.output("prior_beta", "csv", beta_table)
+    ctx.output("workbook", "xlsx", sheets)
+    ctx.output("chords", "npz", {**beta_chords} or {"empty": np.zeros(0)})
+
+
+def _beta_rows(p: GrainSizeParams, beta_part: dict, rules: str) -> list[dict]:
+    rows = []
+    min_ecd = beta_part["min_ecd_um"]
+    for name, lab in (("across_bd", "width"), ("along_bd", "length")):
+        if name in beta_part:
+            b = beta_part[name]
+            rows.append(_row(f"prior_beta_{lab}_intercept", "um",
+                             f"complete chords {name.replace('_', ' ')} in grains with ECD >= "
+                             f"{min_ecd:g} um (direction {b['direction_deg']:.1f}°, spacing "
+                             f"{p.beta_line_spacing_um:g} um); E112 mean incl. edge chords counted half; "
+                             "area_weighted_* columns = line-length-weighted",
+                             b["complete_chords"], e112_mean=b["mean_e112_um"], n_truncated=b["n_truncated"]))
+    cs = beta_part["caliper"]
+    for key, lab in (("across_bd_um", "width"), ("along_bd_um", "length")):
+        if cs.get(key):
+            rows.append(_row(f"prior_beta_{lab}_caliper", "um", "per-grain caliper " + key[:-3].replace("_", " "),
+                             {"n": cs["n_used"], "mean": cs[key]["mean"], "median": cs[key]["median"],
+                              "area_weighted": {"mean": cs[key]["area_weighted_mean"],
+                                                "lognormal": {"mu": None, "sigma": None}}},
+                             rules=f"{rules}; ECD >= {cs['min_ecd_um']:g} um"))
+    return rows
 
 
 def _flat(d: dict, pre: str = "") -> dict:
@@ -354,7 +419,8 @@ class GrainSizeFigureParams(BaseModel):
     map_id: str
     kind: Literal["alpha_ecd", "alpha_ecd_area", "lath_thickness", "lath_minor_axis", "colony_ecd",
                   "colony_ecd_area", "beta_ecd", "beta_width", "beta_length", "colony_map"]
-    grainsize: str | None = None              # grainsize.run step (default newest of the map)
+    grainsize: str | None = None              # grainsize.run step (default newest of the map with that part)
+    bin_width_um: float | None = None         # histogram bin width (um); None = automatic (Freedman-Diaconis)
     width_cm: float | None = None
     dpi: int | None = None
 
@@ -367,14 +433,14 @@ def _read_csv(ctx: OpContext, step, name: str) -> dict[str, np.ndarray]:
 
 
 def _hist_chart(v: np.ndarray, w: np.ndarray | None, xlabel: str, title: str,
-                weight_label: str = "area") -> ChartSpec:
+                weight_label: str = "area", bin_width: float | None = None) -> ChartSpec:
     """Number histogram (count) with the number-weighted log-normal fit, or, with weights, the area-weighted
     histogram (% of area) with the area-weighted log-normal fit."""
     v = np.asarray(v, float)
     ok = np.isfinite(v) & (v > 0)
     v = v[ok]
     w = None if w is None else np.asarray(w, float)[ok]
-    e = hist_edges(v)
+    e = hist_edges(v, bin_width=bin_width)
     bw = float(e[1] - e[0])
     xs = np.linspace(e[0] + bw / 20, e[-1], 300)
     s = dist_stats(v, w)
@@ -402,6 +468,20 @@ def golden_colors(ids: np.ndarray) -> np.ndarray:
     return np.array([colorsys.hsv_to_rgb(a, b, 0.95) for a, b in zip(h, s)]).reshape(-1, 3)
 
 
+def grainsize_step_for(project, map_id: str, part: str) -> str | None:
+    """Newest non-stale grainsize.run of a map that has the alpha or the prior-beta part."""
+    ok = ("all", "alpha", None) if part == "alpha" else ("all", "prior_beta", None)
+    for s in reversed(project.recipe().steps):
+        if s.op == "grainsize.run" and not s.stale and s.params.get("map_id") == map_id \
+                and s.params.get("target") in ok:
+            if part == "prior_beta" and s.params.get("target") in ("all", None):
+                summ = project.root / s.outputs["summary"].path
+                if not json.loads(summ.read_text(encoding="utf-8")).get("prior_beta"):
+                    continue
+            return s.id
+    return None
+
+
 @op("grainsize.figure", GrainSizeFigureParams, uses_backend=True)
 def _grainsize_figure(ctx: OpContext) -> None:
     """Histograms with log-normal fits (alpha ECD number / area-weighted, lath thickness by intercept and by
@@ -410,7 +490,10 @@ def _grainsize_figure(ctx: OpContext) -> None:
     from .settings import load_settings  # noqa: PLC0415
 
     p = GrainSizeFigureParams.model_validate(ctx.params)
-    sid = resolve_source(ctx, p.map_id, p.grainsize, ("grainsize.run",))
+    sid = p.grainsize or grainsize_step_for(ctx.project, p.map_id, "prior_beta" if p.kind.startswith("beta") else "alpha")
+    if sid is None:
+        raise KeyError(f"no grain size of the {'prior-β' if p.kind.startswith('beta') else 'α'} map of {p.map_id}: "
+                       "run Grain size (Apply) on that map tab first")
     s = ctx.project.recipe().step(sid)
     if s.backend != ctx.backend.name:
         raise ValueError(f"grain size {sid} was computed by {s.backend}; a figure always comes from the engine that "
@@ -456,36 +539,40 @@ def _grainsize_figure(ctx: OpContext) -> None:
             t = _read_csv(ctx, s, "alpha_grains")
             used, lath = t["used"].astype(bool), t["is_lath"].astype(bool)
             if p.kind == "alpha_ecd":
-                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}")
+                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}", bin_width=p.bin_width_um)
             elif p.kind == "alpha_ecd_area":
                 c = _hist_chart(t["ecd_um"][used], t["area_um2"][used], "alpha grain ECD (µm)",
-                                "alpha grains, area-weighted")
+                                "alpha grains, area-weighted", bin_width=p.bin_width_um)
             elif p.kind == "lath_thickness":
                 c = _hist_chart(t["thickness_intercept_um"][lath], None, "lath thickness, intercept ⊥ long axis (µm)",
-                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath")
+                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath", bin_width=p.bin_width_um)
             else:
                 c = _hist_chart(t["ellipse_minor_um"][lath], None, "lath minor axis 2b (µm)",
-                                "alpha laths, second-moment ellipse")
+                                "alpha laths, second-moment ellipse", bin_width=p.bin_width_um)
         elif p.kind in ("colony_ecd", "colony_ecd_area"):
             t = _read_csv(ctx, s, "colonies")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], t["area_um2"][used] if p.kind == "colony_ecd_area" else None,
-                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""))
+                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""), bin_width=p.bin_width_um)
         elif p.kind == "beta_ecd":
             t = _read_csv(ctx, s, "prior_beta")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], None, "prior-β grain ECD (µm)",
-                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}")
+                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}", bin_width=p.bin_width_um)
         else:
             name = "across_bd" if p.kind == "beta_width" else "along_bd"
             ch = step_npz(ctx, sid, "chords")
             if f"{name}_um" not in ch:
+                if "build direction" in (summ.get("needs") or []):
+                    from .sample import SheetIncomplete  # noqa: PLC0415
+
+                    raise SheetIncomplete(p.map_id, "build direction", "The prior-β width / length histogram")
                 raise ValueError("no intercepts relative to the build direction in this step")
             b = summ["prior_beta"][name]
             c = _hist_chart(ch[f"{name}_um"], ch[f"{name}_um"],
                             f"prior-β {'width (chords across BD)' if name == 'across_bd' else 'length (chords along BD)'} (µm)",
                             f"complete chords, length-weighted; E112 mean {b['mean_e112_um']:.1f} µm "
-                            f"({b['n_truncated']} edge chords counted half)", "line length")
+                            f"({b['n_truncated']} edge chords counted half)", "line length", bin_width=p.bin_width_um)
         c.width_cm, c.dpi = width, dpi
         meta["n"] = int(np.isfinite(np.asarray(c.heights, float)).sum())
         ctx.backend.render_chart(c, out_png)

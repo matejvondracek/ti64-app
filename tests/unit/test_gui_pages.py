@@ -67,12 +67,13 @@ async def test_ebsd_tab_reconstruction_and_figure(crop300_ju02):
         user.find(marker="sec_recon").click()
         user.find("run_recon").click()
         await user.should_see("reconstruction done", retries=400)
-        # the prior-beta MAP gets the focus (own map tab, no boundaries); the numbers are on the Results tab
+        # the prior-beta MAP gets the focus (own map tab with the prior-beta boundaries of the parent grains,
+        # fix 2); the numbers are on the Results tab
         await user.should_see("Prior-β map shown", retries=200)
         assert user.find(marker="mtab_beta").elements.pop().visible
         await user.should_see(marker="map_viewer", retries=200)
         assert Project.open(p.root).gui_state()["mtab"]["JU02_c300"] == "beta"
-        assert Project.open(p.root).gui_state()["overlays"]["JU02_c300"]["beta"] == []
+        assert Project.open(p.root).gui_state()["overlays"]["JU02_c300"]["beta"] == ["beta_gb"]
         user.find(marker="rtab_results").click()
         await user.should_see("merge sweep")
         await user.should_see(marker="recon_summary")

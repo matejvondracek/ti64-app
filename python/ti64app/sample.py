@@ -94,12 +94,26 @@ class MapPosition(BaseModel):
         return self
 
 
+class SheetIncomplete(ValueError):
+    """A step needs a value of the map sheet that the user has not entered (e.g. the build direction). Loading and
+    most steps work without it; only the steps that need it raise this, naming what is missing and where to enter it.
+    The GUI shows it with an 'Open map sheet' button (Files tab, this file selected)."""
+
+    def __init__(self, map_id: str, missing: str, needed_for: str) -> None:
+        self.map_id, self.missing, self.needed_for = map_id, missing, needed_for
+        super().__init__(f"{needed_for} needs the {missing} of map {map_id!r}; enter it on the Files tab "
+                         f"(select the file, section 'Map sheet')")
+
+
 class SampleSheet(BaseModel):
+    """Effective sheet of one map. Only the map ID, file and input state are needed to load it (phase 6.6 fix 2):
+    the sample and the build direction may still be missing; steps that need the build direction call
+    require_build_direction()."""
     map_id: str
-    specimen_id: str = Field(min_length=1)
+    specimen_id: str | None = Field(None, min_length=1)
     map_file: str
     input_state: InputState
-    build_direction: BuildDirection
+    build_direction: BuildDirection | None = None
     bending: FourPointBending | None = None
     position: MapPosition | None = None
     material: str = "Ti-6Al-4V"
@@ -206,27 +220,60 @@ def effective(m: MapInfo, s: SampleInfo | None, which: str) -> tuple[object, boo
 
 
 def effective_sheet(m: MapInfo, s: SampleInfo | None) -> SampleSheet:
-    """The SampleSheet the EBSD ops use: map values + inherited sample values. Raises with a plain message if
-    something the user must enter is missing (never guessed)."""
-    miss = []
-    if s is None:
-        miss.append("assign the file to a sample")
-    if m.input_state is None:
-        miss.append("input state (raw / OIM-cleaned)")
-    if m.build_direction is None:
-        miss.append("build direction in map coordinates")
-    if miss:
-        raise KeyError(f"map {m.id!r} is not complete; enter on the Files tab: " + ", ".join(miss))
-    return SampleSheet(map_id=m.id, specimen_id=s.id, map_file=m.file, input_state=m.input_state,
+    """The SampleSheet the EBSD ops use: map values + inherited sample values. Loads with whatever is known: the
+    input state falls back to the suggestion from the file name (CLAUDE.md: auto-suggested, the user can change it);
+    sample and build direction stay None until entered (never guessed), see require_build_direction()."""
+    return SampleSheet(map_id=m.id, specimen_id=s.id if s else None, map_file=m.file,
+                       input_state=m.input_state or suggest_input_state(m.file),
                        build_direction=m.build_direction, bending=effective(m, s, "bending")[0], position=m.position,
                        material=effective(m, s, "material")[0] or "", process=effective(m, s, "process")[0] or "",
                        notes=m.notes)
+
+
+def require_build_direction(sheet: SampleSheet, needed_for: str) -> BuildDirection:
+    """The build direction of a map, or SheetIncomplete naming the step that needs it."""
+    if sheet.build_direction is None:
+        raise SheetIncomplete(sheet.map_id, "build direction", needed_for)
+    return sheet.build_direction
+
+
+SHEET_RESULT_KEYS = ("map_file", "input_state", "build_direction", "bending", "position")
+BD_OPS = ("grainsize.run", "grainsize.figure", "grainsize.compare_oim")   # use the build direction (length / width)
+
+
+def stale_on_sheet_change(map_id: str, old: dict | None, new: dict):
+    """Which steps of a map a sheet change makes stale (predicate on RecipeStep). File or input state: everything of
+    the map (the cleanup preset depends on it). Build direction: only what uses it (grain size along / across BD,
+    figures / exports coloured along 'build'), so entering it after loading keeps the loaded map, grains and
+    reconstruction. Position / 4PB: nothing yet (no step uses them; the 4PB stress map will)."""
+    import json  # noqa: PLC0415
+
+    changed = {k for k in SHEET_RESULT_KEYS if (old or {}).get(k) != (new or {}).get(k)}
+    if old is None or changed & {"map_file", "input_state"}:
+        return lambda s: s.params.get("map_id") == map_id
+    if "build_direction" in changed:
+        return lambda s: s.params.get("map_id") == map_id and (s.op in BD_OPS or '"build"' in json.dumps(s.params))
+    return lambda s: False
+
+
+def missing_fields(m: MapInfo) -> list[str]:
+    """What the user has not entered yet for a map (shown as hints; nothing here blocks loading)."""
+    out = []
+    if m.sample_id is None:
+        out.append("sample")
+    if m.input_state is None:
+        out.append("input state (suggested from the file name until set)")
+    if m.build_direction is None:
+        out.append("build direction")
+    return out
 
 
 def split_sheet(sheet: SampleSheet, sample: SampleInfo | None) -> tuple[SampleInfo, dict]:
     """Legacy SampleSheet -> (SampleInfo, MapInfo fields). Values that differ from an existing sample become
     per-file overrides, so effective_sheet() gives the same sheet back."""
     if sample is None:
+        if not sheet.specimen_id:
+            raise ValueError("specimen_id is required to store a sheet")
         sample = SampleInfo(id=sheet.specimen_id, material=sheet.material, process=sheet.process,
                             bending=sheet.bending)
     m = {"input_state": sheet.input_state, "build_direction": sheet.build_direction, "position": sheet.position,

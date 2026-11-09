@@ -452,3 +452,140 @@ def test_mosaic_export_formats(project, tmp_path):
         e3 = service.run(project, "sem.export", {"stitch": st.id, "format": fmt, "scale_bar": False})
         assert (project.root / e3.outputs["export"].path).stat().st_size > 1000
     assert service.replay(project).ok
+
+
+# ---- fix 2 of the 6.6 user test: stage axes that are not recorded (JU04), repeats --------------------------------
+def _flatten_stage(folder, y_mm=0.237, x_by_num=None):
+    """Rewrite the .txt files like JU04: stage Y the same in every image (and X per column if given)."""
+    import re
+    for f in folder.glob("*.txt"):
+        s = f.read_text(encoding="utf-8")
+        num = int(re.search(r"\$SM_IMAGE_NUMBER (\d+)", s).group(1))
+        x, y = (float(v) for v in re.search(r"\$CM_STAGE_POSITION ([\d.]+) ([\d.]+)", s).groups())
+        x = x_by_num.get(num, x) if x_by_num else x
+        f.write_text(re.sub(r"\$CM_STAGE_POSITION [\d.]+ [\d.]+", f"$CM_STAGE_POSITION {x:.3f} {y_mm:.3f}", s),
+                     encoding="utf-8")
+
+
+JU04_LIKE = [(0.0, 0.0), (381.3, 2.4), (14.6, 405.2), (393.8, 401.7)]    # two columns of two, ~20 % overlap
+
+
+def test_stage_analysis_unknown_axis_and_repeats(tmp_path):
+    make_tiles(tmp_path, JU04_LIKE)
+    # columns: same stage X per column (as JU04: images of one column share the position), Y constant
+    _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0, 9773: 0.980, 9774: 0.980})
+    tl = stitching.scan(tmp_path)
+    sa = stitching.stage_analysis(tl)
+    assert sa["unknown_axes"] == ["Y"] and sa["spread_um"][1] == 0.0
+    assert sa["identical"] == [["9771", "9772"], ["9773", "9774"]]
+    assert sa["repeats"] == [["9771", "9772"], ["9773", "9774"]]
+    assert "stage Y is 0.237 mm in all 4 images" in sa["message"] and "not in the metadata" in sa["message"]
+    # legitimate single column (X constant, Y stepped, no identical positions): X unknown, Y known, no repeats
+    col = tmp_path / "col"
+    col.mkdir()
+    make_tiles(col, [(0.0, 0.0), (381.3, 2.4), (760.0, -1.0)])
+    sb = stitching.stage_analysis(stitching.scan(col))
+    assert sb["unknown_axes"] == ["X"] and not sb["repeats"]
+    # the Arrange preview spreads the images of one position along the unknown axis (rows), image-number order
+    lay = stitching.layout_preview(tl)
+    ys = {t["image_number"]: t["y"] for t in lay["tiles"]}
+    assert ys[9772] - ys[9771] > TH and ys[9774] - ys[9773] > TH and lay["unknown_axes"] == ["Y"]
+
+
+def test_unknown_axis_found_by_matching(tmp_path):
+    """JU04: the vertical position is not in the metadata; Stitch searches it over the full range (X from the
+    stage), places every tile within a pixel, and reports the repeats as not confirmed."""
+    files, pos = make_tiles(tmp_path, JU04_LIKE)
+    _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0, 9773: 0.980, 9774: 0.980})
+    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")["BSE"].info
+    err = _rel(side, pos, [f.stem for f in files])
+    assert np.abs(err).max() < 1.0, err
+    assert side["stage_only_tiles"] == [] and side["stage_map"]["unknown_axes"] == ["Y"]
+    assert side["misalignment_px"]["max"] < 0.5
+    notes = " ".join(side["notes"])
+    assert "not in the metadata" in notes and "possible repeats" in notes and "not repeats" in notes
+    assert side["stage_to_mosaic"]["unknown_axes"] == ["Y"] and side["stage_to_mosaic"]["fitted_axes"] == ["X"]
+    # the old behaviour (stage prior with Y = constant) put the two rows on top of each other: forcing the default
+    # stage map (no unknown-axis search) shows it
+    old = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), stage_map="default"), tmp_path / "o2")
+    assert np.abs(_rel(old["BSE"].info, pos, [f.stem for f in files])).max() > 100
+
+
+def test_repeat_confirmed(tmp_path):
+    """Two images of the same field (same stage position and magnification) are confirmed as a repeat."""
+    make_tiles(tmp_path, [(0.0, 0.0), (0.4, -0.3)], seed=4)
+    _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0})
+    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")["BSE"].info
+    assert side["stage_map"]["unknown_axes"] == ["X", "Y"]
+    assert any("repeat confirmed" in q and "9771 = 9772" in q for q in side["notes"])
+
+
+def test_export_estimate_and_guard():
+    from ti64app.ops_stitch import export_estimate
+
+    ok = export_estimate((5000, 4000), (5000, 4000), "png")
+    assert ok["level"] == "ok" and ok["ok"]
+    big = export_estimate((9767, 22453), (9767, 22453), "png")         # the 6.6 user test mosaic: works, warned
+    assert big["level"] == "warn" and big["ok"] and "BigTIFF" in big["message"]
+    huge = export_estimate((40000, 60000), (40000, 60000), "png")
+    assert huge["level"] == "refuse" and not huge["ok"]
+    assert [a["fraction"] for a in huge["alternatives"]] == ["1/2", "1/4", "1/8"]
+    assert export_estimate((30000, 40000), (30000, 40000), "bigtiff")["ok"]
+    assert export_estimate((40000, 30000), (40000, 30000), "tiff")["level"] == "refuse"     # > 4 GB classic TIFF
+
+
+def test_png_hash_large_image_streamed(tmp_path):
+    """Output hashes of images above PIL's decompression-bomb limit (the cause of the failed mosaic export); the
+    streamed hash equals the old full-array hash."""
+    from ti64app.hashing import array_hash, png_hash
+
+    a = np.random.default_rng(0).integers(0, 255, (300, 700), dtype=np.uint8)
+    f = tmp_path / "a.png"
+    Image.fromarray(a).save(f)
+    assert png_hash(f) == array_hash({"rgba": np.asarray(Image.open(f).convert("RGBA"))})
+    old = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = 1000                       # pretend the image is above the limit
+    try:
+        assert png_hash(f).startswith("sha256:")
+    finally:
+        Image.MAX_IMAGE_PIXELS = old
+
+
+def test_mosaic_export_fractions_bigtiff_one_scale_bar(project, tmp_path, monkeypatch):
+    """Fix 15-17: 1/2, 1/4, 1/8 of the original; tiled BigTIFF; with the (generated) info strip the viewer's scale
+    bar is left out (only the strip's own bar); a size that does not fit in memory is refused BEFORE the export."""
+    import tifffile
+    from PIL import Image
+
+    from ti64app import ops_stitch
+
+    make_tiles(tmp_path, GRID[:2])
+    st = service.run(project, "sem.stitch", {"folder": str(tmp_path), "info_strip": "generate"})
+    side = json.loads((project.root / st.outputs["sidecar_BSE"].path).read_text(encoding="utf-8"))
+    w, h = side["mosaic_px"]
+    sh = side["strip"]["height_px"]
+    bar = [{"kind": "scale_bar", "x": 0.03, "y": 0.8, "w": 0.2}]
+    for k in (2, 4, 8):
+        e = service.run(project, "sem.export", {"stitch": st.id, "mode": "scale", "scale": 1 / k, "legends": bar,
+                                                "info_strip": False})
+        meta = json.loads((project.root / e.outputs["sidecar"].path).read_text(encoding="utf-8"))
+        assert meta["image_px"] == [-(-w // k), -(-h // k)] and abs(meta["pixel_size_um"] - PS * k) < 1e-9
+        assert meta["scale_bar"] is True and meta["scale_bar_source"] == "image"
+    # with the info strip: one scale bar only (the strip's); the image area is untouched by the viewer's bar
+    a = service.run(project, "sem.export", {"stitch": st.id, "legends": bar, "info_strip": True})
+    b = service.run(project, "sem.export", {"stitch": st.id, "legends": [], "info_strip": True})
+    meta = json.loads((project.root / a.outputs["sidecar"].path).read_text(encoding="utf-8"))
+    assert meta["scale_bar_left_out"] and meta["scale_bar_source"] == "info strip" and meta["legends"] == []
+    with Image.open(project.root / a.outputs["export"].path) as ia, Image.open(project.root / b.outputs["export"].path) as ib:
+        assert np.array_equal(np.asarray(ia), np.asarray(ib)) and ia.height == h + sh
+    # tiled BigTIFF
+    t = service.run(project, "sem.export", {"stitch": st.id, "format": "bigtiff", "info_strip": False})
+    f = project.root / t.outputs["export"].path
+    with tifffile.TiffFile(f) as tf:
+        assert tf.is_bigtiff and tf.pages[0].is_tiled and tf.pages[0].shape == (h, w)
+    # refused before anything is written, with the alternatives in the message
+    monkeypatch.setattr(ops_stitch, "MEMORY_BUDGET", 1000)
+    n = len(project.recipe().steps)
+    with pytest.raises(ValueError, match=r"export not possible: .*1/2, 1/4, 1/8.*BigTIFF"):
+        service.run(project, "sem.export", {"stitch": st.id, "format": "png"})
+    assert len(project.recipe().steps) == n

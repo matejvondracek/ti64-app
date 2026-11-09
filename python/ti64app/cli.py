@@ -144,6 +144,10 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--scan", action="store_true", help="only show the detector counts / data bars, do not stitch")
     st.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd not in (None, "gui", "mcp"):         # GUI / MCP set up their own log file
+        from .logs import setup_logging  # noqa: PLC0415
+
+        setup_logging("cli")
     if a.cmd == "backends":
         from .backends import backend_status  # noqa: PLC0415
 

@@ -1,7 +1,17 @@
 """MATLAB backend: MATLAB R2025b + MTEX 7.2 through the MATLAB Engine (`matlabengine==25.2.*`).
 
-- One persistent engine per Python process, started lazily on first use (startup ~10-20 s).
-- MTEX objects stay in the MATLAB session (ti64.store) and are referenced by ID.
+- One persistent engine per Python process, started lazily on first use (startup ~10-20 s). It is always a NEW
+  MATLAB process without the desktop (-nodesktop -nosplash); the app never attaches to the user's open MATLAB
+  (no connect_matlab / find_matlab / shared sessions), so a crash of the desktop (e.g. its clipboard service,
+  docs/decisions.md D23) cannot take the app down and the app cannot disturb the user's session.
+- Logs: the engine's command-window output goes to %APPDATA%/ti64app/logs/matlab-engine-<python pid>.log
+  (-logfile), MATLAB crash dumps to the same folder (MATLAB_LOG_DIR).
+- Every call runs in the background and is watched: if the engine raises an EngineError with the MATLAB process
+  gone, the process disappears, or a crash dump of the engine's process appears (MATLAB may keep a crashed process
+  alive), the process is killed, a new engine is started once and EngineRestarted is raised with a plain-language
+  message. Objects of the old session are gone; handles() then lists only the new session's objects, so the service
+  layer rebuilds what a rerun needs (service.materialize). A start longer than START_TIMEOUT_S is aborted.
+- MTEX objects stay in the MATLAB session (ti64.store) and are referenced by ID (random, never reused).
 - Per-pixel arrays move to Python through temporary HDF5 files (ti64.exportEbsd + h5py),
   never element by element through the engine.
 - If MATLAB, the engine package or MTEX is missing, the backend reports itself as unavailable.
@@ -10,19 +20,46 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import logging
 import os
+import shutil
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
 from .. import __version__
-from ..settings import REPO_ROOT, load_settings
+from ..settings import REPO_ROOT, load_settings, logs_dir
 from .base import (BackendUnavailable, ChartSpec, CleanupParams, ColonyParams, CleanupReport, EBSDData, EBSDHandle,
-                   GrainParams, GrainsData, GrainsHandle, LoadParams, MapParams, ReconData, RenderSpec)
+                   EngineRestarted, GrainParams, GrainsData, GrainsHandle, LoadParams, MapParams, ReconData,
+                   RenderSpec)
 
 MATLAB_DIR = REPO_ROOT / "matlab"
+START_OPTIONS = "-nodesktop -nosplash"
+START_TIMEOUT_S = float(os.environ.get("TI64_MATLAB_START_TIMEOUT", "240"))
+WATCH_S = 2.0                # how often the MATLAB process / crash dumps are checked during a call
+log = logging.getLogger("ti64app.matlab")
+
+
+class _EngineDied(Exception):
+    """Internal: the MATLAB process of the engine is gone or crashed."""
+
+    def __init__(self, reason: str, crash_dump: str | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.crash_dump = crash_dump
+
+
+def _create_time(pid: int) -> float:
+    """Start time of a process (0 if it does not exist): a pid alone can be reused by another process."""
+    try:
+        import psutil  # noqa: PLC0415
+
+        return psutil.Process(pid).create_time()
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 class MatlabBackend:
@@ -30,8 +67,16 @@ class MatlabBackend:
 
     def __init__(self) -> None:
         self._eng = None
-        self._lock = threading.Lock()
+        self._pid: int | None = None          # MATLAB process of the current engine
+        self._pid_started = 0.0
+        self._t_start = 0.0
+        self._lock = threading.RLock()
         self._log = io.StringIO()
+        self._futures: set = set()            # running calls (cancel_running)
+        self.log_file: Path | None = None     # MATLAB -logfile of the current engine
+        self.generation = 0                   # +1 per engine start (0 = never started)
+        self.restarts = 0                     # restarts after a crash in this Python process
+        self.notice: str | None = None        # last restart message (GUI: show once via pop_notice)
 
     # -- availability -------------------------------------------------------------------------
     def is_available(self) -> bool:
@@ -62,17 +107,180 @@ class MatlabBackend:
                 reason = self.unavailable_reason()
                 if reason:
                     raise BackendUnavailable(reason)
-                import matlab.engine  # noqa: PLC0415  (optional dependency)
-
-                eng = matlab.engine.start_matlab("-nodesktop -nosplash")
-                eng.addpath(str(MATLAB_DIR), nargout=0)
-                eng.ti64.setupMtex(load_settings().paths.mtex_path, nargout=0, stdout=self._log)
-                self._eng = eng
+                self._start()
             return self._eng
 
+    @staticmethod
+    def _engine_module():
+        import matlab.engine  # noqa: PLC0415  (optional dependency)
+
+        return matlab.engine
+
+    def _start(self) -> None:
+        """Start a NEW MATLAB process without the desktop (never attach to an open MATLAB), within a time limit."""
+        from ..logs import prune  # noqa: PLC0415
+
+        me = self._engine_module()
+        d = logs_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        self.log_file = d / f"matlab-engine-{os.getpid()}.log"
+        prune("matlab-engine-*.log", keep=10)
+        prune("matlab_crash_dump*", keep=10)
+        os.environ["MATLAB_LOG_DIR"] = str(d)          # crash dumps of the engine go next to its log
+        opts = f'{START_OPTIONS} -logfile "{self.log_file}"'
+        log.info("starting MATLAB engine: %s", opts)
+        t0 = time.time()
+        fut = me.start_matlab(opts, background=True)
+        try:
+            eng = fut.result(timeout=START_TIMEOUT_S)
+        except me.TimeoutError as e:
+            try:
+                fut.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            raise BackendUnavailable(f"MATLAB did not start within {START_TIMEOUT_S:.0f} s (log: {self.log_file}). "
+                                     "Check the MATLAB licence / installation, or choose the pymtex backend in "
+                                     "Settings.") from e
+        except Exception as e:  # noqa: BLE001
+            raise BackendUnavailable(f"MATLAB could not be started: {e} (log: {self.log_file})") from e
+        self._eng = eng
+        try:
+            self._pid = int(eng.feature("getpid"))
+            self._pid_started = _create_time(self._pid)
+            eng.addpath(str(MATLAB_DIR), nargout=0)
+            eng.ti64.setupMtex(load_settings().paths.mtex_path, nargout=0, stdout=self._log)
+        except Exception as e:  # noqa: BLE001
+            self._forget_engine(kill=True)
+            raise BackendUnavailable(f"MATLAB started but MTEX could not be set up: {e} (log: {self.log_file})") from e
+        self._t_start = t0
+        self.generation += 1
+        log.info("MATLAB engine %d started in %.1f s (pid %s)", self.generation, time.time() - t0, self._pid)
+
     def call(self, fn: str, *args, nargout: int = 1):
-        """Call a MATLAB function by name; MTEX console output goes to self.log."""
-        return self.engine().feval(fn, *args, nargout=nargout, stdout=self._log, stderr=self._log)
+        """Call a MATLAB function by name; MTEX console output goes to self.log. If MATLAB dies during the call,
+        a new engine is started and EngineRestarted is raised (plain-language message; run the step again)."""
+        me = self._engine_module()
+        eng = self.engine()
+        gen = self.generation
+        try:
+            fut = eng.feval(fn, *args, nargout=nargout, stdout=self._log, stderr=self._log, background=True)
+            return self._wait(fut)
+        except _EngineDied as e:
+            self._recover(gen, fn, e.reason, e.crash_dump)
+        except (me.EngineError, me.RejectedExecutionError, SystemError) as e:
+            if not self._dead_soon():
+                raise                          # an engine error while MATLAB is still running
+            self._recover(gen, fn, "the MATLAB process ended", self._crash_dump())
+        except me.CancelledError:
+            raise InterruptedError(f"MATLAB call {fn} was cancelled") from None
+
+    def _wait(self, fut):
+        """Result of a background call; watches the MATLAB process while waiting (never hangs on a dead engine)."""
+        me = self._engine_module()
+        self._futures.add(fut)
+        try:
+            while True:
+                try:
+                    return fut.result(timeout=WATCH_S)     # returns as soon as the call is done
+                except me.TimeoutError:
+                    pass
+                dump = self._crash_dump()
+                if dump:
+                    raise _EngineDied("MATLAB crashed", dump)
+                if not self._alive():
+                    raise _EngineDied("the MATLAB process ended")
+        finally:
+            self._futures.discard(fut)
+
+    def cancel_running(self) -> int:
+        """Ask MATLAB to cancel the calls that are running (e.g. Cancel in the GUI). Returns how many."""
+        n = 0
+        for f in list(self._futures):
+            try:
+                n += bool(f.cancel())
+            except Exception:  # noqa: BLE001
+                pass
+        return n
+
+    def _alive(self) -> bool:
+        if self._pid is None:
+            return self._eng is not None
+        return self._pid_started > 0 and _create_time(self._pid) == self._pid_started
+
+    def _dead_soon(self, wait_s: float = 5.0) -> bool:
+        """After an EngineError: is the MATLAB process gone (or crashed)? A killed process can still be listed for a
+        moment, so this waits up to `wait_s`."""
+        t_end = time.monotonic() + wait_s
+        while True:
+            if not self._alive() or self._crash_dump():
+                return True
+            if time.monotonic() >= t_end:
+                return False
+            time.sleep(0.1)
+
+    def _crash_dump(self) -> str | None:
+        """A MATLAB crash dump of the engine's process written since it started (logs folder or %TEMP%)."""
+        if self._pid is None:
+            return None
+        for folder in {logs_dir(), Path(tempfile.gettempdir())}:
+            for f in folder.glob(f"matlab_crash_dump.{self._pid}-*"):
+                try:
+                    if f.stat().st_mtime >= self._t_start - 1:
+                        return str(f)
+                except OSError:
+                    pass
+        return None
+
+    def _forget_engine(self, kill: bool) -> None:
+        """Drop the current engine; kill its MATLAB process if it is still there (crashed but alive)."""
+        if kill and self._pid is not None and self._alive():
+            try:
+                import psutil  # noqa: PLC0415
+
+                psutil.Process(self._pid).kill()
+            except Exception:  # noqa: BLE001
+                pass
+        eng, self._eng, self._pid, self._pid_started = self._eng, None, None, 0.0
+        self._futures.clear()
+        if eng is not None:                      # release the dead session now (else __del__ raises at exit)
+            try:
+                eng.exit()
+            except Exception:  # noqa: BLE001  ("MATLAB process cannot be terminated": it is gone)
+                getattr(eng, "__dict__", {}).pop("_matlab", None)
+        try:                                     # matlab.engine would try to exit the dead engine at interpreter exit
+            me = self._engine_module()
+            me._engines[:] = [w for w in me._engines if w() is not eng]
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _recover(self, gen: int, fn: str, reason: str, crash_dump: str | None) -> None:
+        """MATLAB died during `fn`: kill what is left, start a new engine once, raise EngineRestarted."""
+        with self._lock:
+            if crash_dump and Path(crash_dump).parent != logs_dir():
+                try:
+                    crash_dump = str(shutil.copy2(crash_dump, logs_dir() / Path(crash_dump).name))
+                except OSError:
+                    pass
+            old_log = self.log_file
+            log.error("MATLAB engine %d died during %s: %s (log %s, crash dump %s)", gen, fn, reason, old_log,
+                      crash_dump)
+            if self.generation == gen:           # not yet restarted by another thread
+                self._forget_engine(kill=True)
+                self.restarts += 1
+                try:
+                    self._start()
+                except BackendUnavailable as e:
+                    self.notice = f"MATLAB stopped unexpectedly ({reason}) and could not be restarted: {e}"
+                    raise BackendUnavailable(self.notice) from None
+            where = f"Crash report: {crash_dump}" if crash_dump else f"MATLAB log: {old_log}"
+            self.notice = (f"MATLAB stopped unexpectedly ({reason}) and was restarted. Maps kept in MATLAB were "
+                           f"lost; they are reloaded automatically when you run the step again. {where}")
+            raise EngineRestarted(self.notice, log_file=str(old_log) if old_log else None, crash_dump=crash_dump)
+
+    def pop_notice(self) -> str | None:
+        """The last restart message, once (for a GUI notification)."""
+        n, self.notice = self.notice, None
+        return n
 
     @property
     def log(self) -> str:
@@ -85,9 +293,12 @@ class MatlabBackend:
         with self._lock:
             if self._eng is not None:
                 try:
-                    self._eng.quit()
+                    if self._alive():
+                        self._eng.quit()
+                except Exception:  # noqa: BLE001  (already dead)
+                    pass
                 finally:
-                    self._eng = None
+                    self._forget_engine(kill=False)
 
     def versions(self) -> dict[str, str]:
         return {"app": __version__, "matlab": str(self.call("version")),
@@ -356,9 +567,16 @@ class MatlabBackend:
 
     def release(self, handle: EBSDHandle) -> None:
         if self.running:
-            self.call("ti64.store", "remove", handle.id, nargout=0)
+            try:
+                self.call("ti64.store", "remove", handle.id, nargout=0)
+            except EngineRestarted:
+                pass                             # gone with the old session
 
     def handles(self) -> list[str]:
+        """IDs of the objects in the CURRENT MATLAB session ([] without an engine; after a restart only new ones)."""
         if not self.running:
             return []
-        return [str(h) for h in self.call("ti64.store", "list")]
+        try:
+            return [str(h) for h in self.call("ti64.store", "list")]
+        except EngineRestarted:
+            return []                            # the old objects are gone; callers rebuild them

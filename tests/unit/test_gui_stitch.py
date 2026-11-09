@@ -1,5 +1,7 @@
 """Stitch tab (NiceGUI simulated user) on synthetic JEOL tiles: stitch sets, checklist, Arrange view, the greyed
-"keep the original data bar" option, Stitch / Refine (manual layout recorded), Overlaps (difference image)."""
+"keep the original data bar" option, ONE Stitch button (stage positions; after a drag on the Arrange tab the manual
+layout + search radius are recorded; no Refine button), Overlaps (difference image)."""
+import asyncio
 import sys
 
 import pytest
@@ -47,7 +49,7 @@ def test_single_column_from_layout(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_stitch_page_sets_arrange_refine(tmp_path):
+async def test_stitch_page_sets_arrange_one_button(tmp_path):
     folder = tmp_path / "tiles"
     folder.mkdir()
     make_tiles(folder, GRID[:4], det="BED-C")
@@ -73,15 +75,61 @@ async def test_stitch_page_sets_arrange_refine(tmp_path):
         strip = user.find(marker="st_strip").elements.pop()
         keep = next(o for o in strip._props["options"] if strip._values[o["value"]] == "keep")
         assert keep["disable"] and "single column" in keep["reason"]
-        # Refine: register from the positions in the Arrange view (recorded as manual_layout)
-        user.find(marker="st_refine").click()
+        await user.should_not_see(marker="st_refine")             # one button only (fix 14)
+        # Stitch from the stage positions
+        user.find(marker="st_run").click()
         await user.should_see(marker="st_summary_BSE", retries=400)
         await user.should_see(marker="st_pairs_BSE")
         await user.should_see(marker="st_overlap_select")
         await user.should_see(marker="st_overlap_info", retries=100)
+        # drag one tile on the Arrange tab, Stitch again: registered within the search radius of these positions
+        lay = {t["key"]: (t["x"], t["y"]) for t in arr._props["tiles"]}
+        user.find(marker="st_arrange").trigger("moved", {"moves": [{"key": "9772", "x": lay["9772"][0] + 12,
+                                                                    "y": lay["9772"][1] - 7}]})
+        user.find(marker="st_run").click()
+        for _ in range(400):
+            if len([s for s in Project.open_or_create("gst").recipe().steps if s.op == "sem.stitch"]) == 2:
+                break
+            await asyncio.sleep(0.05)
     p = Project.open_or_create("gst")
     steps = [s for s in p.recipe().steps if s.op == "sem.stitch"]
-    assert len(steps) == 1
+    assert len(steps) == 2
     prm = steps[0].params
     assert prm["detector"] == "BSE" and prm["blend"] == "seam" and len(prm["files"]) == 4
+    assert not prm["manual_layout"] and prm["refine_radius"] == 0.1
+    prm = steps[1].params
     assert set(prm["manual_layout"]) == {"9771", "9772", "9773", "9774"} and prm["refine_radius"] == 0.1
+
+
+@pytest.mark.anyio
+async def test_mosaic_export_dialog_fractions_and_size_guard(tmp_path):
+    """Fix 15-17: the mosaic export offers 1, 1/2, 1/4, 1/8 and BigTIFF; a size that does not fit in memory is
+    refused before exporting (Export disabled, 'Use 1/2' ... 'Use BigTIFF (tiled)' offered); with the info strip the
+    view's scale bar is left out (the strip has its own)."""
+    from nicegui import ui
+
+    from ti64app.gui.export_dialog import export_dialog
+    from ti64app.gui.state import GuiState
+
+    p = Project.open_or_create("gexp")
+
+    async with user_simulation(main_file=MAIN) as user:
+        @ui.page("/exp_test")
+        async def page():
+            await export_dialog(p, GuiState(p), kind="mosaic", run_step=None, stitch_step="x", detector="BSE",
+                                legends=[{"kind": "scale_bar", "x": 0.03, "y": 0.88, "w": 0.15}],
+                                geometry={"size_px": [60000, 50000], "pixel_size_um": 0.01})
+        await user.open("/exp_test")
+        await user.should_see(marker="export_dialog")
+        mode = user.find(marker="exp_mode").elements.pop()
+        assert {"native", "1/2", "1/4", "1/8"} <= set(mode.options)
+        fmt = user.find(marker="exp_fmt").elements.pop()
+        assert "bigtiff" in fmt.options
+        await user.should_see("Cannot export")
+        await user.should_see(marker="exp_use_1_2")
+        await user.should_see(marker="exp_use_bigtiff")
+        assert not user.find(marker="run_export").elements.pop().enabled
+        await user.should_see("The scale bar comes from the info strip")
+        user.find(marker="exp_use_1_4").click()
+        await user.should_see("15,000 × 12,500 px")
+        assert user.find(marker="run_export").elements.pop().enabled

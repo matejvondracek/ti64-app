@@ -255,14 +255,57 @@ def get_overlay(project: Project, map_id: str, name: str, lp: LayerParams, backe
     return O
 
 
-def available(project: Project, map_id: str) -> dict:
-    """What the viewer can show for a map: layer kinds and overlays with the steps they need."""
+_PROPS: dict[str, dict] = {}
+
+
+def stored_data(project: Project, step_id: str) -> dict[str, bool]:
+    """Which per-pixel data a map step really contains (cached per step): CI / IQ present, Fit present and not
+    constant (the test exports store Fit = 180 everywhere), PRIAS columns in the .ang rows."""
+    k = f"{project.root}|{step_id}"
+    if k in _PROPS:
+        return _PROPS[k]
+    s = project.recipe().step(step_id)
+    out = {"ci": False, "iq": False, "fit": False, "prias": False}
+    try:
+        with np.load(project.root / s.outputs["ebsd"].path, allow_pickle=False) as z:
+            for name in ("ci", "iq", "fit"):
+                if f"prop_{name}" in z.files:
+                    v = z[f"prop_{name}"]
+                    ok = np.isfinite(v)
+                    out[name] = bool(ok.any()) and (name != "fit" or float(v[ok].min()) != float(v[ok].max()))
+    except (OSError, KeyError, ValueError):
+        pass
+    try:
+        from .io.ang import data_column_count, read_header  # noqa: PLC0415
+
+        f = project.sample(s.params["map_id"]).map_file
+        out["prias"] = read_header(f).declares_prias and max(data_column_count(f, 200)) >= 13
+    except Exception:  # noqa: BLE001  (file moved, not an .ang)
+        pass
+    _PROPS[k] = out
+    return out
+
+
+ALPHA_OVERLAYS = ("hagb", "lagb", "interface", "burgers", "crack")       # from the alpha grains (alpha map tab)
+BETA_OVERLAYS = ("beta_gb", "crack")                                     # from the parent grains (prior-beta tab)
+
+
+def available(project: Project, map_id: str, tab: str | None = None) -> dict:
+    """What the viewer can show for a map: only the layers and overlays that the loaded data and the steps run so
+    far can produce (no Fit map when Fit is not stored, no PRIAS without PRIAS columns, KAM / GND only after they were
+    computed, boundaries only after grains / reconstruction, crack only when a crack path is drawn). tab = 'alpha' |
+    'beta' limits the overlays to that map tab (prior-beta tab: prior-beta boundaries from the parent grains)."""
+    from .annotations import load_annotations  # noqa: PLC0415
+    from .service import latest_step  # noqa: PLC0415
+
     r = [s for s in project.recipe().steps if not s.stale and s.params.get("map_id") == map_id]
     ops = {s.op for s in r}
     kinds_done = {s.params.get("kind") for s in r if s.op == "map.compute"}
     layers = []
-    if ops & {"ebsd.load", "ebsd.cleanup"}:
-        layers += ["ipf", "phase", "ci", "iq", "fit", "prias"]
+    src = latest_step(project, ("ebsd.cleanup", "ebsd.load"), map_id=map_id)
+    if src is not None:
+        have = stored_data(project, src.id)
+        layers += ["ipf", "phase"] + [k for k in ("ci", "iq", "fit", "prias") if have.get(k)]
         layers += [k for k in ("kam", "grod", "gos", "gnd") if k in kinds_done]
     if "recon.run" in ops:
         layers += list(RECON_KINDS)
@@ -271,8 +314,15 @@ def available(project: Project, map_id: str) -> dict:
         overlays += ["hagb", "lagb", "interface", "burgers"]
     if "recon.run" in ops:
         overlays.append("beta_gb")
-    overlays.append("crack")
-    return {"layers": layers, "overlays": overlays, "loaded": bool(ops & {"ebsd.load"})}
+    try:
+        if any(a.type == "crack" for a in load_annotations(project, map_id)):
+            overlays.append("crack")
+    except Exception:  # noqa: BLE001
+        pass
+    if tab in ("alpha", "beta"):
+        overlays = [o for o in overlays if o in (BETA_OVERLAYS if tab == "beta" else ALPHA_OVERLAYS)]
+    return {"layers": layers, "overlays": overlays, "loaded": bool(ops & {"ebsd.load"}),
+            "grainsize": any(s.op == "grainsize.run" for s in r), "recon": "recon.run" in ops}
 
 
 def key_pngs(project: Project, map_id: str, lp: LayerParams, backend: str | None = None) -> list:

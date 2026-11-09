@@ -68,8 +68,8 @@ def test_build_direction_required_and_exclusive():
     with pytest.raises(ValidationError):
         BuildDirection(vector=(0, 0, 0))
     assert BuildDirection(vector=(0, -2, 0)).unit_vector == (0.0, -1.0, 0.0)
-    with pytest.raises(ValidationError):            # sample sheet without build direction
-        SampleSheet(map_id="a", specimen_id="s", map_file="f.ang", input_state="raw")
+    # fix 2: a sheet without build direction (and sample) loads; steps that need the BD ask for it
+    assert SampleSheet(map_id="a", map_file="f.ang", input_state="raw").build_direction is None
 
 
 def test_four_point_bending_and_position_validation():

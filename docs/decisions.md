@@ -510,3 +510,146 @@
   SVG embedded images, PDF overlay page with pypdf, new dependency). The export dialog no longer has legend options;
   it shows the final size in px, the physical size in um and an estimated file size, and takes a typed width or
   height in px (aspect locked).
+
+## D23 (2026-11-09) Loading without sample / build direction; what a sheet change makes stale (fix 2.1)
+- **Load with whatever is known.** `SampleSheet.specimen_id` and `build_direction` are optional; the input state
+  falls back to the suggestion from the file name (CLAUDE.md: auto-suggested) and is NOT stored as if the user had
+  entered it (`set_sheet` keeps `MapInfo.input_state = None` when the recorded value only repeats the suggestion).
+  A linked `.ang` loads, cleans, segments, reconstructs and gets grain sizes without a sample or build direction.
+- **Asked only when a step needs it.** `sample.require_build_direction()` raises `SheetIncomplete(map_id, missing,
+  needed_for)`: IPF colours along "build" (figure, viewer, export, recon figures, IPF key), the prior-β width /
+  length histograms. The GUI shows it as a warning with an **Open map sheet** button (`/files?sel=<map>`: Files tab,
+  that file selected); never as an error with a log. Steps that can do most of their work without it (recon.run
+  grain shape, grainsize.run prior-β calipers / intercepts along BD) run, leave the BD part out, put
+  `"needs": ["build direction"]` in their summary and the GUI says what was left out, with the same link. The build
+  direction is still never guessed. The EBSD tab shows "build direction not entered" and a "Map sheet" button.
+- **Stale rule** (`sample.stale_on_sheet_change`, used by `Project.update_file` / `assign` / `save_sample_info` and the
+  recorded `sample.set`): map file or input state changed -> everything of the map (the cleanup preset depends on
+  it); build direction changed -> only `grainsize.*` and steps whose parameters use direction "build"; position / 4PB
+  -> nothing yet (no step uses them). Entering the build direction after loading keeps the loaded map, grains and
+  reconstruction.
+- MCP: `set_sample_sheet` needs only `map_file` + `input_state`; the instructions say BD / specimen / 4PB come from the
+  user and are only needed by the steps that use them.
+
+## D24 (2026-11-09) EBSD tab after the second user test (fixes 2.2-2.12)
+- **Auto-load** (2.2): opening the EBSD tab or picking another map in "Sample / file" loads it (progress bar under the
+  edit menu, placeholder "Loading ..." on the map); "Load again" stays in "Load and cleanup". **Loaded-map cache per
+  backend** (CLAUDE.md): `ebsd.load` stores the transferred arrays in `<project>/cache/maps/<backend>_<key>.npz`
+  (key = file fingerprint, input state, setting, backend + versions); a later recorded load of the same file takes its
+  outputs from there (metric `cached`); the backend object is made only when a later step needs it (`materialize`
+  sets `OpContext.need_object`, which bypasses the cache). "Clear cache" in Settings removes it.
+- **Only offer what exists** (2.8, `layers.available`): map list from the data actually stored by the source step
+  (`stored_data`: CI / IQ present, Fit present and not constant, PRIAS columns in the .ang rows) plus KAM / GROD / GOS /
+  GND only after they were computed; overlays: α-grain boundaries after grains.calc (α map tab only), prior-β
+  boundaries after recon.run (prior β tab only), crack only when a crack path is drawn; the Overlays button is
+  disabled with an explanation when there is nothing. Reconstruction figures appear only after a reconstruction,
+  grain-size figures only after a grain-size step, and only the kinds of the current map tab.
+- **Options hide their parameters** (2.7): wild-spike angle, smoothing-filter strength / limit, KAM order / cutoff vs
+  GND stencil / Poisson's ratio, refined-OR limit (only for "refined OR if <= limit"), custom IPF vector (only when a
+  direction is "custom"), histogram bin width (not for the colony map).
+- **Prior-β tab** (2.9): its overlay menu offers the prior-β grain boundaries of the PARENT grains (`beta_gb`, from
+  recon.run) and crack paths, not the α-grain boundaries; they are shown by default (this replaces "no boundaries by
+  default" of D22, which hid the α boundaries). **Grain size works on the map tab it is started from**:
+  `grainsize.run target = "alpha"` (α grains / laths / colonies; an existing grains.calc with the chosen boundary angle
+  is reused instead of segmenting again) or `"prior_beta"` (prior-β grains of the newest reconstruction: ECD, calipers,
+  intercepts across / along BD; no α segmentation needed); `"all"` (default, MCP / CLI / old recipes) as before. The
+  section title says which ("Grain size · prior-β map"); the History panel lists prior-β grain-size steps on the
+  prior β tab; `grainsize.figure` picks the newest grain-size step that has the part it draws.
+- **Histogram bin width** (2.10): `grainsize.figure bin_width_um` (µm; empty = Freedman-Diaconis as before, at most
+  2000 bins); the log-normal fits are unchanged.
+- **Boundary lines keep their screen width** (2.11): overlay tiles were already drawn per zoom level with the width in
+  screen px, but during a zoom animation Leaflet stretched the old tiles (lines 2x / 4x thicker or thinner until the
+  new tiles arrived). Overlays are now hidden from zoomstart until the new level's tiles have loaded. Exports use the
+  figure line width (Settings) x the per-type factor (unchanged).
+- **Legends anchored to the map** (2.12): `LegendItem.frame = "map"`: x, y, w are fractions of the whole map (or
+  image / mosaic) extent, the boxes are placed with `latLngToContainerPoint`, move with pan and scale with zoom (all
+  sizes - text, padding, bar - follow the box width; the scale-bar length stays a nice number of µm). Exports convert
+  them to the exported region (`legends.in_region`: whole map unchanged; a ROI / view keeps each item at its place on
+  the map, items outside the region are left out). Items saved before (frame "image") are treated as before.
+
+## D25 (2026-11-09) Recipe: replay speed, progress, delete steps (fixes 2.3-2.5)
+- **Profile** (`scripts/profile_replay.py`, the user's test project: 48 steps incl. stale, MATLAB- and pymtex-recorded,
+  replayed on pymtex). Before: the Python process grew to 6.5 GB (every backend object of every step stayed alive in
+  `service.SESSION`; 1 GB per loaded full map) and the replay died with MemoryError at step 38 (export.map); under that
+  memory pressure recon.run took 31-37 s (20 s normally) and grainsize.run 62 s (31 s); after each step with
+  MATLAB-recorded outputs ~13-15 s went into comparing 2.6 M-point arrays value by value although another engine never
+  reproduces them. After: 451 s for all 48 steps, RSS <= 0.6 GB at the end, compare 0 s for other-backend outputs.
+- **Fixes**: run_recipe releases the backend objects a later step no longer uses (last use from `recipe.references`;
+  `materialize` rebuilds one if needed); replay releases the scratch project at the end; after every recorded GUI step
+  the objects of stale steps are released (`release_stale`). Outputs of a step replayed on another backend than
+  recorded are `other_backend` (not compared value by value; backends are compared by tests/conformance), still "ok".
+  Stale steps are only replayed when "include stale steps" is ticked (default off). Remaining hot spots: recon.run
+  ~25 s per full map, 4x / 8x hexagon exports ~20 s, grain-size tables (CSV + XLSX via openpyxl) ~29 s to write and
+  hash on the full map.
+- **Progress** (2.4): replay and "Run a recipe file" show "step 3 of 9: Grains and boundaries (pymtex)", a progress
+  bar, the elapsed time and Cancel (`run_recipe(on_step, should_stop)`; the running step finishes, then it stops; the
+  report says "cancelled"). The result lists the run time and the slowest steps.
+- **Delete steps** (2.5): History panel "Delete all steps…" and, when there are stale steps, "Delete stale steps (n)…",
+  for the map tab shown or (tick) the whole project; a confirmation says how many and why. `service.plan_delete`: steps
+  that use a deleted step are deleted with it; "stale" keeps stale steps that current steps still use. One undo entry
+  (`history`); output files stay (undo needs them).
+- **MATLAB restart** (fix 2.6, D26): a step that hits `EngineRestarted` is run once more after the restart (its sources
+  are rebuilt by `materialize`); the GUI shows the plain-language notice.
+
+## D26 (2026-11-09) MATLAB engine: own headless process, crash detection, one restart (fix 2.6)
+- **Crash after the user test** (`matlab_crash_log.txt`, not committed): MATLAB R2025b aborted with "Breakpoint" in its
+  desktop clipboard service (`EditorServices::ClipboardImpl` -> `libmwfoundation_json.dll`), not in ti64 or MTEX code.
+  MATLAB's crash mode "continue" can leave a crashed process alive, so a call could hang.
+- **Start**: always a new MATLAB process via `matlab.engine.start_matlab("-nodesktop -nosplash -logfile ...",
+  background=True)` with a time limit (240 s, `TI64_MATLAB_START_TIMEOUT`). The app never attaches to the user's open
+  MATLAB (no `connect_matlab` / `find_matlab` / shared engines).
+- **Logs**: `%APPDATA%\ti64app\logs\` holds `matlab-engine-<python pid>.log` (MATLAB command window), MATLAB crash
+  dumps (`MATLAB_LOG_DIR`), `ti64-gui.log`, `ti64-cli.log` and `ti64-mcp.log` (`ti64app.logs`). Crash dumps and logs
+  are git-ignored.
+- **Watchdog**: every engine call runs in the background; every 2 s the app checks that the MATLAB process (PID + start
+  time) still exists and that no crash dump of that PID has appeared. An `EngineError` with the process gone (5 s
+  grace), a missing process or a crash dump counts as a crash: the process is killed, a new engine starts once and
+  `EngineRestarted` is raised with a plain-language message naming the log or crash report. Objects of the old session
+  are lost; `handles()` lists only the new session's objects, so `service.materialize` rebuilds what a rerun needs.
+  `service.run` runs the step once more after a restart and the GUI shows the notice. An `EngineError` while MATLAB is
+  still running is passed on unchanged.
+- **Notification buttons**: "Open log" / "Show" / "Open map sheet" now use `ui.notification` (the element converts
+  `:handler` strings to functions); with `ui.notify` the buttons did nothing.
+
+## D27 (2026-11-09) .up2 overview map and click-to-pattern (View tab, fix 2.13)
+- One streaming pass over the .up2 (batches of ~16 k patterns, next batch read in a second thread; never loaded fully,
+  peak RAM 1.6 GB) computes per pattern: pattern quality = Krieger Lassen (1994) frequency-inertia IQ as in kikuchipy
+  (`get_image_quality`; equal to kikuchipy to 1e-4 without correction), AFTER static background subtraction (mean of
+  4096 patterns spread over the file) and dynamic background removal (Gaussian high-pass, sigma = width / 8). Without
+  the correction the raw EDAX patterns (~32 000 counts of smooth background) give an IQ map of the beam position on the
+  detector, not of the microstructure. Virtual BSE = mean intensity of the whole pattern.
+- Subsampling: every n-th scan row is read (rows are contiguous; skipped rows are never read), every n-th pattern of a
+  row evaluated. Default n = 2 (1 um per point on the 0.5 um DED map); n = 4 quick, n = 1 full. Ti64_DED_Area 2
+  (43 GB, 6.0 M patterns): n = 4 20 s, n = 2 61 s, n = 1 227 s (disk-bound).
+- Cache: `<project>/cache/up2_overview/<stem>_<sha1(abs path, size, mtime_ns, algorithm version)>_s<n>.npz` (IQ,
+  vBSE, mean pattern, rows done). Cancel keeps the rows done; the next pass resumes. A viewer cache like the tiles, not
+  a recipe step; MCP `up2_overview` uses the same cache.
+- Grid from the .up2 header (columns, rows, step, hex flag). Display: percentile stretch, optional "flatten shading"
+  (display only). A click (probe) reads only the pattern under the cursor: scan row / column, x / y in um, pattern
+  index, intensity range, IQ; the pattern can be shown background corrected.
+
+## D28 (2026-11-09) Stitching after the second user test (fixes 2.14-2.18)
+- (a) **One "Stitch" button**: registration plus refinement within the search radius (`refine_radius`, % of the tile
+  size, always recorded). Positions come from the Arrange view once a tile was moved, else from the stage.
+- (b) **Unknown stage axes** (`stitching.stage_analysis`): an axis with no stage spread (< 0.5 um) is unknown; when
+  different images share an identical stage position (1 um stage resolution) although both axes vary, both axes are
+  unknown. JU04: stage Y = 0.237 mm in all 20 images, images of one column have identical positions and beam shift.
+  Pairs whose recorded axis allows an overlap are matched over the full range (coarse phase correlation + NCC of the
+  whole tiles); the image direction and sign of the recorded axis are chosen by the summed scores of agreeing matches;
+  matches must agree with it within max(search radius, 1 um); the threshold uses the coarse score; matches are refined
+  at full resolution and placed by least squares with a 1e-9 prior. The stage -> mosaic transform fits recorded axes
+  only. The Arrange preview spreads identical positions along the unknown axis in image-number order. The GUI says so
+  under 'Stitch sets' (axis named, repeats listed) and in the Result notes; also in the MCP outputs.
+- (c) **Repeats**: identical stage position + magnification = possible repeat; confirmed when matched at < 5 % of the
+  tile size, else reported as "not repeats" (JU04 9473/9474 and 9491/9492 are vertical neighbours).
+- (d) Sub-pixel step: the phase-correlation shift is accepted unless NCC drops by more than 0.01 (NCC is flat on noisy
+  tiles; before, correct 2-3 px shifts on 10000x images were rejected).
+- (e) **sem.export**: size and memory estimate first (`export_estimate`: refused above 6 GB or for a classic TIFF > 4 GB,
+  with 1/2, 1/4, 1/8 and BigTIFF offered; warning above 100 Mpx); export size as a fraction 1, 1/2, 1/4, 1/8 (box
+  average) next to the px / mm fields; tiled BigTIFF with pyramid (hashed by bytes); legends composited per item box;
+  with an info strip or data bar the view's scale bar is left out (one bar only, recorded in the sidecar). The failed
+  220 Mpx export came from PIL's decompression-bomb check in `hashing.png_hash` (raised after the file was written);
+  the hash now skips that check and converts in row bands, with an identical digest.
+- Verified on JU04 "stich along crack path": 8 BSE tiles at 1500x, 9766 x 22452 px, residual misalignment <= 0.3 px,
+  matching the manual arrangement; 10000x set 9475-9479 one continuous column (<= 0.4 px). 250x set: tile 9446 has no
+  good match, stays at its stage position and the message says to drag it on the Arrange tab.

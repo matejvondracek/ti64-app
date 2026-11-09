@@ -34,8 +34,8 @@ def test_suggestions():
 def test_inheritance_and_overrides(tmp_path, crop300_ju02):
     p = Project.create("p", base=tmp_path)
     m = p.add_files([crop300_ju02])[0]
-    with pytest.raises(KeyError, match="assign the file to a sample"):
-        p.sample(m.id)
+    sh0 = p.sample(m.id)                         # fix 2: loads without sample / build direction (never guessed)
+    assert sh0.specimen_id is None and sh0.build_direction is None and sh0.input_state == "oim_cleaned"
     p.save_sample_info(SampleInfo(id="JU02", heat_treatment="HIP",
                                   bending=FourPointBending(outer_span_mm=40, inner_span_mm=20, width_mm=5,
                                                            thickness_mm=3, load_N=100)))
@@ -65,7 +65,9 @@ def test_sheet_change_marks_results_stale_and_is_recorded(tmp_path, crop300_ju02
     service.run(p, "ebsd.load", {"map_id": m.id})                    # new sheet recorded, results not stale
     assert [s.op for s in p.recipe().steps] == ["sample.set", "ebsd.load", "sample.set", "ebsd.load"]
     assert [s.stale for s in p.recipe().steps] == [True, False, False, False]
-    p.update_file(m.id, build_direction={"angle_deg": 90})           # result-relevant: stale
+    p.update_file(m.id, build_direction={"angle_deg": 90})           # BD: only what uses it goes stale (fix 2)
+    assert not p.recipe().steps[-1].stale
+    p.update_file(m.id, input_state="raw")                           # input state: everything of the map
     assert p.recipe().steps[-1].stale
     rep = service.replay(p)                                          # the recipe alone rebuilds the project
     assert rep.ok, rep

@@ -14,7 +14,7 @@ from nicegui import run as ng_run
 from nicegui import ui
 
 from ..project import Project
-from ..sample import (BuildDirection, FourPointBending, MapInfo, MapPosition, SampleInfo, effective,
+from ..sample import (missing_fields, BuildDirection, FourPointBending, MapInfo, MapPosition, SampleInfo, effective,
                       suggest_input_state, suggest_role, suggest_sample_id)
 from . import dialogs
 from .shell import check_interrupted, error, header
@@ -37,12 +37,16 @@ def open_in_tool(p: Project, gs: GuiState, m: MapInfo) -> None:
     ui.navigate.to(tab)
 
 
-def files_page() -> None:
+def files_page(sel: str | None = None) -> None:
+    """sel = map ID to select (link 'Open map sheet' from a step that needs a sheet value)."""
     p = header("Files")
     if p is None:
         ui.navigate.to("/")
         return
     gs = GuiState(p)
+    if sel and p.file(sel) is not None:
+        gs.set("files_sel", ["file", sel])
+        gs.set("selected_file", sel)
     gs.set("tab", "/files")
     check_interrupted(p)
     st: dict = {"sel": gs.get("files_sel"), "drag": None, "collapsed": set(gs.get("files_collapsed") or [])}
@@ -312,8 +316,9 @@ def files_page() -> None:
                 ui.icon("warning", color="warning").tooltip("This file changed on disk since it was linked or last "
                                                             "used; results may not match it any more.")
             if m.kind == "ang" and (m.input_state is None or m.build_direction is None or m.sample_id is None):
-                ui.icon("edit_note", color="warning").tooltip("Map sheet incomplete (sample, input state, build "
-                                                              "direction)")
+                ui.icon("edit_note", color="warning").tooltip(
+                    "Map sheet not complete: " + ", ".join(missing_fields(m)) + ". The map loads without them; "
+                    "steps that need a value (e.g. the build direction) ask for it.")
             with ui.context_menu():
                 ui.menu_item("Open", on_click=lambda m=m: open_in_tool(p, gs, m))
                 for s in samples:
@@ -648,7 +653,8 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
                     ui.label(f"Prefill from {x.id} of this sample: {txt}").classes("text-xs ti-muted")
                     ui.button("Use", on_click=use).props("dense outline size=sm").mark("ms_bd_use")
             else:
-                ui.label("Required before loading the map; never guessed.").classes("text-xs text-amber-800")
+                ui.label("Not needed to load the map; steps that use it (IPF along the build direction, prior-β length / "
+                         "width along BD) ask for it. Never guessed.").classes("text-xs text-amber-800")
     else:
         ui.label("Image sheet").classes("font-semibold")
     # position + role

@@ -63,7 +63,7 @@ def test_grainsize_outputs(gchain):
 def test_grainsize_figures(gchain):
     for k in GS_FIGURES:
         if k.startswith("beta"):
-            with pytest.raises(ValueError, match="no prior-beta"):
+            with pytest.raises(KeyError, match="no grain size of the prior"):
                 service.run(gchain, "grainsize.figure", {"map_id": MAP, "kind": k})
             continue
         st = service.run(gchain, "grainsize.figure", {"map_id": MAP, "kind": k})

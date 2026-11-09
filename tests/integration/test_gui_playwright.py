@@ -2,7 +2,7 @@
 home -> new project -> add files -> find missing -> new sample for a file -> fold -> View tab (image, .up2) ->
 EBSD load / cleanup / grains -> overlay menu -> legends on the map -> hexagons when zoomed -> export dialog (sizes) ->
 history reorder (refused + applied + undo) -> prior-beta map tab -> Settings -> Stitch (stitch sets, greyed info-strip
-option, Arrange, Refine, overlap difference, export, View) -> Crack, then 1920x1080. Needs the test data and
+option, Arrange, Stitch, overlap difference, export, View) -> Crack, then 1920x1080. Needs the test data and
 Playwright + Chromium:
     pip install playwright && python -m playwright install chromium
 """

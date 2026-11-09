@@ -114,6 +114,8 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   run on CPU. Keep peak RAM < 8 GB.
 - Cache each loaded + cleaned map per backend (pymtex: .npz/.h5; MATLAB: <name>_mtexcache.mat) under
   projects/ or a cache folder, never next to the raw data; keyed by file, input state and cleanup parameters.
+- matlab backend: start the engine without the desktop (-nodesktop -nosplash), never attach to the user's
+  open MATLAB; if the engine dies, restart it and report it in plain language.
 - matlab backend: keep large objects in the MATLAB session; move per-pixel arrays to Python through
   temporary HDF5/.mat files (h5py), not element-wise engine conversion.
 - Unit tests use the 300x300 crops (about 60 x 52 um, smaller than one prior-beta grain). Reconstruction

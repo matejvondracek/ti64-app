@@ -26,11 +26,40 @@ DESKTOP: dict = {"request_open": None, "spawn": None, "set_title": None}    # fi
 
 def error(e: BaseException, what: str = "") -> None:
     """Plain-language notification + full traceback in the log file."""
+    from ..sample import SheetIncomplete  # noqa: PLC0415
+
+    if isinstance(e, SheetIncomplete):                  # not an error: a value the user still has to enter
+        sheet_missing(e.map_id, plain_error(e))
+        return
     log.error("%s%s", f"{what}: " if what else "", e, exc_info=e)
     msg = (f"{what}: " if what else "") + plain_error(e)
-    ui.notify(msg, type="negative", multi_line=True, timeout=12000, close_button="OK",
-              actions=[{"label": "Open log", "color": "white",
-                        ":handler": "() => fetch('/api/ti64/open_log', {method: 'POST'})"}])
+    notify_actions(msg, [("Open log", "() => fetch('/api/ti64/open_log', {method: 'POST'})")], type="negative",
+                   timeout=12, close_button="OK")
+
+
+def notify_actions(msg: str, actions: list[tuple[str, str]], **kw) -> None:
+    """Notification with action buttons (label, JS handler). ui.notification, not ui.notify: only the element turns
+    ':handler' strings into functions, with ui.notify the buttons did nothing."""
+    kw.setdefault("multi_line", True)
+    ui.notification(msg, actions=[{"label": lab, "color": "white", ":handler": js} for lab, js in actions], **kw)
+
+
+_LAST_SHEET_NOTE: dict[str, float] = {}
+
+
+def sheet_missing(map_id: str, msg: str) -> None:
+    """Something on the map sheet is missing for a step: say what and link straight to the sheet (Files tab with
+    the file selected). The same message is not repeated within 30 s (redraws of a map would repeat it)."""
+    import json  # noqa: PLC0415
+    import time  # noqa: PLC0415
+
+    now = time.monotonic()
+    if now - _LAST_SHEET_NOTE.get(msg, -1e9) < 30:
+        return
+    _LAST_SHEET_NOTE[msg] = now
+    notify_actions(msg, [("Open map sheet",
+                          f"() => window.location.href = '/files?sel=' + encodeURIComponent({json.dumps(map_id)})")],
+                   type="warning", timeout=10, close_button="Later", position="bottom-right")
 
 
 def bytes_h(n: int) -> str:

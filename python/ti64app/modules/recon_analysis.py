@@ -148,6 +148,10 @@ def variant_stats(parent_grain: np.ndarray, variant: np.ndarray, packet: np.ndar
     return out
 
 
+BD_MISSING = ("build direction not entered: length / width along and across BD not computed (enter it on the Files "
+              "tab, section 'Map sheet', then run the step again)")
+
+
 def bd_in_plane(bd: tuple[float, float, float]) -> tuple[np.ndarray | None, float]:
     """Unit in-plane build direction (x, y) and the angle of BD out of the map plane (deg)."""
     v = np.asarray(bd, float)
@@ -165,9 +169,13 @@ def grain_shape(x: np.ndarray, y: np.ndarray, parent_grain: np.ndarray, grain: d
     (ISO 13067 / ASTM E2627). If BD is more than max_bd_out_of_plane_deg out of the map plane, the
     calipers are not defined (None) and a warning is returned."""
     ids = np.asarray(grain["id"], np.int64)
-    u, out_deg = bd_in_plane(bd)
     warnings = []
-    if out_deg > max_bd_out_of_plane_deg:
+    if bd is None:
+        u, out_deg = None, None
+        warnings.append(BD_MISSING)
+    else:
+        u, out_deg = bd_in_plane(bd)
+    if out_deg is not None and out_deg > max_bd_out_of_plane_deg:
         warnings.append(f"build direction is {out_deg:.0f} deg out of the map plane: calipers along/across "
                         "BD not computed")
         u = None
@@ -206,7 +214,7 @@ def grain_shape(x: np.ndarray, y: np.ndarray, parent_grain: np.ndarray, grain: d
                    "the in-plane build direction (along) and its normal (across) + one step; aspect = along / "
                    "across; grains touching the map edge excluded (ISO 13067 / ASTM E2627)"),
         "min_px": min_px, "min_ecd_um": min_ecd_um, "step_um": step_um,
-        "build_direction": [float(c) for c in bd], "bd_out_of_plane_deg": out_deg,
+        "build_direction": [float(c) for c in bd] if bd is not None else None, "bd_out_of_plane_deg": out_deg,
         "n_grains": int(n), "n_used": int(used.sum()), "n_edge": int(np.asarray(grain["is_edge"], bool).sum()),
         "ecd_um": _stats(ecd, area), "along_bd_um": _stats(along, area), "across_bd_um": _stats(across, area),
         "aspect_along_across": _stats(aspect, area), "warnings": warnings}

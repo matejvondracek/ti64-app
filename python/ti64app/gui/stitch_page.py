@@ -3,7 +3,10 @@ the selection (same magnification + pixel size + overlapping stage footprints; d
 stitched together) and a checklist of the images of the chosen set (pick a subset), then the options (info strip,
 blending, seam, band width, search radius, min. score). Right: Arrange (thumbnails at their stage positions, or in a
 row without stage data: drag them roughly into place, zoom, lock a tile, select with click / Shift-click / Shift-drag;
-Refine searches only within the radius around these positions and the manual layout is saved in the recipe),
+once tiles were moved, the one 'Stitch' button searches only within the search radius around these positions and the
+manual layout is saved in the recipe. A stage axis that is not recorded (no spread, or images with identical stage
+positions, e.g. JU04: stage Y the same in every image) is named under 'Stitch sets', its images are spread out along
+it on the Arrange tab and Stitch searches it by image matching over the full range),
 Result (mosaic with tile borders coloured by match score, nudge / exclude a tile, pairs with their residual
 misalignment) and Overlaps (difference image of one overlap: ghosting shows as double edges).
 Everything runs through service.run("sem.stitch", ...) (recorded in the recipe); Export uses the shared export
@@ -147,6 +150,7 @@ def stitch_page() -> None:
                 counts = ui.column().classes("w-full gap-1")
                 ui.label("Stitch sets").classes("font-semibold").tooltip(tip("st_sets"))
                 sets_box = ui.column().classes("w-full gap-1").mark("st_sets")
+                stage_box = ui.column().classes("w-full gap-1").mark("st_stage_check")
                 ui.label("Images of the set").classes("font-semibold") \
                     .tooltip("Untick images to leave them out. In the Arrange view: click, Shift-click or "
                              "Shift-drag a box to select.")
@@ -172,16 +176,22 @@ def stitch_page() -> None:
                     band = ui.number("band width [px]", value=saved.get("band", 32), min=0, step=8, format="%d") \
                         .classes("w-32").tooltip(tip("st_band")).mark("st_band")
                 with ui.row().classes("w-full no-wrap gap-2"):
-                    radius = ui.number("refine radius [% of tile]", value=saved.get("radius", 10), min=1, max=50,
-                                       step=1, format="%g").classes("grow").tooltip(tip("st_radius")).mark("st_radius")
+                    radius = ui.number("search radius [% of tile]", value=saved.get("radius", 10), min=1, max=50,
+                                       step=1, format="%g").classes("grow").mark("st_radius") \
+                        .tooltip("How far a match may lie from the position on the 'Arrange' tab (after you moved "
+                                 "tiles there), or from the recorded stage axis when the other axis is not recorded "
+                                 "(e.g. stage Y the same in every image). In % of the tile size; at least the 1 µm "
+                                 "stage resolution.")
                     min_score = ui.number("min. match score", value=saved.get("min_score", 0.3), step=0.05,
                                           min=0, max=1).classes("w-32").tooltip(tip("st_min_score"))
         with ui.column().classes("w-full p-3 gap-2 border-t"):
             prog = ui.linear_progress(value=0, show_value=False).props("rounded").classes("w-full").mark("st_progress")
             prog_lab = ui.label("").classes("text-xs ti-muted")
             with ui.row().classes("w-full no-wrap gap-2"):
-                ui.button("Stitch", icon="view_module", on_click=lambda: do_stitch(False)).classes("grow") \
-                    .mark("st_run").tooltip("Stitch the ticked images, starting from their stage positions")
+                ui.button("Stitch", icon="view_module", on_click=lambda: do_stitch()).classes("grow") \
+                    .mark("st_run").tooltip("Register and stitch the ticked images: from the positions on the "
+                                            "'Arrange' tab (within the search radius) or, if you did not move any "
+                                            "tile, from the stage positions")
                 exp_btn = ui.button("Export", icon="ios_share", on_click=lambda: do_export()).props("outline") \
                     .classes("grow").mark("st_export")
     with right:
@@ -194,13 +204,11 @@ def stitch_page() -> None:
             with ui.tab_panel("arrange").classes("p-0 h-full"):
                 with ui.column().classes("w-full h-full gap-0"):
                     with ui.row().classes("w-full items-center gap-2 px-3 py-2 bg-white border-b no-wrap"):
-                        ui.button("Refine", icon="auto_fix_high", on_click=lambda: do_stitch(True)) \
-                            .mark("st_refine").tooltip(tip("st_refine"))
                         ui.button("Stage positions", icon="restart_alt", on_click=lambda: reset_layout()) \
                             .props("outline dense no-caps").mark("st_reset") \
                             .tooltip("Put every tile back at its stage position (or in a row without stage data)")
                         ui.button("Lock", icon="lock", on_click=lambda: lock(True)).props("outline dense no-caps") \
-                            .mark("st_lock").tooltip("Selected tiles keep their position when refining")
+                            .mark("st_lock").tooltip("Selected tiles keep their position when you press 'Stitch'")
                         ui.button("Unlock", icon="lock_open", on_click=lambda: lock(False)) \
                             .props("outline dense no-caps").mark("st_unlock")
                         ui.button(icon="fit_screen", on_click=lambda: arr.fit()).props("flat round dense") \
@@ -210,7 +218,7 @@ def stitch_page() -> None:
             with ui.tab_panel("result").classes("p-3"):
                 result = ui.column().classes("w-full gap-3").mark("st_result")
                 with result:
-                    ui.label("Stitch or Refine to see the mosaic here.").classes("ti-muted")
+                    ui.label("Press the 'Stitch' button (next to 'Export') to see the mosaic here.").classes("ti-muted")
             with ui.tab_panel("overlaps").classes("p-3"):
                 overlaps = ui.column().classes("w-full gap-3").mark("st_overlaps")
                 with overlaps:
@@ -340,7 +348,28 @@ def stitch_page() -> None:
         st["locked"] = set(mem.get("locked") or []) & keys
         st["manual"] = bool(mem.get("manual"))
         refresh_checklist()
+        show_stage_check(tl)
         refresh_arrange(fit=True)
+
+    def show_stage_check(tl: list[stitching.TileInfo]):
+        """Stage axes that are not recorded and possible repeats of the chosen set (fix 18, JU04)."""
+        st["stage_check"] = sa = stitching.stage_analysis(tl) if len(tl) > 1 else {"unknown_axes": [], "repeats": []}
+        stage_box.clear()
+        if not sa["unknown_axes"] and not sa["repeats"]:
+            return
+        with stage_box, ui.row().classes("w-full no-wrap gap-2 p-2 rounded bg-amber-50 border border-amber-300"):
+            ui.icon("warning", size="20px").classes("text-amber-700 shrink-0")
+            with ui.column().classes("gap-1 min-w-0"):
+                if sa["unknown_axes"]:
+                    ui.label(sa["message"][:1].upper() + sa["message"][1:] + " Check the mosaic on the 'Result' tab; "
+                             "if a tile is wrong, drag it into place on the 'Arrange' tab and press 'Stitch' again.") \
+                        .classes("text-xs").mark("st_unknown_axis")
+                if sa["repeats"]:
+                    ui.label("Possible repeats (same stage position and magnification): " +
+                             "; ".join(" = ".join(g) for g in sa["repeats"]) +
+                             ". 'Stitch' tells you on the 'Result' tab whether they show the same area; untick a "
+                             "repeat under 'Images of the set' to leave it out.").classes("text-xs") \
+                        .mark("st_repeats")
 
     def refresh_checklist():
         checklist.clear()
@@ -372,8 +401,11 @@ def stitch_page() -> None:
         if fit:
             arr.fit()
         n = len(checked_tiles())
+        unk = (st.get("stage_check") or {}).get("unknown_axes") or []
         arr_lab.text = (f"{n} of {len(tl)} images selected · " +
-                        ("manual arrangement" if st["manual"] else "stage positions") +
+                        ("manual arrangement" if st["manual"] else "stage positions" + (
+                            f" (stage {' and '.join(unk)} not recorded: images with the same position are spread out "
+                            "in image-number order; Stitch finds their place, or drag them)" if unk else "")) +
                         (f" · locked: {', '.join(sorted(st['locked']))}" if st["locked"] else ""))
         update_strip_option()
 
@@ -451,20 +483,22 @@ def stitch_page() -> None:
         pr = {"files": files, "detector": det.value, "se_layout": "bse" if se_bse.value else "own",
               "info_strip": strip.value, "blend": blend.value, "seam": seam.value,
               "blend_band_px": int(band.value or 0), "min_score": float(min_score.value or 0.3),
-              "exclude": sorted(edits["exclude"]), "nudge": {k: list(v) for k, v in edits["nudge"].items()}}
-        if manual:
+              "exclude": sorted(edits["exclude"]), "nudge": {k: list(v) for k, v in edits["nudge"].items()},
+              "refine_radius": float(radius.value or 10) / 100.0}
+        if manual:                       # tiles moved on the Arrange tab: their positions replace the stage
             pr.update(manual_layout={tile_key(t): st["layout"][tile_key(t)] for t in tl},
-                      locked=sorted(st["locked"] & {tile_key(t) for t in tl}),
-                      refine_radius=float(radius.value or 10) / 100.0)
+                      locked=sorted(st["locked"] & {tile_key(t) for t in tl}))
         if src.get("sample"):
             pr["sample_id"] = src["sample"]
         return pr
 
-    async def do_stitch(manual: bool):
+    async def do_stitch():
+        """One button (fix 14 of the 6.6 user test): registration incl. the refinement within the search radius,
+        from the Arrange positions once tiles were moved there, else from the stage positions."""
         if STITCH_STATE["busy"]:
             return
         try:
-            prm = params(manual)
+            prm = params(bool(st["manual"]))
         except Exception as e:  # noqa: BLE001
             error(e, "Cannot stitch yet")
             return
@@ -506,6 +540,12 @@ def stitch_page() -> None:
                                                            f"{side['render']['blend_band_px']} px band)"
                                                            if side.get('render', {}).get('blend') == 'seam' else "")) \
                         .classes("text-sm").mark(f"st_summary_{d}")
+                    stage_notes = [q for q in side.get("notes", []) if not q.startswith("MP_BEAM_SHIFT")]
+                    if stage_notes:                       # unknown stage axis, repeats (confirmed or not), unmatched
+                        with ui.column().classes("w-full gap-0 p-2 rounded bg-amber-50 border border-amber-300") \
+                                .mark(f"st_notes_{d}"):
+                            for q in stage_notes:
+                                ui.label("• " + q[:1].upper() + q[1:]).classes("text-xs")
                     img = ui.interactive_image(str(prev), content=tile_svg(side, sc, None, side["params"]["min_score"]),
                                                events=["click"]).classes("max-w-xl").mark(f"st_result_{d}")
                     tile_box = ui.column().classes("w-full gap-2")
@@ -557,7 +597,7 @@ def stitch_page() -> None:
                     else:
                         edits["nudge"].pop(key, None)
                     (edits["exclude"].add if ex.value else edits["exclude"].discard)(key)
-                    await do_stitch(bool(st["last"] and st["last"].params.get("manual_layout")))
+                    await do_stitch()
                 ui.button("Re-stitch", icon="refresh", on_click=apply).mark("st_restitch")
 
     def show_overlap_picker():

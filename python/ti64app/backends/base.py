@@ -34,6 +34,18 @@ class BackendUnavailable(RuntimeError):
     """The backend cannot run on this machine (e.g. MATLAB not installed)."""
 
 
+class EngineRestarted(RuntimeError):
+    """The backend's engine (MATLAB) died during a call and was restarted. Objects kept in the old session are
+    gone (they are rebuilt from the recipe on the next use), so the interrupted step can simply be run again.
+    The message is plain language for the GUI / MCP; `log_file` points to the engine log, `crash_dump` to the
+    MATLAB crash dump if one was written."""
+
+    def __init__(self, message: str, log_file: str | None = None, crash_dump: str | None = None):
+        super().__init__(message)
+        self.log_file = log_file
+        self.crash_dump = crash_dump
+
+
 # ---- parameters ----------------------------------------------------------------------------
 class LoadParams(BaseModel):
     file: Path

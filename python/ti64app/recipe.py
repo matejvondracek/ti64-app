@@ -48,6 +48,26 @@ class RecipeStep(BaseModel):
     stale: bool = False
 
 
+def references(step: RecipeStep, known: set[str]) -> set[str]:
+    """Ids of the earlier steps a step uses: '<id>:<output>' inputs and parameter values (any depth) that are step
+    ids (source, grains, recon, values, grainsize, stitch, ...)."""
+    out = {i.split(":", 1)[0] for i in step.inputs if isinstance(i, str)}
+
+    def walk(v):
+        if isinstance(v, str):
+            if v in known:
+                out.add(v)
+        elif isinstance(v, dict):
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+    walk(step.params)
+    out.discard(step.id)
+    return out & known
+
+
 class Recipe(BaseModel):
     steps: list[RecipeStep] = Field(default_factory=list)
 

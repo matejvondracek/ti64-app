@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .recipe import Recipe
-from .sample import (MapInfo, SampleInfo, SampleSheet, effective_sheet, file_kind, map_id_from_file, split_sheet)
+from .sample import (MapInfo, SampleInfo, SampleSheet, effective_sheet, file_kind, map_id_from_file, split_sheet,
+                     suggest_input_state)
 from .settings import BackendName, REPO_ROOT, preferences_path
 
 PROJECTS_DIR = REPO_ROOT / "projects"
@@ -363,15 +364,29 @@ class Project:
 
     def set_sheet(self, sheet: SampleSheet) -> None:
         """Store a full legacy sheet (op sample.set, MCP set_sample_sheet): the sample is created if needed,
-        values that differ from it become per-file overrides; the file is linked if it is not yet."""
-        s, fields = split_sheet(sheet, self.sample_info(sheet.specimen_id))
-        if self.sample_info(s.id) is None:
-            write_json(self.samples_path, {"samples": [x.model_dump(mode="json") for x in self.sample_infos() + [s]]})
+        values that differ from it become per-file overrides; the file is linked if it is not yet. A sheet without a
+        sample (loaded before the user assigned one) links the file Unassigned; an input state that only repeats the
+        suggestion from the file name is not stored as if the user had entered it."""
         files = self.files()
         m = next((x for x in files if x.id == sheet.map_id), None)
+        if sheet.specimen_id:
+            s, fields = split_sheet(sheet, self.sample_info(sheet.specimen_id))
+            if self.sample_info(s.id) is None:
+                write_json(self.samples_path,
+                           {"samples": [x.model_dump(mode="json") for x in self.sample_infos() + [s]]})
+            sid = s.id
+        else:
+            sid = None
+            fields = {"input_state": sheet.input_state, "build_direction": sheet.build_direction,
+                      "position": sheet.position, "notes": sheet.notes}
+            for k in ("material", "process", "bending"):
+                if m is not None and getattr(m, k) is not None:
+                    fields[k] = getattr(sheet, k)
+        if (m is not None and m.input_state is None and fields.get("input_state") == suggest_input_state(sheet.map_file)):
+            fields["input_state"] = None
         f = Path(sheet.map_file)
         st = f.stat() if f.is_file() else None
-        base = {"id": sheet.map_id, "file": str(f), "kind": file_kind(f) or "other", "sample_id": s.id,
+        base = {"id": sheet.map_id, "file": str(f), "kind": file_kind(f) or "other", "sample_id": sid,
                 "size": st.st_size if st else None, "mtime": st.st_mtime if st else None}
         new = MapInfo.model_validate({**(m.model_dump() if m else {}), **base, **fields,
                                       **{k: fields.get(k) for k in ("material", "process", "bending")}})
@@ -385,10 +400,14 @@ class Project:
             return None
 
     def _stale_if_changed(self, map_id: str, old) -> int:
-        if old is None or self._sheet_or_none(map_id) == old:
+        from .sample import stale_on_sheet_change  # noqa: PLC0415
+
+        new = self._sheet_or_none(map_id)
+        if old is None or new == old:
             return 0
+        pred = stale_on_sheet_change(map_id, old, new or {})
         r = self.recipe()
-        n = r.mark_stale(lambda s: s.params.get("map_id") == map_id and s.op != "sample.set")
+        n = r.mark_stale(lambda s: s.op != "sample.set" and pred(s))
         if n:
             self.save_recipe(r)
         return n

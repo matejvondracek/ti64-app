@@ -198,7 +198,7 @@ Decisions D20 (true hexagons), D21 (stitching), D22 (GUI). Tabs are now **Files 
 | Info strip "keep the original data bar": greyed out with the reason as a hover tooltip when the images are not one column | `gui/stitch_page.py` |
 | **View tab**: any image or mosaic (zoom / pan, metadata, draggable scale bar, export), `.up2` files (header table + pattern viewer: row / column, step to neighbours; indexing in phase 9) | `gui/view_tab.py`, `gui/tiles.py` (`ImageLayer`, thumbnails), `io/up2.py` (`read_pattern`, `pattern_index`) |
 | Files tab: **Find missing…** searches a folder (with subfolders) by name and size and relinks all missing files at once (list of what was found); the list updates immediately (stale-slot bug fixed for all dialogs: `state.stable`, row clicks ignore buttons); Add file starts with "All files (*.*)"; right-click "New sample for this file" asks for the ID (prefilled) and moves the file; clicking a sample's name folds its files (remembered) | `gui/files_tab.py`, `gui/dialogs.py`, `project.py` (`find_missing`) |
-| EBSD tab: overlay menu in columns (grows to the right) with colour and line width per boundary type; map tabs **α map · prior β · Results**, each map tab with its own layer, overlays and history; the reconstruction focuses the prior-β tab (no boundaries by default) | `gui/ebsd_tab.py`, `ops_ebsd.py` (`OverlayStyle`), `layers.py` |
+| EBSD tab: overlay menu in columns (grows to the right) with colour and line width per boundary type; map tabs **α map · prior β · Results**, each map tab with its own layer, overlays and history; the reconstruction focuses the prior-β tab (its prior-β boundaries shown, D24) | `gui/ebsd_tab.py`, `ops_ebsd.py` (`OverlayStyle`), `layers.py` |
 | **History panel right of the map**: drag a step onto another to reorder; invalid orders are refused with the reason (e.g. "Cleanup needs a loaded map before it"); a valid order re-runs from the first changed step, old results stay as stale, one undo entry | `gui/history_panel.py`, `reorder.py`, `history.py` (`group`) |
 | **True hexagons**: the viewer draws regular hexagons when a cell is ≥ 8 screen px (zoom indicator says brick / hexagons, tooltip explains both); exports: native and 2× brick, 4× / 8× hexagons drawn by each backend (`cell_image`: pymtex `raster.hexagon_image`, MATLAB `+ti64/hexRasterize.m`); MATLAB `render.m` figures with ≥ 4 px per measurement use hexagons | `raster.py`, `backends/*`, `matlab/+ti64/hexImage.m`, `hexRasterize.m`, `render.m` |
 | **Export dialog**: final size in px, physical size in µm, estimated file size; type the width or height in px (aspect locked), or scale / mm at DPI; hexagon note for hex maps; no legend options any more | `gui/export_dialog.py` |
@@ -208,6 +208,26 @@ Decisions D20 (true hexagons), D21 (stitching), D22 (GUI). Tabs are now **Files 
 Screenshots of every changed screen (`python scripts/gui_screenshots.py`, 46 screens, plus
 `python scripts/hex_backends.py` for the pymtex / MATLAB hexagon comparison) are in `projects/_gui_screenshots/`
 (git-ignored; `index.html` shows them all).
+
+### Phase 6.6 fixes, second round (2026-11-09)
+Decisions D23–D28.
+
+| Change | Where |
+| --- | --- |
+| A map **loads without sample or build direction** (input state suggested from the file name until set); steps that need the build direction say so with an **Open map sheet** button (Files tab, file selected); steps that can do the rest run and say what they left out; entering the BD later only makes BD-dependent results stale | `sample.py` (`SheetIncomplete`, `require_build_direction`, `stale_on_sheet_change`), `project.py`, `ops_*`, `gui/shell.py` (`sheet_missing`), `gui/files_tab.py` (`/files?sel=`), MCP `set_sample_sheet` |
+| The selected map **loads by itself** when the EBSD tab opens or another map is picked (progress shown); loaded-map **cache per backend** in `cache/maps/` | `gui/ebsd_tab.py`, `service.py` (`ebsd.load`) |
+| **Replay**: profiled (`scripts/profile_replay.py`), unused backend objects released (RAM 6.5 GB → ≤ 0.6 GB, no MemoryError), no value-by-value comparison with another backend's outputs; progress dialog "step 3 of 9: … (pymtex)", bar, elapsed time, Cancel; slowest steps listed | `service.py` (`run_recipe`, `replay`, `release_stale`), `gui/history_panel.py` (`run_with_progress`) |
+| History: **Delete all steps…** / **Delete stale steps (n)…** (map tab or whole project, confirmation, dependents included, one undo entry) | `service.py` (`plan_delete`, `delete_steps`), `recipe.py` (`references`), `gui/history_panel.py` |
+| **MATLAB engine**: own headless process (`-nodesktop -nosplash`, never the user's MATLAB), crash watchdog, one restart with a plain-language message, the step runs again; logs in `%APPDATA%\ti64app\logs\` | `backends/matlab_backend.py`, `backends/base.py` (`EngineRestarted`), `logs.py`, `service.py` |
+| Edit menu: **switched-off options hide their parameters**; only maps / overlays / figures that exist are offered (no Fit / PRIAS when not stored, α boundaries after grains, prior-β boundaries after the reconstruction, crack after drawing one) | `gui/ebsd_tab.py`, `layers.py` (`available`, `stored_data`) |
+| **Prior β tab** shows the prior-β grain boundaries of the parent grains; **grain size works on the map tab it is started from** (`grainsize.run target`); histogram **bin width** (µm) with the log-normal fits | `ops_grainsize.py`, `modules/grain_size.py` (`hist_edges`), `gui/ebsd_tab.py`, `gui/history_panel.py`, `reorder.py` |
+| Boundary lines keep their **screen width** while zooming; **legends anchored to the map** (move / scale with zoom and pan, exported exactly there for any region) | `gui/map_viewer.js`, `legends.py` (`frame`, `in_region`), `ops_export.py` |
+| **.up2 overview**: pattern-quality / virtual-BSE map computed once by streaming (subsampled, cached, cancellable, resumable); a click loads only that pattern (row, column, x, y) | `modules/up2_overview.py`, `gui/view_tab.py`, MCP `up2_overview` |
+| **Stitch**: one Stitch button (refinement within the search radius); unknown stage axes (no spread / identical positions) searched by image matching and reported, possible repeats flagged (JU04); export size estimate with 1/2–1/8 and tiled BigTIFF, large-export failure fixed; one scale bar with the info strip | `modules/stitching.py`, `ops_stitch.py`, `gui/stitch_page.py`, `gui/export_dialog.py`, `hashing.py` |
+| Tests | `tests/unit/test_fix2_ebsd.py`, `test_matlab_engine.py`, `test_up2_overview.py`, `test_stitching.py`, `test_gui_stitch.py`; older tests updated to the new rules |
+
+Screenshots of the changed screens: `python scripts/gui_screenshots_fix2.py` → `projects/_gui_screenshots_fix2/`
+(git-ignored; `index.html`).
 
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.

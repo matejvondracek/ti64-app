@@ -50,6 +50,8 @@ def check_order(steps: list[RecipeStep]) -> str | None:
     seen: list[str] = []
     for k, s in enumerate(steps):
         req = REQUIRES.get(s.op)
+        if s.op == "grainsize.run" and s.params.get("target") == "prior_beta":
+            req = (("recon.run",), "a prior-β reconstruction")
         if req and not any(o in seen for o in req[0]):
             return f"step {k + 1} ({NAMES.get(s.op, s.op)}) needs {req[1]} before it"
         if s.op == "ebsd.load" and k > 0 and any(o in REQUIRES for o in seen):

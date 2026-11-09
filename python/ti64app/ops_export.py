@@ -209,6 +209,9 @@ def _export_map(ctx: OpContext) -> None:
     items = [a for a in load_annotations(ctx.project, p.map_id) if a.type != "crack"] if p.annotations else []
     x0, x1, y0, y1 = L.extent
     view_w = (abs(roi[2] - roi[0]) if roi else x1 - x0)
+    from .legends import in_region  # noqa: PLC0415
+
+    legend_items = in_region(p.legends, (x0, x1, y0, y1), roi) if p.legends else None   # map-anchored -> region
     prims = to_primitives(items, view_w, include_roi=p.roi_outlines)
     # the resolved steps (recorded in the params, so replay draws exactly the same data)
     lay = p.layer.model_dump(mode="json")
@@ -219,7 +222,7 @@ def _export_map(ctx: OpContext) -> None:
         lay["values"] = ctx.params.pop("values")
     side: dict[str, Any] = {
         "map_id": p.map_id, "map_file": sheet.map_file, "map_fingerprint": file_fingerprint(sheet.map_file),
-        "input_state": sheet.input_state, "build_direction": sheet.build_direction.model_dump(mode="json"),
+        "input_state": sheet.input_state, "build_direction": sheet.build_direction.model_dump(mode="json") if sheet.build_direction else None,
         "layer": {**lay, "title": spec.title, "colorbar_label": spec.colorbar_label,
                   "ipf_keys": meta.get("keys")},
         "source_steps": {"map": src, **({k: v for k, v in ov["used"].items()} if ov else {})},
@@ -255,7 +258,8 @@ def _export_map(ctx: OpContext) -> None:
 
             legend_info.setdefault("colorbar", cinfo.get("colorbar"))
             legend_info.setdefault("clim", cinfo.get("clim"))
-            img = compose_array(img, p.legends, g.px, legend_info)
+            img = compose_array(img, in_region(p.legends, (x0, x1, y0, y1), (g.x0, g.y0, g.x0 + g.W * g.px,
+                                                                              g.y0 + g.H * g.py)), g.px, legend_info)
         side.update(scale=k, image_px=[g.W, g.H], pixel_size_um=[g.px, g.py], origin_um=[g.x0, g.y0],
                     physical_size_um=[g.W * g.px, g.H * g.py], line_px=line_px, background=p.background,
                     cells="regular hexagons (backend cell_image)" if hexagons else
@@ -292,7 +296,7 @@ def _export_map(ctx: OpContext) -> None:
             spec.xlim, spec.ylim = (roi[0], roi[2]), (roi[1], roi[3])
         ctx.backend.render(handle(), spec, out)
         if p.legends:
-            _legends_on_figure(out, p, roi or (x0, y0, x1, y1), legend_info, ctx, spec)
+            _legends_on_figure(out, legend_items, p, roi or (x0, y0, x1, y1), legend_info, ctx, spec)
         side.update(width_mm=p.width_mm, dpi=p.dpi, expected_width_px=round(p.width_mm / 25.4 * p.dpi)
                     if p.format in ("png", "tiff") else None, scale_bar=p.scale_bar, title=p.title,
                     colorbar=p.colorbar, legend=p.legend, notes=[f"figure drawn by the {ctx.backend.name} renderer"])
@@ -334,7 +338,7 @@ def _legend_info(ctx: OpContext, p: ExportParams, spec, meta: dict, handle) -> d
     return info
 
 
-def _legends_on_figure(out: Path, p: ExportParams, view: tuple, info: dict, ctx: OpContext, spec) -> None:
+def _legends_on_figure(out: Path, items, p: ExportParams, view: tuple, info: dict, ctx: OpContext, spec) -> None:
     """Put the legend items on a backend figure (bare map exactly width_mm wide)."""
     from . import legends as lg  # noqa: PLC0415
 
@@ -346,7 +350,7 @@ def _legends_on_figure(out: Path, p: ExportParams, view: tuple, info: dict, ctx:
 
         with Image.open(out) as im:
             dpi = im.info.get("dpi")
-            new = lg.compose(im.copy(), p.legends, view_w / im.width, info)
+            new = lg.compose(im.copy(), items, view_w / im.width, info)
         kw = {"dpi": dpi} if dpi else {}
         if ext == ".png":
             new.save(out, "PNG", **kw)
@@ -357,10 +361,10 @@ def _legends_on_figure(out: Path, p: ExportParams, view: tuple, info: dict, ctx:
 
         m = _re.search(r'viewBox="[-\d.eE]+ [-\d.eE]+ ([-\d.eE]+) ', out.read_text(encoding="utf-8")[:4000])
         units = float(m.group(1)) if m else 1.0
-        lg.compose_svg(out, p.legends, view_w / units, info)
+        lg.compose_svg(out, items, view_w / units, info)
     elif ext == ".pdf":
         width_pt = p.width_mm / 25.4 * 72
-        lg.compose_pdf(out, p.legends, view_w / width_pt, info)
+        lg.compose_pdf(out, items, view_w / width_pt, info)
 
 
 def export_files(project, step) -> tuple[Path, Path]:

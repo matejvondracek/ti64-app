@@ -2,8 +2,10 @@
 scale bar, colour bar (value maps) or colour swatches (phase / ID maps), IPF colour key. Python-only, shared by
 export.map (both backends) and sem.export.
 
-A legend item is placed in fractions of the exported image: x, y = its top-left corner, w = its width (0..1 of the
-image width), the same numbers the viewer stores when the user drags / resizes the box over the map. Raster exports
+A legend item is anchored to the MAP (frame "map", phase 6.6 fix 2): x, y = its top-left corner and w = its width as
+fractions of the whole map (or image / mosaic) width and height, so it moves and scales with zoom and pan in the
+viewer and an export of any region puts it exactly where it sits on the map (in_region() converts to fractions of
+the exported region). Items saved before (frame "image") are fractions of the exported image. Raster exports
 (PNG / TIFF) get the items burnt in; SVG gets them as embedded images (the map stays vector); PDF gets an overlay
 page merged on top (pypdf).
 """
@@ -27,14 +29,39 @@ DEFAULTS = {"scale_bar": (0.03, 0.88, 0.22), "colorbar": (0.68, 0.86, 0.28), "ip
 
 class LegendItem(BaseModel):
     kind: LegendKind
-    x: float = Field(0.03, ge=-0.5, le=1.5, description="left edge, fraction of the image width")
-    y: float = Field(0.88, ge=-0.5, le=1.5, description="top edge, fraction of the image height")
-    w: float = Field(0.2, gt=0, le=1.0, description="width, fraction of the image width")
+    x: float = Field(0.03, description="left edge, fraction of the map (frame 'map') or image width")
+    y: float = Field(0.88, description="top edge, fraction of the map or image height")
+    w: float = Field(0.2, gt=0, le=50.0, description="width, fraction of the map or image width")
+    frame: Literal["map", "image"] = "image"
 
 
 def default_item(kind: str) -> LegendItem:
     x, y, w = DEFAULTS[kind]
-    return LegendItem(kind=kind, x=x, y=y, w=w)
+    return LegendItem(kind=kind, x=x, y=y, w=w, frame="map")
+
+
+def in_region(items: list[LegendItem] | None, extent: tuple[float, float, float, float],
+              region: tuple[float, float, float, float] | None) -> list[LegendItem]:
+    """Items as fractions of an exported region. extent = (x0, x1, y0, y1) of the whole map (um or px), region =
+    (x0, y0, x1, y1) of the export (None = whole map). Map-anchored items keep their place on the map, so an item
+    outside the region is left out; image-frame items are returned unchanged."""
+    out = []
+    ex0, ex1, ey0, ey1 = extent
+    for it in items or []:
+        if it.frame != "map" or region is None:
+            out.append(it.model_copy(update={"frame": "image"}))
+            continue
+        rx0, ry0, rx1, ry1 = min(region[0], region[2]), min(region[1], region[3]), max(region[0], region[2]),             max(region[1], region[3])
+        mw, mh, rw, rh = ex1 - ex0, ey1 - ey0, rx1 - rx0, ry1 - ry0
+        if rw <= 0 or rh <= 0:
+            continue
+        x = (ex0 + it.x * mw - rx0) / rw
+        y = (ey0 + it.y * mh - ry0) / rh
+        w = it.w * mw / rw
+        if x + w < 0 or x > 1 or y > 1 or y < -1 or w > 1:   # not inside the exported region / larger than it
+            continue
+        out.append(LegendItem(kind=it.kind, x=x, y=y, w=w, frame="image"))
+    return out
 
 
 def _font(px: float):

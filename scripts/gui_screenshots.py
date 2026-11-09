@@ -289,8 +289,7 @@ def flow(r: Run, page, base: str, work: Path, crop: Path, stitch: list[Path], no
         mark(page, "edit_menu").wait_for()
         choose(page, "ebsd_file", "JU02")
         page.wait_for_timeout(800)
-        mark(page, "run_load").click()
-        wait_idle(page, 1500)
+        wait_idle(page, 1500)                       # the selected map loads by itself (fix 2)
         mark(page, "map_viewer").wait_for(timeout=300_000)
         page.wait_for_timeout(2500)
         r.shot("ebsd_loaded_history_right")
@@ -485,7 +484,7 @@ def flow(r: Run, page, base: str, work: Path, crop: Path, stitch: list[Path], no
         r.shot("stitch_arrange_moved_locked")
         if no_stitch:
             return
-        mark(page, "st_refine").click()
+        mark(page, "st_run").click()                # one 'Stitch' button (refines within the radius)
         mark(page, "st_summary_BSE").wait_for(timeout=900_000)
         page.mouse.move(700, 700)
         page.wait_for_timeout(1500)

@@ -75,6 +75,8 @@ TIPS: dict[str, str] = {
     "colony_tol": "α grains whose misorientation is within this angle are grouped into one colony.",
     "beta_line_spacing_um": "Spacing of the test lines for prior-β width / length (µm).",
     "gs_fig": "Which grain-size figure to draw with the backend.",
+    "gs_bin": "Histogram bin width in µm (empty = automatic, Freedman-Diaconis). The log-normal fit is drawn as "
+              "before; only the bars change.",
     "gs_oim": "Grain file exported from OIM Analysis, to compare the grain sizes with OIM.",
     # files / sheets
     "sample_id": "Specimen ID, e.g. JU04. Output folders and export names start with it.",
@@ -88,7 +90,7 @@ TIPS: dict[str, str] = {
     "input_state": "raw = straight from indexing; OIM-cleaned = already cleaned in OIM Analysis. Selects the "
                    "cleanup preset; changing it marks this map's results stale.",
     "bd_map": "Build direction in MAP coordinates (x right, y down): angle from +x toward +y (clockwise on "
-              "screen), or a vector. Required before loading the map; never guessed.",
+              "screen), or a vector. Not needed to load the map; steps that use it ask for it. Never guessed.",
     "position": "Where the map's first pixel sits on the specimen (sample frame, mm) and which specimen axes "
                 "the map +x / +y point along.",
     "role": "Which part of the bent specimen the map shows: tension, middle (near the neutral axis) or "

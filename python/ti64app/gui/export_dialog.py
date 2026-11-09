@@ -17,12 +17,13 @@ from nicegui import ui
 
 from ..project import Project
 from . import dialogs
-from .shell import error
+from .shell import error, notify_actions
 from .state import GuiState
 
-EXT = {"png": ".png", "tiff": ".tif", "svg": ".svg", "pdf": ".pdf"}
+EXT = {"png": ".png", "tiff": ".tif", "svg": ".svg", "pdf": ".pdf", "bigtiff": ".tif"}
 TYPES = {"png": ("PNG image", "*.png"), "tiff": ("TIFF image", "*.tif;*.tiff"), "svg": ("SVG vector", "*.svg"),
-         "pdf": ("PDF document", "*.pdf")}
+         "pdf": ("PDF document", "*.pdf"), "bigtiff": ("BigTIFF image (tiled)", "*.tif;*.tiff")}
+FRACTIONS = {"1/2": 2, "1/4": 4, "1/8": 8}          # images / mosaics: export size as a fraction of the original
 DEFAULTS = {"format": "png", "res": "native", "width_mm": 120.0, "dpi": 600, "px_w": None, "overlays": True,
             "annotations": True, "info_strip": True, "region": "map", "folder": ""}
 LEGEND_NAMES = {"scale_bar": "scale bar", "colorbar": "colour bar / colour legend", "ipf_key": "IPF colour key"}
@@ -45,6 +46,11 @@ def export_size(res: str, region_um: tuple[float, float], step: tuple[float, flo
     """Final pixel size, pixel size (um) and physical size of an export (what the ops will write, to +-1 px)."""
     w_um, h_um = region_um
     dx, dy = step
+    if res in FRACTIONS and native_px is not None:          # 1/2, 1/4, 1/8 of an image / mosaic (box average)
+        k = FRACTIONS[res]
+        W, H = -(-native_px[0] // k), -(-native_px[1] // k)          # PIL reduce rounds up
+        px = py = w_um / max(native_px[0], 1) * k
+        return {"W": W, "H": H, "px_um": px, "py_um": py, "w_um": w_um, "h_um": h_um}
     if res == "native" or res in ("2", "4", "8"):
         k = 1 if res == "native" else int(res)
         if native_px is not None and k == 1:
@@ -101,11 +107,15 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                               else Path(image or "").name)).classes("text-lg font-semibold")
         with ui.row().classes("w-full items-center gap-2"):
             ui.label("Format").classes("w-24 ti-muted")
-            fmt = ui.toggle({"png": "PNG", "tiff": "TIFF", "svg": "SVG", "pdf": "PDF"}, value=last["format"]) \
+            fmt_opts = {"png": "PNG", "tiff": "TIFF", "svg": "SVG", "pdf": "PDF",
+                        **({} if is_map else {"bigtiff": "BigTIFF (tiled)"})}
+            fmt = ui.toggle(fmt_opts, value=last["format"] if last["format"] in fmt_opts else "png") \
                 .props("no-caps rounded unelevated toggle-color=primary").mark("exp_fmt")
         res_opts = ({"native": "native (1 px per measurement)", "2": "2×", "4": "4×", "8": "8×",
                      "px": "size in pixels", "width": "width in mm at DPI"} if is_map else
-                    {"native": "native (1 px per image pixel)", "px": "size in pixels", "width": "width in mm at DPI"})
+                    {"native": "1 (native, 1 px per image pixel)", "1/2": "1/2 of the original",
+                     "1/4": "1/4 of the original", "1/8": "1/8 of the original", "px": "size in pixels",
+                     "width": "width in mm at DPI"})
         with ui.row().classes("w-full items-end gap-2 no-wrap"):
             ui.label("Resolution").classes("w-24 ti-muted pb-2")
             res = ui.select(res_opts, value=last["res"] if last["res"] in res_opts else "native").classes("w-56") \
@@ -129,6 +139,7 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                 region = ui.select(reg_opts, value=last["region"] if last["region"] in reg_opts else "map") \
                     .classes("w-56").mark("exp_region")
         size_lab = ui.label().classes("text-sm font-semibold").mark("exp_size")
+        warn_box = ui.column().classes("w-full gap-1").mark("exp_size_warn")
         hex_lab = ui.label().classes("text-xs ti-muted").mark("exp_hex_note")
         with ui.row().classes("w-full items-center gap-3"):
             ui.label("Include").classes("w-24 ti-muted")
@@ -139,10 +150,21 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                 ann = ui.checkbox("annotations", value=last["annotations"]).mark("exp_annotations")
             else:
                 strip = ui.checkbox("info strip / data bar", value=last["info_strip"]).mark("exp_strip")
-        ui.label("Legends as placed on the view: " + (", ".join(LEGEND_NAMES[it["kind"]] for it in legends)
-                                                      if legends else "none") +
-                 ". Move, resize, show or hide them on the view; the export puts them exactly there.") \
-            .classes("text-xs ti-muted").mark("exp_legends")
+        leg_lab = ui.label().classes("text-xs ti-muted").mark("exp_legends")
+
+        def legends_text(_=None):
+            names = [LEGEND_NAMES[it["kind"]] for it in legends]
+            strip_bar = (not is_map and strip is not None and strip.value
+                         and any(it["kind"] == "scale_bar" for it in legends))
+            if strip_bar:                 # the info strip / data bar has its own scale bar (user test, fix 16)
+                names = [n for n in names if n != LEGEND_NAMES["scale_bar"]]
+            leg_lab.text = ("Legends as placed on the view: " + (", ".join(names) if names else "none") +
+                            ". Move, resize, show or hide them on the view; the export puts them exactly there." +
+                            (" The scale bar comes from the info strip / data bar (the one on the view is left "
+                             "out, so there is only one)." if strip_bar else ""))
+        legends_text()
+        if strip is not None:
+            strip.on_value_change(legends_text)
         with ui.row().classes("w-full items-end gap-2 no-wrap"):
             dest = ui.input("Save as", value=str(Path(last["folder"] or Path.home() / "Documents") /
                                                  (base + EXT[last["format"]]))).classes("grow").mark("exp_dest")
@@ -199,8 +221,40 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                     " Hover the ⓘ next to Resolution for the difference."
             else:
                 hex_lab.text = ""
-            if s["W"] * s["H"] > 400e6:
-                size_lab.text += " – very large; consider a smaller size"
+            if is_map:
+                if s["W"] * s["H"] > 400e6:
+                    size_lab.text += " – very large; consider a smaller size"
+                return
+            size_check(s)
+
+        def size_check(s: dict):
+            """Images / mosaics: pixels and memory BEFORE the export (fix 15); refused sizes offer 1/2, 1/4, 1/8 or
+            the tiled BigTIFF instead of failing."""
+            from ..ops_stitch import export_estimate  # noqa: PLC0415
+
+            nat = tuple(geometry.get("size_px") or (1, 1))
+            est = export_estimate(nat, (s["W"], s["H"]), fmt.value, int(geometry.get("bytes_per_px") or 1))
+            state["est"] = est
+            warn_box.clear()
+            if est["level"] == "ok":
+                if state.get("btn"):
+                    state["btn"].set_enabled(True)
+                return
+            refuse = est["level"] == "refuse"
+            with warn_box, ui.column().classes("w-full gap-1 p-2 rounded border " + (
+                    "bg-red-50 border-red-300" if refuse else "bg-amber-50 border-amber-300")):
+                ui.label(("Cannot export: " if refuse else "Large export: ") + est["message"] +
+                         f" (≈ {fmt_bytes(est['memory_bytes'])} of memory)").classes("text-xs").mark("exp_warn_text")
+                with ui.row().classes("gap-2"):
+                    for a in est["alternatives"][:3]:
+                        ui.button(f"Use {a['fraction']} ({a['W']:,} × {a['H']:,} px)",
+                                  on_click=lambda a=a: setattr(res, "value", a["fraction"])) \
+                            .props("outline dense no-caps").mark(f"exp_use_{a['fraction'].replace('/', '_')}")
+                    if fmt.value != "bigtiff":
+                        ui.button("Use BigTIFF (tiled)", on_click=lambda: setattr(fmt, "value", "bigtiff")) \
+                            .props("outline dense no-caps").mark("exp_use_bigtiff")
+            if state.get("btn"):
+                state["btn"].set_enabled(not refuse)
 
         def h_typed(e):
             if state["lock"] or res.value != "px" or not e.value:
@@ -239,6 +293,10 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                 ui.notify(f"Folder {target.parent} does not exist.", type="warning")
                 return
             s = size()
+            if not is_map and (state.get("est") or {}).get("level") == "refuse":
+                ui.notify("This size cannot be exported: press 'Use 1/2', 'Use 1/4', 'Use 1/8' or 'Use BigTIFF "
+                          "(tiled)' in this dialog.", type="warning")
+                return
             dlg.close()
             if c["res"] == "px":                            # an exact pixel width = a figure / resize of that width
                 c["res"], c["dpi"], c["width_mm"] = "width", 300, s["W"] / 300 * 25.4
@@ -260,7 +318,8 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                 step = await run_step("export.map", prm, "export", None, with_map=False)
             else:
                 prm = {"detector": detector, "format": c["format"],
-                       "mode": "native" if c["res"] == "native" else "width", "width_mm": c["width_mm"], "dpi": c["dpi"],
+                       "mode": ("native" if c["res"] == "native" else "scale" if c["res"] in FRACTIONS else "width"),
+                       "scale": 1.0 / FRACTIONS.get(c["res"], 1), "width_mm": c["width_mm"], "dpi": c["dpi"],
                        "info_strip": c["info_strip"], "name": target.stem, "sample_id": sample_id,
                        "legends": legends, "scale_bar": False}
                 prm.update({"stitch": stitch_step} if kind == "mosaic" else {"image": image})
@@ -272,14 +331,16 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                 shutil.copy2(src, target)
                 side = p.root / step.outputs["sidecar"].path
                 shutil.copy2(side, target.with_suffix(".json"))
-                ui.notify(f"Exported {target.name} to {target.parent}", type="positive",
-                          actions=[{"label": "Show", "color": "white",
-                                    ":handler": f"() => fetch('/api/ti64/reveal?path={_q(target)}', {{method: 'POST'}})"}])
+                notify_actions(f"Exported {target.name} to {target.parent}",
+                               [("Show", f"() => fetch('/api/ti64/reveal?path={_q(target)}', {{method: 'POST'}})")],
+                               type="positive", multi_line=False)
             except Exception as e:  # noqa: BLE001
                 error(e, "Could not write the exported file")
         with ui.row().classes("w-full justify-end"):
             ui.button("Cancel", on_click=dlg.close).props("flat").mark("exp_cancel")
-            ui.button("Export", icon="ios_share", on_click=go).mark("run_export")
+            state["btn"] = ui.button("Export", icon="ios_share", on_click=go).mark("run_export")
+        if not is_map:
+            update()                                   # enable / disable Export from the size check
     dlg.open()
 
 

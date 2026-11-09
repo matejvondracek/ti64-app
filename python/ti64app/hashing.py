@@ -37,9 +37,26 @@ def png_hash(path: Path) -> str:
     """Hash of the decoded pixels (RGBA) of an image, independent of PNG metadata/compression."""
     from PIL import Image  # noqa: PLC0415
 
-    with Image.open(path) as im:
-        a = np.asarray(im.convert("RGBA"))
-    return array_hash({"rgba": a})
+    # Our own output files: PIL's decompression-bomb limit (179 Mpx) made a 9767 x 22453 px mosaic export fail AFTER
+    # it was written. RGBA is converted in row bands (a full RGBA copy is 4 B per pixel); the digest is identical to
+    # array_hash({"rgba": full RGBA array}).
+    old = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            im.load()
+            W, H = im.size
+            h = hashlib.sha256()
+            h.update(b"rgba")
+            h.update(b"uint8")
+            h.update(str((H, W, 4)).encode())
+            band = max(1, 2**26 // max(1, 4 * W))
+            for y in range(0, H, band):
+                h.update(np.ascontiguousarray(np.asarray(im.crop((0, y, W, min(H, y + band))).convert("RGBA")))
+                         .tobytes())
+    finally:
+        Image.MAX_IMAGE_PIXELS = old
+    return "sha256:" + h.hexdigest()
 
 
 def bytes_hash(path: Path) -> str:

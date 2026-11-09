@@ -15,6 +15,7 @@ the steps it depends on, without recording them again.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -28,7 +29,7 @@ from pydantic import BaseModel
 
 from . import __version__, history
 from .backends import get_backend
-from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, LoadParams
+from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, EngineRestarted, LoadParams
 from .hashing import array_hash, bytes_hash, file_fingerprint, json_hash, npz_hash, png_hash, xlsx_hash
 from .io import bse as bse_io
 from .io import up2 as up2_io
@@ -47,6 +48,7 @@ class OpContext:
     out_dir: Path = Path()
     outputs: dict[str, tuple] = field(default_factory=dict)   # name -> (kind, value[, file stem])
     metrics: dict[str, float] = field(default_factory=dict)
+    need_object: bool = False                 # materialize(): the backend object is wanted (no cache shortcut)
 
     def add_input(self, path: str | Path) -> None:
         p = Path(path)
@@ -88,6 +90,15 @@ def op(name: str, params: type[BaseModel], uses_backend: bool):
 
 # backend objects still alive: (project root, step id, backend) -> handle
 SESSION: dict[tuple[str, str, str], Any] = {}
+# plain-language notices for the GUI (e.g. "MATLAB stopped unexpectedly and was restarted"), taken by pop_notices()
+NOTICES: list[str] = []
+log = logging.getLogger("ti64app.service")
+
+
+def pop_notices() -> list[str]:
+    out = list(NOTICES)
+    NOTICES.clear()
+    return out
 
 
 # ---- operations -------------------------------------------------------------------------------
@@ -123,7 +134,24 @@ def _ebsd_load(ctx: OpContext) -> None:
     sheet = ctx.project.sample(p.map_id)
     ctx.add_input(sheet.map_file)
     lp = LoadParams(file=Path(sheet.map_file), input_state=sheet.input_state, setting=p.setting)
+    # loaded-map cache per backend (CLAUDE.md): keyed by file fingerprint, input state, setting, backend + versions.
+    # A recorded load whose map is cached takes its data from there; the backend object is made only when a later
+    # step needs it (materialize -> need_object)
+    key = json_hash([ctx.step.inputs[-1].fingerprint, lp.input_state, lp.setting, ctx.backend.name,
+                     ctx.backend.versions()])[7:31]
+    cdir = ctx.project.cache_dir / "maps"
+    cnpz, cmeta = cdir / f"{ctx.backend.name}_{key}.npz", cdir / f"{ctx.backend.name}_{key}.json"
     t0 = time.perf_counter()
+    if not ctx.need_object and cnpz.is_file() and cmeta.is_file():
+        try:
+            meta = json.loads(cmeta.read_text(encoding="utf-8"))
+            data = EBSDData.from_npz(cnpz, meta)
+            ctx.metrics.update(cached=1.0, load_s=round(time.perf_counter() - t0, 2), n_points=data.n)
+            ctx.output("ebsd", "npz", data)
+            ctx.output("meta", "json", {**data.meta(), "input_state": sheet.input_state, "map_id": p.map_id})
+            return
+        except (OSError, ValueError, KeyError):
+            pass                                          # damaged cache entry: load again
     h = ctx.backend.load_ebsd(lp)
     t1 = time.perf_counter()
     data = ctx.backend.get_ebsd(h)
@@ -132,6 +160,15 @@ def _ebsd_load(ctx: OpContext) -> None:
     ctx.metrics.update(load_s=round(t1 - t0, 2), transfer_s=round(t2 - t1, 2), n_points=data.n)
     ctx.output("ebsd", "npz", data)
     ctx.output("meta", "json", {**data.meta(), "input_state": sheet.input_state, "map_id": p.map_id})
+    if not cnpz.is_file():
+        try:
+            cdir.mkdir(parents=True, exist_ok=True)
+            tmp = cdir / f".{cnpz.stem}.{time.time_ns()}.npz"
+            data.save_npz(tmp)
+            tmp.replace(cnpz)
+            write_json(cmeta, data.meta())
+        except OSError:
+            pass
 
 
 class Up2HeaderParams(BaseModel):
@@ -270,7 +307,16 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
         _mark_running(project, step)
     t0 = time.perf_counter()
     try:
-        spec.func(ctx)
+        try:
+            spec.func(ctx)
+        except EngineRestarted as e:         # MATLAB died and was restarted: run the step once more (its sources
+            log.warning("%s; rerunning %s", e, op_name)   # are rebuilt from the recipe by materialize())
+            step.inputs = []
+            ctx = OpContext(project, step, dict(params), be, ctx.out_dir)
+            shutil.rmtree(ctx.out_dir, ignore_errors=True)
+            spec.func(ctx)
+            step.metrics["engine_restarted"] = 1.0
+            NOTICES.append(f"{e} The step '{op_name}' was run again after the restart.")
         step.params = ctx.params                 # ops record resolved values (e.g. source step, preset)
         step.outputs = {n: _write_output(ctx, n, *o) for n, o in ctx.outputs.items()}
     except Exception:
@@ -280,27 +326,29 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
         if record:
             project.clear_interrupted()
         raise
-    step.metrics = {**ctx.metrics, "seconds": round(time.perf_counter() - t0, 2), **_memory_GB()}
+    step.metrics = {**step.metrics, **ctx.metrics, "seconds": round(time.perf_counter() - t0, 2), **_memory_GB()}
     if record:
         project.clear_interrupted()
         for i in step.inputs:                    # size + mtime of linked files when used ("changed" warning)
             if not isinstance(i, str):
                 project.touch_file(i.path)
         r = project.recipe()
-        if op_name == "sample.set":      # a changed sheet makes everything on that map stale (not: notes, names)
+        if op_name == "sample.set":      # a changed sheet makes the results that depend on it stale (not: notes)
+            from .sample import stale_on_sheet_change  # noqa: PLC0415
+
             mid = params["map_id"]
             prev = [s for s in r.steps if s.op == "sample.set" and s.params.get("map_id") == mid and not s.stale]
-            if not prev or any(prev[-1].params.get(k) != params.get(k) for k in SHEET_RESULT_KEYS):
-                r.mark_stale(lambda s: s.params.get("map_id") == mid)
-            else:
-                r.mark_stale(lambda s: s.op == "sample.set" and s.params.get("map_id") == mid)
+            pred = stale_on_sheet_change(mid, prev[-1].params if prev else None, params)
+            r.mark_stale(lambda s: (s.op == "sample.set" and s.params.get("map_id") == mid) or pred(s))
         r.add(step)
         project.save_recipe(r)
         history.commit(project, f"{op_name} {step.params.get('map_id', '')} ({step.id})".replace("  ", " "), before)
+        if step_id is None:
+            release_stale(project)
     return step
 
 
-SHEET_RESULT_KEYS = ("map_file", "input_state", "build_direction", "bending", "position")
+from .sample import SHEET_RESULT_KEYS  # noqa: E402  (kept importable from here)
 
 
 def record_sheet(project: Project, map_id: str) -> RecipeStep | None:
@@ -353,6 +401,58 @@ def switch_backend(project: Project, backend: str) -> int:
     return n
 
 
+def plan_delete(project: Project, ids: list[str] | set[str], only_unused: bool = False) -> dict:
+    """What deleting steps would remove. Steps that use a deleted step are deleted with it (their results would have
+    no source), unless only_unused: then the steps that live steps still use are KEPT (used by 'Delete stale steps').
+    Returns {delete: [ids in recipe order], dependents: [ids added because they use a deleted step],
+    kept: [ids kept because live steps use them]}."""
+    from .recipe import references  # noqa: PLC0415
+
+    steps = project.recipe().steps
+    known = {s.id for s in steps}
+    refs = {s.id: references(s, known) for s in steps}
+    want = set(ids) & known
+    kept: set[str] = set()
+    if only_unused:
+        live_refs = set().union(*[refs[s.id] for s in steps if s.id not in want and not s.stale] or [set()])
+        changed = True
+        while changed:                       # a kept step keeps what it uses
+            changed = False
+            for i in list(want):
+                if i in live_refs or any(i in refs[k] for k in kept):
+                    want.discard(i)
+                    kept.add(i)
+                    changed = True
+    dep: set[str] = set()
+    changed = True
+    while changed and not only_unused:
+        changed = False
+        for s in steps:
+            if s.id not in want and refs[s.id] & want:
+                want.add(s.id)
+                dep.add(s.id)
+                changed = True
+    order = [s.id for s in steps]
+    return {"delete": [i for i in order if i in want], "dependents": [i for i in order if i in dep],
+            "kept": [i for i in order if i in kept]}
+
+
+def delete_steps(project: Project, ids: list[str] | set[str], label: str, only_unused: bool = False) -> dict:
+    """Remove steps from the recipe as ONE undo entry (Ctrl+Z / Undo brings them back). Output files stay in
+    outputs/ (undo needs them); plan_delete() decides the dependents."""
+    plan = plan_delete(project, ids, only_unused)
+    if not plan["delete"]:
+        return plan
+    before = history.snapshot(project)
+    r = project.recipe()
+    gone = set(plan["delete"])
+    r.steps = [s for s in r.steps if s.id not in gone]
+    project.save_recipe(r)
+    history.commit(project, f"{label} ({len(gone)} step{'s' if len(gone) != 1 else ''})", before)
+    _release_steps(project, gone)
+    return plan
+
+
 def undo(project: Project) -> str | None:
     """Undo the last recorded action (recipe step or backend switch); returns its label."""
     return history.undo(project)
@@ -367,7 +467,7 @@ class OutputCheck(BaseModel):
     step_id: str
     op: str
     output: str
-    status: str                 # identical | within_tolerance | not_compared | different | missing
+    status: str                 # identical | within_tolerance | not_compared | other_backend | different | missing
     detail: str = ""
 
 
@@ -379,10 +479,16 @@ class StepRun(BaseModel):
     seconds: float = 0.0
 
 
+class ReplayCancelled(Exception):
+    """Raised by a should_stop callback / cancel request between two steps of run_recipe."""
+
+
 class RunReport(BaseModel):
     """Result of running a recipe into a project (ti64 run, MCP run_recipe) or of a replay."""
     project_root: str
     backend_override: str | None
+    cancelled: bool = False
+    seconds: float = 0.0
     steps: list[StepRun] = []
     skipped: list[str] = []      # stale steps not run
     checks: list[OutputCheck] = []
@@ -390,8 +496,8 @@ class RunReport(BaseModel):
 
     @property
     def ok(self) -> bool:
-        return not self.input_changes and all(c.status in ("identical", "within_tolerance", "not_compared")
-                                              for c in self.checks)
+        return not self.input_changes and all(c.status in ("identical", "within_tolerance", "not_compared",
+                                                           "other_backend") for c in self.checks)
 
     @property
     def replay_root(self) -> str:
@@ -466,6 +572,11 @@ def _check_output(name: str, ref: OutputRef, new: RecipeStep, s: RecipeStep, rec
         return OutputCheck(**c, status="missing")
     if nref.content_hash == ref.content_hash:
         return OutputCheck(**c, status="identical")
+    if s.backend and new.backend and s.backend != new.backend:
+        # another engine never reproduces the bytes; comparing 2.6 M-point arrays value by value took ~13 s per
+        # output and says nothing (backends agree within the conformance tolerances, tests/conformance)
+        return OutputCheck(**c, status="other_backend",
+                           detail=f"recorded with {s.backend}, replayed with {new.backend}: not compared value by value")
     if ref.kind in ("svg", "pdf"):
         return OutputCheck(**c, status="not_compared",
                            detail="vector file regenerated (renderer timestamps); its sidecar is compared")
@@ -486,12 +597,15 @@ def _check_output(name: str, ref: OutputRef, new: RecipeStep, s: RecipeStep, rec
 
 def run_recipe(target: Project, steps: list[RecipeStep], backend: str | None = None,
                include_stale: bool = False, until: str | None = None, recorded_root: Path | None = None,
-               compare: bool = True, on_step: Callable[[int, int, RecipeStep], None] | None = None) -> RunReport:
+               compare: bool = True, on_step: Callable[[int, int, RecipeStep], None] | None = None,
+               should_stop: Callable[[], bool] | None = None) -> RunReport:
     """Run recipe steps in order into `target` (each recorded there with its original id, so references between
     steps stay valid). Backend steps use the recorded backend (or the target project's backend for hand-written
     steps without one) unless `backend` overrides it. Recorded outputs (content hashes) are compared with the new
     ones; `recorded_root` = the project the steps came from (for tolerance checks of differing arrays / tables).
-    Stale steps are skipped unless include_stale; `until` stops after that step id."""
+    Stale steps are skipped unless include_stale; `until` stops after that step id. on_step(k, n, step) is called
+    before each step (progress); should_stop() is checked between steps (Cancel: the running step finishes, the
+    report is returned with cancelled=True)."""
     known = {s.id for s in target.recipe().steps}
     todo = [s for s in steps if include_stale or not s.stale]
     clash = sorted(known & {s.id for s in todo})
@@ -502,7 +616,18 @@ def run_recipe(target: Project, steps: list[RecipeStep], backend: str | None = N
             raise KeyError(f"step {s.id}: unknown operation {s.op!r}")
     rep = RunReport(project_root=str(target.root), backend_override=backend,
                     skipped=[s.id for s in steps if s.stale and not include_stale])
+    from .recipe import references  # noqa: PLC0415
+
+    ids = {s.id for s in todo}
+    last_use = {}                             # step id -> index of the last step that uses its backend object
     for k, s in enumerate(todo):
+        for r in references(s, ids):
+            last_use[r] = k
+    t_start = time.perf_counter()
+    for k, s in enumerate(todo):
+        if should_stop and should_stop():
+            rep.cancelled = True
+            break
         for inp in s.inputs:
             if isinstance(inp, FileInput):
                 p = Path(inp.path)
@@ -517,21 +642,30 @@ def run_recipe(target: Project, steps: list[RecipeStep], backend: str | None = N
                                  seconds=new.metrics.get("seconds", 0.0)))
         if compare:
             rep.checks += [_check_output(n, ref, new, s, recorded_root, target.root) for n, ref in s.outputs.items()]
+        # free backend objects no later step uses (a replay kept every map, grain set and reconstruction alive and
+        # ran out of RAM); materialize() rebuilds one if it is needed after all
+        _release_steps(target, [i for i in ids if last_use.get(i, -1) <= k])
         if until and s.id == until:
             break
+    rep.seconds = round(time.perf_counter() - t_start, 2)
     return rep
 
 
 def replay(project: Project, backend: str | None = None, into: Path | None = None,
-           include_stale: bool = False, until: str | None = None) -> RunReport:
+           include_stale: bool = False, until: str | None = None,
+           on_step: Callable[[int, int, RecipeStep], None] | None = None,
+           should_stop: Callable[[], bool] | None = None) -> RunReport:
     """Re-run the recipe in a scratch project and compare every output with the recorded one.
     Backend steps use the recorded backend unless `backend` overrides it; `until` stops after that step."""
     root = into or project.cache_dir / f"replay_{datetime.now():%Y%m%d_%H%M%S}"
     if root.exists():
         shutil.rmtree(root)
     scratch = Project.create(root.name, base=root.parent, backend=project.info().backend)
-    return run_recipe(scratch, project.recipe().steps, backend=backend, include_stale=include_stale, until=until,
-                      recorded_root=project.root)
+    try:
+        return run_recipe(scratch, project.recipe().steps, backend=backend, include_stale=include_stale, until=until,
+                          recorded_root=project.root, on_step=on_step, should_stop=should_stop)
+    finally:
+        release_project(scratch)              # backend objects of the scratch copy (RAM, MATLAB workspace)
 
 
 def release_project(project: Project) -> int:
@@ -547,6 +681,25 @@ def release_project(project: Project) -> int:
     return len(keys)
 
 
+def _release_steps(project: Project, step_ids) -> int:
+    """Release the backend objects of these steps of a project (if alive)."""
+    want, n = set(step_ids), 0
+    for key in [k for k in SESSION if k[0] == str(project.root) and k[1] in want]:
+        h = SESSION.pop(key)
+        n += 1
+        try:
+            get_backend(key[2]).release(h)
+        except Exception:  # noqa: BLE001
+            pass
+    return n
+
+
+def release_stale(project: Project) -> int:
+    """Release the backend objects of stale steps (a newer step replaced them); they are rebuilt if ever needed."""
+    stale = {s.id for s in project.recipe().steps if s.stale}
+    return _release_steps(project, stale)
+
+
 def materialize(project: Project, step_id: str, backend: str) -> Any:
     """Backend object produced by an earlier step; rebuilt by re-running that step (and, through
     ctx.use, its own sources) without recording it or writing outputs."""
@@ -557,7 +710,7 @@ def materialize(project: Project, step_id: str, backend: str) -> Any:
         return h
     s = project.recipe().step(step_id)
     ctx = OpContext(project, RecipeStep(op=s.op, params=dict(s.params), backend=backend), dict(s.params),
-                    be, project.cache_dir / "rebuild")
+                    be, project.cache_dir / "rebuild", need_object=True)
     ctx.step.id = step_id
     OPS[s.op].func(ctx)
     if key not in SESSION:

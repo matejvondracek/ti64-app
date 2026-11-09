@@ -130,7 +130,7 @@ def view_page() -> None:
     want = gs.get("view_file")
     key0 = f"file:{want}" if want and f"file:{want}" in opts else (gs.get("view_source") if gs.get("view_source") in opts
                                                                     else next(iter(opts), None))
-    st: dict = {"key": key0, "src": None, "viewer": None}
+    st: dict = {"key": key0, "src": None, "viewer": None, "timers": []}
 
     with ui.row().classes("w-full no-wrap gap-0 items-stretch").style("height: calc(100vh - 56px)"):
         left = ui.column().classes("h-full shrink-0 bg-white border-r gap-0").style("width: 360px").mark("view_left")
@@ -177,6 +177,10 @@ def view_page() -> None:
     async def show():
         key = st["key"]
         gs.set("view_source", key)
+        for t in st["timers"]:                       # progress polling of a previous .up2 overview pass
+            t.deactivate()
+        st["timers"].clear()
+        with_bar.set_visibility(True)
         if key and key.startswith("file:"):
             m = p.file(key[5:])
             gs.set("view_file", m.id if m else None)
@@ -211,17 +215,22 @@ def view_page() -> None:
         exp_btn.enable()
 
     def show_up2(m):
+        """.up2: overview map (pattern quality / virtual BSE from one streaming pass, cached) in the viewer; a click
+        loads only the pattern under the cursor (fix 13)."""
         from ..io import up2  # noqa: PLC0415
+        from ..modules import up2_overview as uo  # noqa: PLC0415
 
-        bar.set_visibility(False)
+        bar.set_visibility(True)
+        with_bar.set_visibility(False)
         st["src"] = None
+        st["viewer"] = None
         exp_btn.disable()
-        title.text = ""
         try:
             h = up2.read_header(m.file)
         except Exception as e:  # noqa: BLE001
             error(e, "Could not read the .up2 header")
             return
+        title.text = f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}"
         meta_table([("file", Path(m.file).name), ("folder", str(Path(m.file).parent)),
                     ("format version", h.version), ("patterns", f"{h.n_patterns:,}"),
                     ("pattern size", f"{h.pattern_width} × {h.pattern_height} px (16 bit)"),
@@ -231,59 +240,266 @@ def view_page() -> None:
                     ("file size", f"{h.file_size / 1e9:.2f} GB"
                                   + ("" if h.size_ok else " (does not match the header!)")),
                     ("data offset", f"{h.data_offset} bytes")])
+        cache = p.cache_dir
+        o = dict(gs.get("up2_overview", m.id, default=None) or {})
+        o.setdefault("step", 2)
+        o.setdefault("channel", "iq")
+        o.setdefault("flatten", True)
+        o.setdefault("corrected", True)
         pos = gs.get("up2_pos", m.id, default=[h.n_rows // 2, h.n_cols // 2])
+        u = {"job": None, "ov": None, "timer": None, "busy": False}
+
+        def save_opts():
+            gs.set("up2_overview", m.id, dict(o))
+        with meta:
+            ui.label("Overview map: computed once by streaming the file in chunks (never loaded fully) and cached in "
+                     "the project's cache folder. Click a point of the map to load that one pattern.") \
+                .classes("text-xs ti-muted pt-2").mark("up2_note")
+
         holder.clear()
         with holder:
-            with ui.column().classes("w-full p-4 gap-3 items-start").mark("up2_viewer"):
-                ui.label(f"Pattern viewer: {Path(m.file).name}").classes("text-lg font-semibold")
-                ui.label("Patterns are read one at a time from the file (never loaded fully). Indexing of the patterns "
-                         "(Hough / dictionary, PyEBSDIndex) comes in phase 9.").classes("text-sm ti-muted") \
-                    .mark("up2_note")
-                with ui.row().classes("items-start gap-6 no-wrap"):
-                    img = ui.image().classes("border").style("width: 360px; height: 360px; image-rendering: pixelated") \
-                        .mark("up2_pattern")
-                    with ui.column().classes("gap-2"):
-                        with ui.row().classes("items-end gap-2 no-wrap"):
-                            row = ui.number("scan row", value=pos[0], min=0, max=h.n_rows - 1, step=1, format="%d") \
-                                .classes("w-32").mark("up2_row")
-                            col = ui.number("scan column", value=pos[1], min=0, max=h.n_cols - 1, step=1,
-                                            format="%d").classes("w-32").mark("up2_col")
+            with ui.row().classes("w-full h-full no-wrap gap-0 items-stretch").mark("up2_viewer"):
+                with ui.column().classes("grow h-full min-w-0 gap-0"):
+                    with ui.row().classes("w-full items-center gap-3 px-3 py-1 bg-white border-b").mark("up2_toolbar"):
+                        chan = ui.select(uo.CHANNELS, value=o["channel"], label="Map").classes("w-56") \
+                            .props("dense options-dense").mark("up2_channel") \
+                            .tooltip("Pattern quality: Krieger Lassen image quality after static + dynamic background "
+                                     "correction. Virtual BSE: mean intensity of the whole pattern.")
+                        flat = ui.checkbox("flatten shading", value=o["flatten"]).props("dense").mark("up2_flatten") \
+                            .tooltip("Divide by a strongly blurred copy of the map: removes the smooth shading from the "
+                                     "detector geometry and keeps the microstructure contrast (display only)")
+                        res = ui.select({4: "every 4th row and column (quick)", 2: "every 2nd row and column",
+                                         1: "full resolution (all patterns)"}, value=o["step"], label="Resolution") \
+                            .classes("w-60").props("dense options-dense").mark("up2_resolution") \
+                            .tooltip("Skipped rows are never read: every 2nd row reads half the file. Full resolution "
+                                     f"reads all {h.file_size / 1e9:.0f} GB (several minutes).")
+                        go = ui.button("Compute overview", icon="play_arrow", on_click=lambda: start()) \
+                            .props("dense no-caps").classes("px-3").mark("up2_compute")
+                        stop = ui.button("Cancel", icon="stop", on_click=lambda: cancel()) \
+                            .props("dense outline no-caps").classes("px-3").mark("up2_cancel")
+                    with ui.row().classes("w-full items-center gap-3 px-3 py-1 no-wrap bg-white border-b"):
+                        prog = ui.linear_progress(value=0, show_value=False).classes("grow").mark("up2_progress")
+                        ptext = ui.label("").classes("text-xs ti-muted whitespace-nowrap").mark("up2_progress_text")
+                    mapbox = ui.column().classes("w-full grow min-h-0 gap-0")
+                with ui.column().classes("h-full shrink-0 bg-white border-l p-3 gap-2").style("width: 320px"):
+                    ui.label("Pattern").classes("font-semibold")
+                    img = ui.image().classes("border").style("width: 260px; height: 260px; "
+                                                             "image-rendering: pixelated").mark("up2_pattern")
+                    corr = ui.checkbox("background corrected", value=o["corrected"]).props("dense") \
+                        .mark("up2_corrected") \
+                        .tooltip("Show the pattern minus the static background (mean pattern of the file) and minus "
+                                 "its own blurred copy (dynamic background), as used for the pattern quality. Off = "
+                                 "raw counts. Needs the overview (it holds the mean pattern).")
+                    info = ui.label("").classes("text-sm").style("white-space: pre-line").mark("up2_info")
+                    with ui.row().classes("items-end gap-2 no-wrap"):
+                        row = ui.number("scan row", value=pos[0], min=0, max=h.n_rows - 1, step=1, format="%d") \
+                            .classes("w-28").props("dense").mark("up2_row")
+                        col = ui.number("scan column", value=pos[1], min=0, max=h.n_cols - 1, step=1,
+                                        format="%d").classes("w-28").props("dense").mark("up2_col")
+                    with ui.row().classes("items-center gap-2 no-wrap"):
                         ui.label("Step to a neighbour").classes("text-xs ti-muted")
-                        with ui.grid(columns=3).classes("gap-1"):
+                        with ui.grid(columns=3).classes("gap-0"):
                             for lab, dr, dc, ic in (("", 0, 0, ""), ("up", -1, 0, "north"), ("", 0, 0, ""),
-                                                    ("left", 0, -1, "west"), ("", 0, 0, "center"),
+                                                    ("left", 0, -1, "west"), ("", 0, 0, ""),
                                                     ("right", 0, 1, "east"), ("", 0, 0, ""), ("down", 1, 0, "south"),
                                                     ("", 0, 0, "")):
                                 if lab:
                                     ui.button(icon=ic, on_click=lambda dr=dr, dc=dc: step(dr, dc)) \
-                                        .props("outline round dense").tooltip(f"pattern {lab}") \
+                                        .props("flat round dense size=sm").tooltip(f"pattern {lab}") \
                                         .mark(f"up2_{lab}")
                                 else:
                                     ui.element("div")
-                        info = ui.label("").classes("text-sm").mark("up2_info")
+
+        def placeholder(text: str):
+            st["viewer"] = None
+            mapbox.clear()
+            with mapbox:
+                with ui.column().classes("w-full h-full items-center justify-center gap-2 bg-gray-50") \
+                        .mark("up2_placeholder"):
+                    ui.icon("grid_on", size="48px").classes("ti-muted")
+                    ui.label(text).classes("text-center ti-muted").style("max-width: 420px")
+
+        def marker(r, c):
+            v = st["viewer"]
+            if v is not None:
+                v.set(shapes=[{"id": "up2_sel", "type": "point", "text": "", "width_pt": 1, "color": "#e53935",
+                               "xy": [[(c + 0.5 + (0.5 if h.hex_grid and r % 2 else 0)) * h.x_step_um,
+                                       (r + 0.5) * h.y_step_um]]}])
 
         def draw():
-            r, c = int(row.value or 0), int(col.value or 0)
+            if u["busy"]:
+                return
+            r = min(max(int(row.value or 0), 0), h.n_rows - 1)
+            c = min(max(int(col.value or 0), 0), up2.row_length(h, r) - 1)
             try:
                 a = up2.read_pattern(m.file, r, c, h)
             except Exception as e:  # noqa: BLE001
                 info.text = f"no pattern: {e}"
                 return
-            img.set_source(_png_data_url(a))
+            shown = a
+            if corr.value and u["ov"] is not None and u["ov"].background is not None:
+                shown = uo.corrected_pattern(a, u["ov"].background)
+            img.set_source(_png_data_url(shown, 5))
             x, y = up2.pattern_position(h, r, c)
-            info.text = (f"pattern {up2.pattern_index(h, r, c):,} at x {x:g} µm, y {y:g} µm; intensity "
-                         f"{int(a.min())}–{int(a.max())} (mean {a.mean():.0f})")
+            txt = (f"row {r}, column {c}\nx {x:g} µm, y {y:g} µm\npattern {up2.pattern_index(h, r, c):,} of "
+                   f"{h.n_patterns:,}\nintensity {int(a.min())}–{int(a.max())} (mean {a.mean():.0f})")
+            ov = u["ov"]
+            if ov is not None:
+                orow, ocol = r // ov.step, c // ov.step
+                if orow < ov.iq.shape[0] and ocol < ov.iq.shape[1] and np.isfinite(ov.iq[orow, ocol]):
+                    txt += f"\npattern quality {ov.iq[orow, ocol]:.3f}" + (
+                        f" (of the overview point at row {orow * ov.step}, column {ocol * ov.step})"
+                        if ov.step > 1 else "")
+            info.text = txt
             gs.set("up2_pos", m.id, [r, c])
+            marker(r, c)
+
+        def goto(r, c):
+            u["busy"] = True                     # one draw for both fields
+            row.value, col.value = r, c
+            u["busy"] = False
+            draw()
 
         def step(dr, dc):
             r = min(max(int(row.value or 0) + dr, 0), h.n_rows - 1)
             c = min(max(int(col.value or 0) + dc, 0), up2.row_length(h, r) - 1)
-            row.value, col.value = r, c
+            goto(r, c)
+
+        def scan_at(x, y):
+            r = min(max(int(np.floor(y / h.y_step_um)), 0), h.n_rows - 1)
+            sx = 0.5 if h.hex_grid and r % 2 else 0.0
+            c = min(max(int(np.floor(x / h.x_step_um - sx)), 0), up2.row_length(h, r) - 1)
+            return r, c
+
+        def on_probe(e):
+            x, y = e.args["xy"][0]
+            goto(*scan_at(x, y))
+
+        def on_cursor(e):
+            r, c = scan_at(e.args["x"], e.args["y"])
+            x, y = up2.pattern_position(h, r, c)
+            status.text = f"row {r}, column {c}  (x {x:g} µm, y {y:g} µm)  · click to load this pattern"
+
+        def render():
+            ov = u["ov"]
+            if ov is None:
+                return
+            psx, _ = ov.pixel_um
+            lay = tiles.ImageLayer(f"up2_{abs(hash((m.file, ov.step, ov.rows_done, o['channel'], o['flatten'])))}",
+                                   ov.image(o["channel"], flatten=o["flatten"]), psx)
+            tok = tiles.register_image(lay)
+            mapbox.clear()
+            with mapbox:
+                v = MapViewer(psx, lay.extent).classes("w-full h-full").mark("up2_map")
+                key = f"up2:{m.id}"
+                v._props["initial_view"] = gs.get("view_zoom", key)
+                v.on("view", lambda e: gs.set("view_zoom", key, {k: e.args[k] for k in ("x0", "x1", "y0", "y1")}))
+                v.on("cursor", throttle=0.15, handler=on_cursor)
+                v.on("probe", on_probe)
+                v.on("legends", on_legends)
+            v.set(layer_url=tiles.image_url(tok), tool="probe", legends=legends(), legend_data={})
+            st["viewer"] = v
             draw()
+
+        def set_running(running: bool):
+            go.set_enabled(not running)
+            stop.set_enabled(running)
+            res.set_enabled(not running)
+
+        def watch(j):
+            u["job"] = j
+            set_running(True)
+            if u["timer"] is None:
+                u["timer"] = ui.timer(0.5, poll)
+                st["timers"].append(u["timer"])
+            else:
+                u["timer"].activate()
+
+        def poll():
+            j = u["job"]
+            if j is None:
+                return
+            prog.value = j.fraction
+            ptext.text = j.text
+            if not j.done:
+                return
+            u["timer"].deactivate()
+            u["job"] = None
+            set_running(False)
+            if j.error:
+                part = uo.load_cached(cache, m.file, o["step"])
+                ptext.text = j.error
+                if part is not None and part.rows_done:
+                    u["ov"] = part              # show what is done (black below)
+                    render()
+                    ui.notify("Overview cancelled. The rows done are kept; 'Compute overview' (above the map) "
+                              "continues from there.", type="info")
+                else:
+                    placeholder("Overview not computed. Press 'Compute overview' above the map.")
+                    if "cancelled" not in j.error:
+                        error(RuntimeError(j.error), "The overview could not be computed")
+                return
+            u["ov"] = j.result
+            ptext.text = (f"{j.result.iq.shape[1]} × {j.result.iq.shape[0]} points, "
+                          f"{j.result.pixel_um[0]:g} µm per point, computed in {j.result.seconds:.0f} s")
+            render()
+
+        def start():
+            if u["job"] is not None:
+                return
+            if u["ov"] is None or not u["ov"].rows_done:
+                placeholder("Computing the overview map… (progress bar above the map). You can already step "
+                            "through patterns with the 'scan row' / 'scan column' fields of the 'Pattern' panel.")
+            watch(uo.start_job(m.file, cache, o["step"]))
+
+        def cancel():
+            j = u["job"]
+            if j is not None:
+                j.cancel.set()
+                ptext.text = "cancelling after the current chunk…"
+
+        def load_or_start():
+            u["ov"] = uo.load_cached(cache, m.file, o["step"])
+            running = uo.running_job(m.file, cache, o["step"])
+            if running is not None:                 # an earlier visit is still computing it: attach
+                placeholder("Computing the overview map… (progress bar above the map).")
+                watch(running)
+            elif u["ov"] is not None and u["ov"].complete:
+                set_running(False)
+                prog.value = 1
+                ptext.text = (f"{u['ov'].iq.shape[1]} × {u['ov'].iq.shape[0]} points, {u['ov'].pixel_um[0]:g} µm per "
+                              f"point (cached, computed in {u['ov'].seconds:.0f} s)")
+                render()
+            else:
+                if u["ov"] is not None:             # partial pass: show it, continue
+                    prog.value = u["ov"].rows_done / u["ov"].iq.shape[0]
+                    render()
+                start()                             # first open: compute once (cancellable)
+
+        def chan_change(e):
+            o["channel"] = e.value
+            save_opts()
+            render()
+
+        def flat_change(e):
+            o["flatten"] = bool(e.value)
+            save_opts()
+            render()
+
+        def res_change(e):
+            o["step"] = int(e.value)
+            save_opts()
+            u["ov"] = None
+            load_or_start()
+        chan.on_value_change(chan_change)
+        flat.on_value_change(flat_change)
+        res.on_value_change(res_change)
         row.on_value_change(lambda _: draw())
         col.on_value_change(lambda _: draw())
-        draw()
+        corr.on_value_change(lambda e: (o.update(corrected=bool(e.value)), save_opts(), draw()))
         status.text = f"{h.n_patterns:,} patterns of {h.pattern_width} × {h.pattern_height} px"
+        load_or_start()
+        draw()
 
     async def change(e):
         st["key"] = e.value
@@ -305,7 +521,7 @@ def view_page() -> None:
     def sbar_change(e):
         gs.set("view_opts", "scale_bar", bool(e.value))
         if st["viewer"]:
-            st["viewer"].set(legends=legends() if st["src"] and st["src"]["ps"] else [])
+            st["viewer"].set(legends=legends() if (st["src"] is None or st["src"]["ps"]) else [])
     sbar.on_value_change(sbar_change)
 
     async def bar_change(e):

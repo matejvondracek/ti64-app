@@ -74,3 +74,9 @@ desktop.ini
 
 # Machine-specific settings (MTEX folder, MATLAB, literature path)
 settings.local.toml
+
+# Crash dumps and logs (may contain user names and licence IDs)
+*crash*.txt
+*crash_dump*
+*.log
+logs/

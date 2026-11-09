@@ -204,7 +204,9 @@ def _ipf_vector(sheet, direction: str, custom) -> tuple[float, float, float]:
     if direction == "Z":
         return (0.0, 0.0, 1.0)
     if direction == "build":
-        return sheet.build_direction.unit_vector
+        from .sample import require_build_direction  # noqa: PLC0415
+
+        return require_build_direction(sheet, "IPF colours along the build direction").unit_vector
     if custom is None:
         raise ValueError("custom IPF direction needs custom_vector")
     return tuple(float(c) for c in custom)

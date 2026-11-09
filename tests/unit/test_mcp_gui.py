@@ -34,10 +34,10 @@ def test_mcp_sample_sheet_and_load(projects_dir, crop300_ju02):
     assert mcp_server.replay_project(project="p")["ok"]
 
 
-def test_mcp_build_direction_is_required(projects_dir, crop300_ju02):
-    with pytest.raises(ValueError):
-        mcp_server.set_sample_sheet(project="p", map_file=str(crop300_ju02), specimen_id="x",
-                                    input_state="raw")
+def test_mcp_build_direction_is_optional_until_needed(projects_dir, crop300_ju02):
+    out = mcp_server.set_sample_sheet(project="p", map_file=str(crop300_ju02), input_state="raw")
+    assert out["build_direction_unit"] is None
+    assert mcp_server.load_map(project="p", map_id=out["map_id"])["metrics"]["n_points"] == 90000
     with pytest.raises(ValueError, match="4PB"):
         mcp_server.set_sample_sheet(project="p", map_file=str(crop300_ju02), specimen_id="x",
                                     input_state="raw", build_direction_angle_deg=0, outer_span_mm=40)
