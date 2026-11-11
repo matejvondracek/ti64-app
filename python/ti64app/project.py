@@ -6,6 +6,8 @@
   files.json        linked files (MapInfo: absolute path, size, mtime, sample, map sheet)  [format 2]
   annotations.json  annotations / ROIs
   gui_state.json    GUI working state: open tab, selected file, viewer zoom / position, overlays, unapplied drafts
+  export_log.json   exports (settings, file, date) for "export again"; exports are not recipe steps (fix 3.4)
+  exports/<id>/     exported files kept in the project
   running.json      the step being run (left behind if the app closed during a step -> "interrupted")
   outputs/<sample>_<step>/  step outputs (npz / json / png ...); outputs/<step>/ for steps without a sample
   maps/             maps cropped inside the project
@@ -176,6 +178,11 @@ class Project:
             for snap in new_hist.iterdir():
                 if snap.is_dir() and not (snap / "files.json").is_file():
                     migrate_dir(snap, backup=False)
+        from .exportlog import migrate_recipe  # noqa: PLC0415
+
+        n = migrate_recipe(self.root)                   # exports are not recipe steps (fix 3.4)
+        if n:
+            done.append(f"{n} export step(s) moved from the recipe to the export log")
         return done
 
     # -- state --------------------------------------------------------------------------------
@@ -490,10 +497,10 @@ class Project:
         if dest_root.exists() and any(dest_root.iterdir()):
             raise FileExistsError(f"{dest_root} exists and is not empty")
         dest_root.mkdir(parents=True, exist_ok=True)
-        for f in (*STATE_FILES, "gui_state.json"):
+        for f in (*STATE_FILES, "gui_state.json", "export_log.json"):
             if (self.root / f).is_file():
                 shutil.copy2(self.root / f, dest_root / f)
-        for sub in ("outputs", "maps", "figures"):
+        for sub in ("outputs", "exports", "maps", "figures"):
             src = self.root / sub
             for f in (src.rglob("*") if src.is_dir() else []):
                 if f.is_file():

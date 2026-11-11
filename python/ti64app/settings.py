@@ -50,10 +50,17 @@ class FigureStyle(BaseModel):
     dpi: int = 600
 
 
+class FeedbackSettings(BaseModel):
+    """Feedback button (fix 3.2): where issues / e-mails go."""
+    repo_url: str = "https://github.com/matejvondracek/ti64-app"
+    email: str = "vondrm34@cvut.cz"
+
+
 class Settings(BaseModel):
     backend: BackendName = "pymtex"
     paths: Paths = Field(default_factory=Paths)
     figure: FigureStyle = Field(default_factory=FigureStyle)
+    feedback: FeedbackSettings = Field(default_factory=FeedbackSettings)
 
 
 def settings_file_candidates() -> list[Path]:
@@ -90,7 +97,7 @@ def load_settings(path: Path | None = None) -> Settings:
     prefs = preferences_path()
     if prefs.is_file():
         p = json.loads(prefs.read_text(encoding="utf-8"))
-        data.update({k: v for k, v in p.items() if k in ("backend", "figure")})
+        data.update({k: v for k, v in p.items() if k in ("backend", "figure", "feedback")})
         # paths edited on the Settings page override the TOML file, field by field (empty = keep TOML)
         data["paths"] = {**data.get("paths", {}), **{k: v for k, v in p.get("paths", {}).items() if v}}
     return Settings.model_validate(data)
@@ -102,12 +109,41 @@ def save_preferences(settings: Settings, paths: dict[str, str] | None = None) ->
     p = preferences_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     old = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d = settings.model_dump(mode="json", include={"backend", "figure"})
+    d = settings.model_dump(mode="json", include={"backend", "figure", "feedback"})
     d["paths"] = old.get("paths", {}) if paths is None else {k: v for k, v in paths.items() if k in Paths.model_fields}
     tmp = p.with_name(f".{p.name}.tmp")                 # atomic: temp file + rename
     tmp.write_text(json.dumps(d, indent=1), encoding="utf-8")
     tmp.replace(p)
     return p
+
+
+def pictures_dir() -> Path:
+    """The user's Pictures folder (Windows known folder FOLDERID_Pictures, so OneDrive redirection is followed);
+    ~/Pictures elsewhere or if the shell call fails; the home folder if that does not exist. Default export folder
+    (fix 3.3)."""
+    if os.name == "nt":
+        try:
+            import ctypes  # noqa: PLC0415
+            import uuid  # noqa: PLC0415
+            from ctypes import wintypes  # noqa: PLC0415
+
+            class GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
+                            ("Data4", wintypes.BYTE * 8)]
+
+            u = uuid.UUID("{33E28130-4E1E-4676-835A-98395C3BC3BB}")          # FOLDERID_Pictures
+            g = GUID(u.fields[0], u.fields[1], u.fields[2], (wintypes.BYTE * 8).from_buffer_copy(u.bytes[8:]))
+            out = ctypes.c_wchar_p()
+            shell32, ole32 = ctypes.windll.shell32, ctypes.windll.ole32
+            if shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(out)) == 0:
+                path = Path(out.value)
+                ole32.CoTaskMemFree(out)
+                if path.is_dir():
+                    return path
+        except Exception:  # noqa: BLE001
+            pass
+    p = Path.home() / "Pictures"
+    return p if p.is_dir() else Path.home()
 
 
 def logs_dir() -> Path:

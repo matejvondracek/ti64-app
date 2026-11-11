@@ -82,3 +82,32 @@ OIM-cleaned preset, laths at 15° unless --hagb).
 | MATLAB: export native PNG / figure 120 mm @ 600 DPI PNG | 2.2 / 9.7 | 0.67 (Python) |
 
 Tiles are cached (LRU, 3000 tiles); layer colours are cached on disk per layer, recipe state and figure style.
+
+## Fix 3: EBSD tab load time (click on a map -> first image)
+
+`python scripts/profile_load.py cold|warm|both [--cleanup] [--key] [--backend matlab]` mirrors the EBSD tab
+(select_map + show): sheet / availability checks, ebsd.load as a recorded step, the IPF layer, the IPF key legend
+(--key), "Compare to original" and the 16 tiles of the fitted first view. Full JU02 map (2 600 367 points), each mode
+in a fresh process (= app start). Times in s.
+
+| Case | before | after |
+| --- | --- | --- |
+| pymtex, new project (load step + IPF layer + tiles) | 6.9 | 4.6 |
+| pymtex, restart, map loaded + cleaned, viewer cache missing (e.g. after a new grains / KAM / recon step) | 9.1 (IPF layer 5.3: load + cleanup again) | 5.6 (IPF layer 1.8) |
+| pymtex, restart with the viewer cache | 2.3 | 2.3 |
+| pymtex, switching back to the map in the same session | 2.1 | 2.1 |
+| MATLAB, new project (engine start, load step, IPF layer, tiles) | 22.4 + key 52.8 when the key legend is on (the map waited for it) | 22.4; key appears later (GUI change, D29) |
+| MATLAB, restart with the viewer cache | 1.3 | 1.3 |
+
+- The user's "takes very long" on the test project was not time: `show()` raised in `GuiState.set` because
+  gui_state.json still held `layer.JU02_C_Area3 = "phase"` (format before the map tabs); the map never appeared and
+  the "Loading ..." placeholder stayed. Fixed in `GuiState.set`.
+- The layer cache key held every data step of the map, so each new grains.calc / map.compute / recon.run recoloured
+  the IPF map, which in a new session rebuilt load + cleanup (5 s pymtex, ~25 s MATLAB). The key now holds only the
+  steps the layer is drawn from (`layers.layer_deps`) and only the sheet fields that change colours.
+- The viewer colours a map whose backend object is not alive from its STORED orientations (`ipf_colors_quat` through
+  any live object of the map or its load step); colours identical (checked on all 2.6 M pixels). The IPF key needs
+  only the crystal symmetry: no cleanup rebuild either.
+- MATLAB: the first figure export of a new engine session (exportgraphics / print) takes ~46 s once (graphics
+  initialisation in the headless engine), every later export ~1 s. The viewer's IPF key legend hit it before the map
+  was shown.

@@ -185,6 +185,10 @@ def test_mcp_tools(xchain, monkeypatch):
     assert mcp_server.redo(project=name)["redone"].startswith("annotations.set")
     e = mcp_server.export_map(project=name, map_id=MAP, kind="phase", mode="scale", scale=2, roi=[0, 0, 20, 20])
     assert e["meta"]["image_px"][0] == pytest.approx(20 / 0.1, abs=4) and e["file"].endswith(".png")
-    assert mcp_server.recipe_history(project=name)["steps"][-1]["op"] == "export.map"
+    assert mcp_server.recipe_history(project=name)["steps"][-1]["op"] != "export.map"   # not a recipe step (fix 3.4)
+    log = mcp_server.export_log(project=name)["exports"]
+    assert log[-1]["id"] == e["export_id"] and log[-1]["op"] == "export.map"
+    again = mcp_server.export_again(project=name, export_id=e["export_id"])
+    assert again["export_id"] != e["export_id"] and again["file"].endswith(".png")
     c = mcp_server.crop_map(project=name, map_id=MAP, new_map_id="mcp_crop", roi=[0, 0, 20, 20])
     assert c["metrics"]["n_points"] > 9000

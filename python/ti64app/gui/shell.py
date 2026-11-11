@@ -100,6 +100,7 @@ def header(active: str | None = None) -> Project | None:
                             .mark(f"recent_{n}")
             ui.space()
             ui.label("Ti64 EBSD/BSE").classes("text-white text-lg font-semibold mr-2")
+            right_tools()
             return None
         with ui.row().classes("gap-1 no-wrap items-center").style("flex: 1 1 0; min-width: 0"):
             for label, path, icon in TABS:
@@ -131,10 +132,132 @@ def header(active: str | None = None) -> Project | None:
                     st.text = SAVE.text
                     st.classes(replace="text-sm truncate " + ("text-amber-300" if SAVE.error else "text-white/90"))
             ui.timer(0.3, upd_status)
-            ui.button(icon="settings", on_click=lambda: settings_dialog(current_project())) \
-                .props("flat round color=white").tooltip("Settings").mark("settings_gear") \
-                .props('aria-label="Settings"')
+            right_tools()
     return p
+
+
+def right_tools() -> None:
+    """Memory use (fix 3.1), Feedback (fix 3.2) and the Settings gear, right end of the top bar."""
+    mem_lab = ui.label("").classes("text-xs text-white/90 whitespace-nowrap px-2 py-1 rounded cursor-help") \
+        .mark("mem_use")
+    with mem_lab:
+        mem_tip = ui.tooltip("").classes("text-sm").style("white-space: pre-line")
+
+    def upd_mem():
+        from ..sysinfo import memory_status, memory_text  # noqa: PLC0415
+
+        try:
+            m = memory_status()
+        except Exception:  # noqa: BLE001
+            return
+        short, tip_ = memory_text(m)
+        mem_lab.text = short
+        mem_tip.text = tip_
+        mem_lab.classes(replace="text-xs whitespace-nowrap px-2 py-1 rounded cursor-help " +
+                        ("bg-orange-500 text-white font-semibold" if m["warn"] else "text-white/90"))
+    upd_mem()
+    ui.timer(3.0, upd_mem)
+    ui.button("Feedback", icon="feedback", on_click=feedback_dialog).props("flat dense no-caps color=white") \
+        .mark("feedback_btn").tooltip("Report a bug, an idea or a question (GitHub issue or e-mail)")
+    ui.button(icon="settings", on_click=lambda: settings_dialog(current_project())) \
+        .props("flat round color=white").tooltip("Settings").mark("settings_gear") \
+        .props('aria-label="Settings"')
+
+
+# ---- feedback (fix 3.2) ------------------------------------------------------------------------------------
+async def feedback_dialog() -> None:
+    """Description + category; app version, backend, OS and the last 100 log lines are added (paths shortened to
+    file names, issues are public). The window screenshot is taken now (before the dialog covers it) but only
+    included when ticked."""
+    import webbrowser  # noqa: PLC0415
+
+    from nicegui import run  # noqa: PLC0415
+
+    from .. import __version__  # noqa: PLC0415
+    from .. import feedback as fb  # noqa: PLC0415
+    from ..sysinfo import system_summary  # noqa: PLC0415
+
+    shot = await run.io_bound(fb.window_screenshot)
+    s = load_settings()
+    p = current_project()
+    backend = p.info().backend if p else s.backend
+    lines = fb.log_tail()
+    sysi = system_summary()
+    with ui.dialog() as dlg, ui.card().classes("w-[40rem] max-w-full gap-2").mark("feedback_dialog"):
+        with ui.row().classes("w-full items-center"):
+            ui.label("Feedback").classes("text-lg font-semibold")
+            ui.space()
+            ui.button(icon="close", on_click=dlg.close).props("flat round dense").props('aria-label="Close"')
+        cat = ui.toggle({"bug": "Bug", "idea": "Idea", "question": "Question"}, value="bug") \
+            .props("no-caps rounded unelevated toggle-color=primary").mark("fb_category")
+        desc = ui.textarea("What happened / what would help? (steps to reproduce for a bug)") \
+            .classes("w-full").props("autogrow outlined").mark("fb_text")
+        ui.label(f"Added automatically: app {__version__}, backend {backend}, {sysi['os']}, Python {sysi['python']}, "
+                 f"{sysi['ram']} RAM and the last {len(lines)} log lines with every path shortened to its file "
+                 "name.").classes("text-xs ti-muted").mark("fb_info")
+        with ui.expansion("Show the log lines that are added").classes("w-full text-sm").mark("fb_log"):
+            ui.code("\n".join(lines) or "(no log yet)").classes("w-full text-xs") \
+                .style("max-height: 14rem; overflow: auto")
+        with ui.row().classes("items-center gap-1"):
+            shot_cb = ui.checkbox("Add a screenshot of this window", value=False).mark("fb_screenshot") \
+                .tooltip("Off by default: GitHub issues are public. Shows the window as it was when you pressed "
+                         "Feedback (this dialog is not in it).")
+            if shot is None:
+                shot_cb.disable()
+                ui.label("(only in the desktop app window)").classes("text-xs ti-muted")
+        ui.label(f"GitHub: {s.feedback.repo_url} · e-mail: {s.feedback.email} (both editable in Settings, section "
+                 "'Feedback')").classes("text-xs ti-muted break-all")
+
+        def report() -> dict:
+            return fb.build_report(desc.value or "", cat.value, backend, lines, sysi)
+
+        def described() -> bool:
+            if (desc.value or "").strip():
+                return True
+            ui.notify("Describe the problem or idea first (the text box in this dialog).", type="warning")
+            return False
+
+        def github():
+            if not described():
+                return
+            r = report()
+            webbrowser.open(fb.github_issue_url(s.feedback.repo_url, r))
+            if shot_cb.value and shot:
+                z = fb.write_zip(logs_dir().parent / "feedback", r, shot)
+                _reveal(z)
+                ui.notify(f"GitHub opens in your browser. Drag {z.name} (selected in the Explorer window) into the "
+                          "issue to add the screenshot.", type="info", multi_line=True, timeout=12000)
+            else:
+                ui.notify("GitHub opens in your browser with the title and text filled in; check it and press "
+                          "'Submit new issue' there.", type="info", multi_line=True)
+            dlg.close()
+
+        def email():
+            if not described():
+                return
+            r = report()
+            z = fb.write_zip(logs_dir().parent / "feedback", r, shot if shot_cb.value else None)
+            webbrowser.open(fb.mailto_url(s.feedback.email, cat.value, r, z.name))
+            _reveal(z)
+            ui.notify(f"Your e-mail program opens with the subject '{fb.subject(cat.value)}'. Attach {z.name} "
+                      "(selected in the Explorer window that just opened).", type="info", multi_line=True,
+                      timeout=12000)
+            dlg.close()
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+            ui.button("Send e-mail", icon="mail", on_click=email).props("outline").mark("fb_email")
+            ui.button("Open GitHub issue", icon="open_in_new", on_click=github).mark("fb_github")
+    dlg.open()
+
+
+def _reveal(path: Path) -> None:
+    """Explorer window with the file selected."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        subprocess.Popen(["explorer", "/select,", str(path)])  # noqa: S603, S607
+    except Exception as e:  # noqa: BLE001
+        log.warning("cannot open Explorer: %s", e)
 
 
 def _startfile(path: Path) -> None:
@@ -416,6 +539,20 @@ def _settings_body(s, status, p: Project | None) -> None:
         for w in pw.values():
             w.on("blur", upd_paths)
             w.on("keydown.enter", upd_paths)
+
+    with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_feedback"):
+        ui.label("Feedback").classes("font-semibold")
+        repo = ui.input("GitHub repository (issues)", value=s.feedback.repo_url).classes("w-full").mark("fb_repo")
+        mail = ui.input("E-mail address for feedback", value=s.feedback.email).classes("w-full").mark("fb_mail")
+
+        def upd_fb(_=None):
+            s.feedback.repo_url = (repo.value or "").strip() or "https://github.com/matejvondracek/ti64-app"
+            s.feedback.email = (mail.value or "").strip() or "vondrm34@cvut.cz"
+            save()
+        for w in (repo, mail):
+            w.on("blur", upd_fb)
+            w.on("keydown.enter", upd_fb)
+        ui.label("Used by the Feedback button in the top bar.").classes("text-xs ti-muted")
 
     if p:
         with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_disk"):

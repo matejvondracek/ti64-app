@@ -4,7 +4,9 @@ function [gid, nGrains] = calcGrains(id, p)
 %   lagb_deg..hagb_deg inside grains ('angle', [hagb lagb]), 'alpha' and 'minPixel' passed explicitly.
 %   [gid, nGrains] = ti64.calcGrains(id, p)   stores struct('grains', g, 'ebsd', ebsdWithGrainId).
 
-ebsd = ti64.store('get', id);
+S = ti64.store('get', id);
+% a reconstruction (struct with the parent map in .ebsd) gives prior-beta grains (fix 3.10 of the GUI)
+if isstruct(S), ebsd = S.ebsd; else, ebsd = S; end
 [g, e2] = calcGrains(ebsd, 'angle', [p.hagb_deg p.lagb_deg] * degree, 'alpha', p.alpha, ...
                      'minPixel', p.min_px);
 % MTEX 7 calcGrains also returns a MODIFIED map: not-indexed pixels within 'alpha' of a grain are

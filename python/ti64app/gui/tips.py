@@ -75,6 +75,7 @@ TIPS: dict[str, str] = {
     "colony_tol": "α grains whose misorientation is within this angle are grouped into one colony.",
     "beta_line_spacing_um": "Spacing of the test lines for prior-β width / length (µm).",
     "gs_fig": "Which grain-size figure to draw with the backend.",
+    "gs_range": "Smallest and largest grain size shown in the histogram (µm; empty = from 0 / up to the largest grains). Grains outside are not drawn (the title says how many); the statistics and the log-normal fit stay those of all grains.",
     "gs_bin": "Histogram bin width in µm (empty = automatic, Freedman-Diaconis). The log-normal fit is drawn as "
               "before; only the bars change.",
     "gs_oim": "Grain file exported from OIM Analysis, to compare the grain sizes with OIM.",
@@ -114,6 +115,9 @@ TIPS: dict[str, str] = {
                  "recipe.",
     "st_sets": "Images that can be stitched together: same magnification and pixel size, and stage positions whose "
                "fields of view overlap. Different magnifications are never stitched together.",
+    "st_no_stage": "Ignore the stage positions in the .txt files (e.g. a faulty stage, or all images saved with the "
+                   "same position): the tiles are placed only by image matching of every pair, or from your positions "
+                   "on the 'Arrange' tab once you moved a tile there. Sets are then not split by stage position.",
     "st_min_score": "Matches with a lower normalised cross-correlation are not trusted; such tiles are placed "
                     "from the stage position (red border).",
 }

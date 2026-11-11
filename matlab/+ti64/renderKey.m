@@ -30,6 +30,6 @@ else
   plot(key);
 end
 set(f, 'Color', 'w');
-exportgraphics(f, outPng, 'Resolution', dpi, 'BackgroundColor', 'white');
+ti64.plot.saveFigure(f, outPng, dpi);
 close(f);
 end

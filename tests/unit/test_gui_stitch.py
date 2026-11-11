@@ -102,6 +102,66 @@ async def test_stitch_page_sets_arrange_one_button(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_no_stage_option_and_zoomable_result(tmp_path):
+    """Fix 3.16 / 3.17: 'Do not use stage positions' is recorded (use_stage False, Arrange starts from a grid, no
+    stage warning); the result opens in the tiled viewer with tile borders and seams as overlays."""
+    folder = tmp_path / "tiles"
+    folder.mkdir()
+    make_tiles(folder, GRID[:4], det="BED-C")
+    Project.open_or_create("gns")
+    async with user_simulation(main_file=MAIN) as user:
+        sys.modules["ti64app.gui.app"].STATE["project"] = "gns"
+        await user.open("/stitch")
+        user.find(marker="st_source").elements.pop().set_value("folder")
+        user.find(marker="st_folder").type(str(folder))
+        user.find(marker="st_scan").click()
+        await user.should_see(marker="st_chk_9771")
+        user.find(marker="st_no_stage").elements.pop().set_value(True)
+        await user.should_see("stage positions not used")
+        await user.should_not_see(marker="st_unknown_axis")
+        user.find(marker="st_run").click()
+        await user.should_see(marker="st_summary_BSE", retries=400)
+        v = user.find(marker="st_result_BSE").elements.pop()
+        assert v._props["layer_url"] and v._props["tool"] == "probe"
+        assert len(v._props["overlays"]) == 1                       # tile borders on by default
+        user.find(marker="st_seams_BSE").elements.pop().set_value(True)
+        assert len(v._props["overlays"]) == 2
+    p = Project.open_or_create("gns")
+    st = [s for s in p.recipe().steps if s.op == "sem.stitch"][-1]
+    assert st.params["use_stage"] is False and "seams_BSE" in st.outputs
+    side = __import__("json").loads((p.root / st.outputs["sidecar_BSE"].path).read_text(encoding="utf-8"))
+    assert any("stage positions not used" in q for q in side["notes"])
+
+
+def test_mosaic_tiles_lazy_pyramid(tmp_path):
+    """The lazy pyramid reader gives the same pixels as the full image (full resolution) and reads only a few
+    TIFF tiles per viewer tile."""
+    import numpy as np
+
+    from ti64app.gui.mosaic_tiles import MosaicSource
+    from ti64app.raster import tile_grid
+
+    rng = np.random.default_rng(1)
+    img = rng.integers(0, 255, (9000, 1200), dtype=np.uint8)
+    f = tmp_path / "m.tif"
+    stitching.write_tiff(f, img, 0.01)
+    src = MosaicSource("t", f, 0.01, 8800)
+    assert len(src.pages) > 1 and src.extent[3] == pytest.approx(88.0)
+    g = tile_grid(0.01, 0, 2, 30)
+    a = src.tile(g)
+    r = (g.y0 + (np.arange(256) + 0.5) * g.py) / 0.01
+    c = (g.x0 + (np.arange(256) + 0.5) * g.px) / 0.01
+    ref = img[np.floor(r).astype(int)[:, None], np.floor(c).astype(int)[None, :]]
+    assert (a[..., 0] == ref).all() and (a[..., 3] == 255).all()
+    assert len(src.blocks) <= 4
+    far = src.tile(tile_grid(0.01, -5, 0, 0))                    # zoomed out: coarse level, strip rows left out
+    assert far[..., 3].any() and src.blocks
+    low = src.tile(tile_grid(0.01, 0, 2, 34))                    # rows 8704-8959: below 8800 transparent
+    assert low[..., 3][:96].all() and not low[..., 3][100:].any()
+    src.close()
+
+
+@pytest.mark.anyio
 async def test_mosaic_export_dialog_fractions_and_size_guard(tmp_path):
     """Fix 15-17: the mosaic export offers 1, 1/2, 1/4, 1/8 and BigTIFF; a size that does not fit in memory is
     refused before exporting (Export disabled, 'Use 1/2' ... 'Use BigTIFF (tiled)' offered); with the info strip the
@@ -129,7 +189,31 @@ async def test_mosaic_export_dialog_fractions_and_size_guard(tmp_path):
         await user.should_see(marker="exp_use_1_2")
         await user.should_see(marker="exp_use_bigtiff")
         assert not user.find(marker="run_export").elements.pop().enabled
-        await user.should_see("The scale bar comes from the info strip")
+        await user.should_see("The scale bar comes from the microscope info bar")
         user.find(marker="exp_use_1_4").click()
         await user.should_see("15,000 × 12,500 px")
         assert user.find(marker="run_export").elements.pop().enabled
+
+
+@pytest.mark.anyio
+async def test_view_image_opens_with_info_bar_not_scale_bar(tmp_path):
+    """Fix 3.6: a .bmp opens with the microscope info bar ON and the app's scale bar OFF; a change is remembered per
+    image."""
+    files, _ = make_tiles(tmp_path, [(0.0, 0.0)])
+    p = Project.open_or_create("gview")
+    m = p.add_files(files)[0]
+    async with user_simulation(main_file=MAIN) as user:
+        sys.modules["ti64app.gui.app"].STATE["project"] = "gview"
+        await user.open("/view")
+        await user.should_see(marker="view_viewer", retries=100)
+        await user.should_see("microscope info bar")
+        assert user.find(marker="view_databar").elements.pop().value is True
+        sb = user.find(marker="view_sbar").elements.pop()
+        assert sb.value is False
+        v = user.find(marker="view_viewer").elements.pop()
+        assert not v._props["legends"]                               # no app scale bar on the image
+        await user.should_see("px info bar")
+        sb.set_value(True)
+        assert v._props["legends"] and v._props["legends"][0]["kind"] == "scale_bar"
+    o = Project.open_or_create("gview").gui_state()["view_opts_src"][f"file:{m.id}"]
+    assert o == {"scale_bar": True, "info_bar": True}

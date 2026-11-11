@@ -279,7 +279,7 @@ def _recon_figure(ctx: OpContext) -> None:
     Drawn by the backend that computed the reconstruction."""
     p = ReconFigureParams.model_validate(ctx.params)
     rid = resolve_source(ctx, p.map_id, p.recon, ("recon.run",))
-    out_png = ctx.out_dir / "figure.png"
+    out_png = ctx.out_dir / f"figure{ctx.figure_ext}"          # .png; .svg / .pdf / .fig for "Save" (fix 3.14)
     meta = recon_figure(ctx, p, rid, out_png)
     ctx.params.update(recon=rid)
     ctx.output("figure", "png", out_png)

@@ -8,6 +8,10 @@ import { leaflet as L } from "nicegui-leaflet";
 const TOOLS_2PT = ["arrow", "line", "roi_rect", "measure"];
 const TOOLS_MULTI = ["polyline", "crack", "roi_poly"];
 const TOOLS_1PT = ["text", "point", "probe"];
+// legend snapping (fix 3.12): six positions on the map, default width of "auto size" items (fraction of the map width)
+const ANCHORS = ["tl", "tc", "tr", "bl", "bc", "br"];
+const AUTO_W = { scale_bar: 0.22, colorbar: 0.3, ipf_key: 0.18 };
+const SNAP_PX = 28;
 
 export default {
   template: `<div class="ti64-viewer" style="position:relative;width:100%;height:100%"></div>`,
@@ -26,6 +30,9 @@ export default {
                                // extent (anchored to the map: they move and scale with zoom / pan; null = old
                                // scale-bar control); dragged / resized here, exported exactly so (legends.py)
     legend_data: Object,       // {colorbar: {stops, lo, hi, label} | null, swatches: [[label, hex]], key_url}
+                               // items with anchor tl|tc|tr|bl|bc|br sit in that corner of the map at `margin`
+                               // (fraction of the map width); auto = width AUTO_W[kind] of the map (fix 3.12)
+    legend_margin: Number,     // default margin of snapped legends (fraction of the map width)
     hex_grid: Boolean,         // hexagonal map: the zoom indicator says whether cells are drawn as brick or hexagons
     cell_um: Number,           // measurement step dx (um)
     resourcePath: String,
@@ -100,7 +107,9 @@ export default {
       this.$el.style.cursor = this.tool && this.tool !== "pan" ? "crosshair" : "";
     },
     scale_bar() { this.updateScaleBar(); },
-    extent() { this.fit(); },
+    // re-fit only when the extent really changes (every set() sends a new array; refitting on each one threw the
+    // user out of a zoomed-in view when an overlay, legend or tile selection changed)
+    extent(n, o) { if (JSON.stringify(n) !== JSON.stringify(o)) this.fit(); },
     legends: { handler() { this.updateScaleBar(); this.renderLegends(); }, deep: true },
     legend_data: { handler() { this.renderLegends(); }, deep: true },
     hex_grid() { this.updateZoomInfo(); },
@@ -367,14 +376,12 @@ export default {
                    `margin:${cap * 0.25}px 0"><span style="display:inline-block;width:${cap * 1.4}px;` +
                    `height:${cap * 1.2}px;background:${c};border:1px solid #666"></span>${l}</div>`).join("") + "</div>";
         }
-        return `<div style="${box(cap, `${cap * 0.4}px`)};font:${cap}px sans-serif">no colour bar: this map is coloured ` +
-               "by orientation (show the IPF key)</div>";
+        return "";              // nothing to show (orientation map): the box is hidden, never text over the map
       }
       if (it.kind === "ipf_key") {
         if (d.key_url) return `<img src="${d.key_url}" draggable="false" style="width:100%;display:block;` +
                               `background:#fff;border-radius:4px;pointer-events:none">`;
-        const c3 = Math.max(2, wpx / 16);
-        return `<div style="${box(c3, `${c3 * 0.4}px`)};font:${c3}px sans-serif">IPF key: only on IPF maps</div>`;
+        return "";              // no IPF colouring on this map: hidden
       }
       return "";
     },
@@ -397,19 +404,42 @@ export default {
       for (const box of this.legendBox.children) {
         const it = (this.legends || [])[+box.dataset.index];
         if (!it || box.dataset.dragging) continue;
-        const p = this.mapToPx(it.x, it.y);
+        const w = parseFloat(box.style.width);
+        const p = it.anchor ? this.anchorPx(it.anchor, w, box.offsetHeight, this.marginOf(it))
+                            : this.mapToPx(it.x, it.y);
         box.style.left = `${p.x}px`;
         box.style.top = `${p.y}px`;
       }
+    },
+    marginOf(it) {
+      const m = it.margin ?? this.legend_margin;
+      return (m === null || m === undefined ? 0.02 : m) * this.mapWidthPx();
+    },
+    // top-left corner (container px) of a w x h box snapped to an anchor of the map with margin m (px)
+    anchorPx(a, w, h, m) {
+      const p0 = this.mapToPx(0, 0), p1 = this.mapToPx(1, 1);
+      const x = a[1] === "l" ? p0.x + m : a[1] === "r" ? p1.x - m - w : (p0.x + p1.x - w) / 2;
+      const y = a[0] === "t" ? p0.y + m : p1.y - m - h;
+      return { x, y };
+    },
+    nearestAnchor(left, top, w, h, m) {
+      let best = null, bd = SNAP_PX;
+      for (const a of ANCHORS) {
+        const p = this.anchorPx(a, w, h, m);
+        const d = Math.hypot(p.x - left, p.y - top);
+        if (d < bd) { bd = d; best = a; }
+      }
+      return best;
     },
     renderLegends() {
       if (!this.legendBox || !this.map || !this.extent) return;
       this.legendBox.innerHTML = "";
       const items = this.legends || [];
       const MW = this.mapWidthPx();
+      const fix = [];                        // anchored items whose stored x / y differ from where they sit now
       items.forEach((it, i) => {
         const box = document.createElement("div");
-        const wpx = Math.max(4, it.w * MW);
+        const wpx = Math.max(4, (it.auto ? (AUTO_W[it.kind] || it.w) : it.w) * MW);
         const p0 = this.mapToPx(it.x, it.y);
         box.className = "ti64-legend";
         box.dataset.kind = it.kind;
@@ -417,12 +447,17 @@ export default {
         box.setAttribute("data-testid", `legend_${it.kind}`);
         box.style.cssText = `position:absolute;left:${p0.x}px;top:${p0.y}px;width:${wpx}px;` +
                             "pointer-events:auto;cursor:move;user-select:none;outline:1px dashed transparent";
-        box.title = "Fixed to the map: it moves and scales with zoom and pan. Drag to move it, drag the blue corner " +
-                    "to resize it. Exports put it exactly here on the map.";
+        box.title = "Fixed to the map: it moves and scales with zoom and pan. Drag to move it (it snaps to the corners " +
+                    "and edge centres of the map), drag the blue corner to resize it. Exports put it exactly here.";
         const handle = document.createElement("div");
         handle.style.cssText = "position:absolute;right:-6px;bottom:-6px;width:12px;height:12px;background:#2563eb;" +
                                "border:2px solid #fff;border-radius:3px;cursor:nwse-resize";
-        const fill = (w) => { box.innerHTML = this.legendHtml(it, w); box.appendChild(handle); };
+        const fill = (w) => {
+          const html = this.legendHtml(it, w);
+          box.innerHTML = html;
+          box.appendChild(handle);
+          box.style.display = html ? "" : "none";       // nothing to draw for this map: no box at all
+        };
         fill(wpx);
         box.onmouseenter = () => { box.style.outlineColor = "#2563eb"; };
         box.onmouseleave = () => { box.style.outlineColor = "transparent"; };
@@ -435,8 +470,13 @@ export default {
                        w: parseFloat(box.style.width) };
           const move = (m) => {
             if (mode === "move") {
-              box.style.left = `${r0.left + m.clientX - r0.x}px`;
-              box.style.top = `${r0.top + m.clientY - r0.y}px`;
+              let nl = r0.left + m.clientX - r0.x, nt = r0.top + m.clientY - r0.y;
+              const a = this.nearestAnchor(nl, nt, r0.w, box.offsetHeight, this.marginOf(it));
+              if (a) { const p = this.anchorPx(a, r0.w, box.offsetHeight, this.marginOf(it)); nl = p.x; nt = p.y; }
+              box.dataset.snap = a || "";
+              box.style.outline = a ? "2px solid #2563eb" : "1px dashed #2563eb";
+              box.style.left = `${nl}px`;
+              box.style.top = `${nt}px`;
             } else {
               const nw = Math.max(r0.w + m.clientX - r0.x, 20);
               box.style.width = `${nw}px`;
@@ -448,10 +488,14 @@ export default {
             document.removeEventListener("pointerup", up);
             this.map.dragging.enable();
             delete box.dataset.dragging;
+            box.style.outline = "1px dashed transparent";
             const nw = parseFloat(box.style.width), nl = parseFloat(box.style.left), nt = parseFloat(box.style.top);
             const [fx, fy] = this.pxToMap(nl, nt);
+            const upd = mode === "move" ? { anchor: box.dataset.snap || null }
+                                        : { auto: false, anchor: it.anchor || null };     // a manual size
+            delete box.dataset.snap;
             const next = (this.legends || []).map((o, j) => (j === i
-              ? { ...o, x: fx, y: fy, w: nw / this.mapWidthPx(), frame: "map" } : { ...o, frame: "map" }));
+              ? { ...o, ...upd, x: fx, y: fy, w: nw / this.mapWidthPx(), frame: "map" } : { ...o, frame: "map" }));
             this.$emit("legends", { items: next });
           };
           document.addEventListener("pointermove", move);
@@ -461,7 +505,23 @@ export default {
         box.addEventListener("click", (e) => e.stopPropagation());
         box.addEventListener("dblclick", (e) => e.stopPropagation());
         this.legendBox.appendChild(box);
+        if (it.anchor && box.style.display !== "none") {           // snapped: place it in its corner (needs height)
+          const p = this.anchorPx(it.anchor, wpx, box.offsetHeight, this.marginOf(it));
+          box.style.left = `${p.x}px`;
+          box.style.top = `${p.y}px`;
+          const [fx, fy] = this.pxToMap(p.x, p.y);
+          const fw = wpx / MW;
+          if (Math.abs(fx - it.x) > 1e-4 || Math.abs(fy - it.y) > 1e-4 || Math.abs(fw - it.w) > 1e-4)
+            fix.push([i, fx, fy, fw]);
+        } else if (it.auto && Math.abs(wpx / MW - it.w) > 1e-4) {
+          fix.push([i, it.x, it.y, wpx / MW]);
+        }
       });
+      if (fix.length) {                        // keep the stored fractions = what is shown (exports use them)
+        const next = items.map((o, j) => { const f = fix.find((q) => q[0] === j);
+          return f ? { ...o, x: f[1], y: f[2], w: f[3], frame: "map" } : { ...o, frame: "map" }; });
+        this.$emit("legends", { items: next });
+      }
     },
   },
 };

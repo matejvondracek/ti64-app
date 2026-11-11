@@ -121,7 +121,9 @@ def _grainsize_run(ctx: OpContext) -> None:
     if p.target == "prior_beta":
         return _grainsize_beta_only(ctx, p)
     sheet = ctx.project.sample(p.map_id)
-    gsrc = resolve_source(ctx, p.map_id, p.grains, ("grains.calc",))
+    from .ops_ebsd import resolve_grains  # noqa: PLC0415
+
+    gsrc = resolve_grains(ctx, p.map_id, p.grains)
     gstep = ctx.project.recipe().step(gsrc)
     gp = GrainParams(**gstep.params["grains"])
     gh = ctx.use(gsrc, "grains")
@@ -421,6 +423,8 @@ class GrainSizeFigureParams(BaseModel):
                   "colony_ecd_area", "beta_ecd", "beta_width", "beta_length", "colony_map"]
     grainsize: str | None = None              # grainsize.run step (default newest of the map with that part)
     bin_width_um: float | None = None         # histogram bin width (um); None = automatic (Freedman-Diaconis)
+    min_um: float | None = None               # shown range of the histogram (um, fix 3.15); the statistics and the
+    max_um: float | None = None               # log-normal fit stay those of all grains
     width_cm: float | None = None
     dpi: int | None = None
 
@@ -433,14 +437,20 @@ def _read_csv(ctx: OpContext, step, name: str) -> dict[str, np.ndarray]:
 
 
 def _hist_chart(v: np.ndarray, w: np.ndarray | None, xlabel: str, title: str,
-                weight_label: str = "area", bin_width: float | None = None) -> ChartSpec:
+                weight_label: str = "area", bin_width: float | None = None,
+                x_range: tuple[float | None, float | None] = (None, None)) -> ChartSpec:
     """Number histogram (count) with the number-weighted log-normal fit, or, with weights, the area-weighted
-    histogram (% of area) with the area-weighted log-normal fit."""
+    histogram (% of area) with the area-weighted log-normal fit. x_range = (min, max) um shown (fix 3.15): grains
+    outside are not drawn (said in the title), the fit and the area fractions are still those of all grains."""
     v = np.asarray(v, float)
     ok = np.isfinite(v) & (v > 0)
     v = v[ok]
     w = None if w is None else np.asarray(w, float)[ok]
-    e = hist_edges(v, bin_width=bin_width)
+    lo, hi = x_range
+    e = hist_edges(v, bin_width=bin_width, lo=lo, hi=hi)
+    if lo is not None or hi is not None:
+        out = int(((v < e[0]) | (v > e[-1])).sum())
+        title = f"{title}; shown {e[0]:g}-{e[-1]:g} µm" + (f" ({out} outside)" if out else "")
     bw = float(e[1] - e[0])
     xs = np.linspace(e[0] + bw / 20, e[-1], 300)
     s = dist_stats(v, w)
@@ -501,7 +511,7 @@ def _grainsize_figure(ctx: OpContext) -> None:
     ctx.step.inputs.append(f"{sid}:summary")
     style = load_settings().figure
     width, dpi = p.width_cm or style.width_cm, p.dpi or style.dpi
-    out_png = ctx.out_dir / "figure.png"
+    out_png = ctx.out_dir / f"figure{ctx.figure_ext}"          # .png; .svg / .pdf / .fig for "Save" (fix 3.14)
     summ = json.loads((ctx.project.root / s.outputs["summary"].path).read_text(encoding="utf-8"))
     meta: dict[str, Any] = {"kind": p.kind, "map_id": p.map_id, "grainsize": sid, "backend": ctx.backend.name}
     n_rule = summ["rules"]
@@ -539,26 +549,26 @@ def _grainsize_figure(ctx: OpContext) -> None:
             t = _read_csv(ctx, s, "alpha_grains")
             used, lath = t["used"].astype(bool), t["is_lath"].astype(bool)
             if p.kind == "alpha_ecd":
-                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}", bin_width=p.bin_width_um)
+                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
             elif p.kind == "alpha_ecd_area":
                 c = _hist_chart(t["ecd_um"][used], t["area_um2"][used], "alpha grain ECD (µm)",
-                                "alpha grains, area-weighted", bin_width=p.bin_width_um)
+                                "alpha grains, area-weighted", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
             elif p.kind == "lath_thickness":
                 c = _hist_chart(t["thickness_intercept_um"][lath], None, "lath thickness, intercept ⊥ long axis (µm)",
-                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath", bin_width=p.bin_width_um)
+                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
             else:
                 c = _hist_chart(t["ellipse_minor_um"][lath], None, "lath minor axis 2b (µm)",
-                                "alpha laths, second-moment ellipse", bin_width=p.bin_width_um)
+                                "alpha laths, second-moment ellipse", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
         elif p.kind in ("colony_ecd", "colony_ecd_area"):
             t = _read_csv(ctx, s, "colonies")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], t["area_um2"][used] if p.kind == "colony_ecd_area" else None,
-                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""), bin_width=p.bin_width_um)
+                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""), bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
         elif p.kind == "beta_ecd":
             t = _read_csv(ctx, s, "prior_beta")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], None, "prior-β grain ECD (µm)",
-                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}", bin_width=p.bin_width_um)
+                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
         else:
             name = "across_bd" if p.kind == "beta_width" else "along_bd"
             ch = step_npz(ctx, sid, "chords")
@@ -572,7 +582,7 @@ def _grainsize_figure(ctx: OpContext) -> None:
             c = _hist_chart(ch[f"{name}_um"], ch[f"{name}_um"],
                             f"prior-β {'width (chords across BD)' if name == 'across_bd' else 'length (chords along BD)'} (µm)",
                             f"complete chords, length-weighted; E112 mean {b['mean_e112_um']:.1f} µm "
-                            f"({b['n_truncated']} edge chords counted half)", "line length", bin_width=p.bin_width_um)
+                            f"({b['n_truncated']} edge chords counted half)", "line length", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
         c.width_cm, c.dpi = width, dpi
         meta["n"] = int(np.isfinite(np.asarray(c.heights, float)).sum())
         ctx.backend.render_chart(c, out_png)

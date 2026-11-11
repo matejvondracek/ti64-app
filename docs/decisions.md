@@ -653,3 +653,128 @@
 - Verified on JU04 "stich along crack path": 8 BSE tiles at 1500x, 9766 x 22452 px, residual misalignment <= 0.3 px,
   matching the manual arrangement; 10000x set 9475-9479 one continuous column (<= 0.4 px). 250x set: tile 9446 has no
   good match, stays at its stage position and the message says to drag it on the Arrange tab.
+
+## D29 (2026-11-11) EBSD load time (fix 3.8) and load progress stages (fix 3.7)
+- **Profile** (`scripts/profile_load.py`, full JU02, click -> first image, each mode in a fresh process): pymtex new
+  project 6.9 -> 4.6 s; restart with a cleaned map and no viewer cache 9.1 -> 5.6 s; restart with the viewer cache
+  2.3 s; MATLAB new project 22 s (engine start + MTEX ~4 s, load 9 s, transfer + outputs 5 s, IPF layer 3 s, tiles
+  1.5 s). Table in docs/performance.md.
+- **Cause of "JU02 takes very long" in the user's test project**: not time. `GuiState.set` crashed because
+  gui_state.json held `layer.<map> = "phase"` (before the map tabs), so `show()` stopped after colouring and the map
+  never appeared. `set` now replaces an old plain value on the key path by a dict.
+- **Layer cache key = only what the layer is drawn from** (`layers.layer_deps`: newest cleanup / load or `source`,
+  + the map.compute step for KAM / GROD / GOS / GND, the recon.run step for prior-beta layers, the grains.calc /
+  recon.run step for overlays) and only the sheet fields that change colours (file, input state, build direction).
+  Before, any new step of the map recoloured every layer, and in a new session that rebuilt load + cleanup.
+- **Viewer colours from stored orientations**: when the source object is not alive, `figure_spec` (viewer only,
+  step op "view") colours the IPF map with `ipf_colors_quat` on the stored quaternions through any live object of
+  the map or its load step; prior-beta IPF the same. Identical colours (2 600 367 / 2 600 367 pixels). Recorded
+  figures and exports still use the source object (inputs recorded as before). The IPF key uses any live object or the
+  load step (only the crystal symmetry is needed).
+- **MATLAB graphics start-up**: the first figure render of a new engine session (exportgraphics, print, getframe alike)
+  takes ~46 s once; later ones ~1 s. Not avoidable from Python (a warm-up at engine start would delay the first load
+  by the same time); the viewer therefore shows the map first and draws the IPF key legend afterwards.
+- **Progress stages** (`ti64app.progress`, reported only inside a channel): "reading file" (ebsd.load, also from the
+  loaded-map cache), "transferring data" (get_ebsd + writing the outputs), "cleanup" / "repeating cleanup" (an
+  ebsd.cleanup run / rebuilt for a later step), "cleanup from cache" / "reading cached map" (layer read from
+  cache/viewer), "colouring map", "building grid" (cell layout), "drawing" (layer ready, tiles requested).
+
+## D30 (2026-11-11) Stitch and View after the third user test (fixes 3.6, 3.16, 3.17)
+- **View: images open with the microscope info bar, not the app's scale bar** (3.6). A JEOL .bmp / .tif carries its
+  own data bar (detector, kV, WD, magnification, scale bar, image number, date), so a second scale bar on the image is
+  redundant. Default per image: info bar ON, app scale bar OFF; an image without a data bar (nothing to show below it)
+  gets the app's scale bar instead, so there is always one scale. The user's choice is stored per image / mosaic
+  (`gui_state.view_opts_src[<source>]`); the old project-wide `view_opts` is no longer read. The export dialog gets
+  `view_state = {info_strip: shown, overlays: False, annotations: False}` (what you see is what you get).
+- **Stitch result zoomable** (3.16): the Result tab shows the mosaic in the Leaflet map viewer instead of a 2048 px
+  preview. Tiles come from `gui/mosaic_tiles.py` (`/api/ti64/mosaic/...`): the pyramid levels of the mosaic TIFF are
+  read lazily (TIFF tile offsets + `TiffPage.decode`, decoded tiles in an LRU of 384), the level whose pixels are just
+  finer than the screen pixels is used; the info strip rows are left out. 22 753 x 9 679 px: opening < 0.01 s, a tile
+  2-4 ms, RAM a few tens of MB. Mosaics without a pyramid (<= 8192 px) are read whole into `tiles.ImageLayer`.
+  Overlays (ordinary `layers.Overlay` through the overlay route of tiles.py): **tile borders** at the final positions,
+  coloured by best match score as before, with labels "image number · score"; **seams** = boundaries between the tiles'
+  owner regions after the seam choice (midline or minimum-difference), extracted from the owner map during rendering at
+  a stride <= 4096 px and saved as output `seams_<DET>` (npz, mosaic px). Steps from before have no seams output: the
+  midline seams are computed from the tile positions for display and the line under the map says so. A click on a tile
+  selects it (outline) and opens nudge / exclude as before. Choice of overlays remembered per project.
+- **No stage-axis warning, no automatic full-range search** (3.17). D28 (b) is withdrawn: the JU04 crack path had a
+  faulty stage (Y constant, identical positions), not a rule to detect. `stage_analysis` keeps only identical positions
+  and possible repeats (D28 (c)); a constant stage axis is a normal single row / column again. Matching with the stage
+  is the usual search within `search_um` around the stage prediction.
+- **"Do not use stage positions"** (`sem.stitch use_stage=False`, default True; Stitch tab checkbox under 'Stitch
+  sets', MCP `stitch_images use_stage`, CLI `--no-stage`): every pair is matched over the full tile (coarse phase
+  correlation + NCC), good coarse matches (coarse NCC >= min. score) are refined at full resolution, a **maximum
+  spanning tree** of the strongest matches is built first and the other matches are kept only if they agree with it
+  within max(4 x coarse factor, 2 % of the tile) px, then the global least squares (first tile of each group fixed).
+  Without the tree the false matches of repetitive α-lath texture (coarse NCC 0.6-0.8) outvoted true ones and the 0.99
+  match 9465/9466 was dropped (mosaic 10 291 x 12 796 px, 17 px misalignment); with it JU04 crack path (8 tiles, 1500x)
+  gives 9766 x 22 452 px, misalignment <= 0.26 px - the manual result of D28 - in 97 s, no tile without a match. The
+  same path is used without stage data / pixel size. Manual Arrange positions still win once a tile was moved. With the
+  option, stitch sets are not split by stage footprint (`stitch_sets(use_stage=False)`), the Arrange view starts from a
+  grid in image-number order ('Grid' button), no stage -> mosaic transform is fitted (`stage_to_mosaic` = null) and
+  repeats are confirmed / refuted by the matches as before.
+
+## D31 (2026-11-11) Third user test: top bar, feedback, export log, EBSD tab (fixes 3.1-3.5, 3.9-3.15)
+- **Memory in the top bar** (3.1, `sysinfo.py`): "App x GB · PC used / total", every 3 s; app = this Python process +
+  the MATLAB engine process started by the app (its pid from the backend, never created just to ask); tooltip with the
+  parts; orange above 80 % of the PC's RAM (`WARN_FRACTION`).
+- **Feedback** (3.2, `feedback.py`, top bar button): category Bug / Idea / Question, description, app version, backend,
+  OS, Python, RAM and the last 100 lines of ti64-gui.log with every absolute path (Windows, UNC, POSIX) replaced by its
+  file name; URLs are kept. "Open GitHub issue" opens `<repo>/issues/new?title&body` (repo URL in Settings > Feedback);
+  "Send e-mail" opens `mailto:` with the subject exactly "[Ti64] Bug" / "[Ti64] Idea" / "[Ti64] Question" (address in
+  Settings, default vondrm34@cvut.cz) and writes `%APPDATA%/ti64app/feedback/ti64_feedback_<date>.zip` (report.md,
+  log_tail.txt, screenshot.png only if ticked), selected in Explorer to attach. URL bodies carry only the last 25 log
+  lines and are cut at ~7 kB (browser / mail-client limits); the .zip always has all 100. The window screenshot (PIL
+  ImageGrab of this process's top-level window, DWM frame bounds) is taken when Feedback is pressed, so the dialog is
+  not in it; off by default (issues are public); unavailable in browser mode.
+- **Default export folder** (3.3): the Pictures known folder (`SHGetKnownFolderPath(FOLDERID_Pictures)`, follows
+  OneDrive redirection), then the last folder used, per project (`gui_state.export_folder`).
+- **Exports are not recipe steps** (3.4, CLAUDE.md updated by the user): `service.export(op, params, target)` runs
+  export.map / sem.export unrecorded (no undo entry, no sample.set record), writes to `exports/<id>/`, copies file +
+  sidecar to the chosen file and appends `{id, op, params, backend, versions, date, file, project_file, sidecar}` to
+  `export_log.json` (`exportlog.py`). "Export again" (Export dialog > Earlier exports; MCP `export_again`) re-runs an
+  entry with the same params and recorded backend. `service.run` of an export op is routed there, `run_recipe` turns
+  export steps of old / hand-written recipe files into logged exports. **Migration** on open: export steps leave
+  recipe.json and the undo snapshots and become log entries (`migrated: true`; the file the user saved to was not
+  recorded before, so `file` is empty). Figure "Export" of a result is logged as `result.export`.
+- **Export defaults = the view** (3.5): the Include boxes start from `view_state` (overlays shown, annotations, the
+  microscope info bar shown) instead of the last choice; format / resolution are still remembered. The info-strip box
+  reads "Add the microscope info bar under the image (detector, kV, WD, magnification, scale bar, image number, date)"
+  with a tooltip.
+- **Loading progress in the map area** (3.7): the GUI runs load / colouring in a `progress` channel (D29) and shows a
+  bar, the current stage with elapsed seconds and the stages done with their times; the edit-menu bar is hidden then.
+  The map is drawn before the IPF key (the first MATLAB render of an engine takes ~45 s).
+- **KAM / GROD / GOS / GND in the map list** (3.9): always listed on the α tab once the map is loaded ("· computed on
+  first use"); picking one runs map.compute with the section's parameters (α grains first with the 'Grains and
+  boundaries' values if there are none). The section holds only the parameters (KAM order / cutoff, GND stencil /
+  Poisson's ratio); Apply recomputes the map shown.
+- **Prior-β grains** (3.10, user decision 2026-11-11: "segment prior-β grains"): 'Grains and boundaries' on the prior β
+  tab runs grains.calc with `source` = the newest recon.run step: calcGrains on the reconstructed parent map (pymtex: the
+  reconstruction's store entry is a map; MATLAB `+ti64/calcGrains.m` unwraps the reconstruction struct). Same
+  parameters (HAGB / LAGB / alpha / min px). Its HAGB / LAGB overlays belong to the prior β tab (`layers.newest_grains`
+  'beta', `BETA_OVERLAYS`), HAGB is switched on there and the tab stays on prior β. α steps (map.compute, grain size,
+  α overlays) never pick prior-β grains (`ops_ebsd.resolve_grains`). Results appear on the tab they belong to (α grains
+  -> α tab, reconstruction and prior-β grains -> prior β tab, KAM -> α tab, figures -> Results). Conformance on the JU02
+  1000x1000 crop (ideal Burgers): grain counts, inner area-weighted ECD and HAGB length within 10 %
+  (`tests/conformance/test_fix3.py`).
+- **IPF key only on IPF maps** (3.11): the IPF-key button and box are hidden on other maps; an IPF key that is on is
+  shown as the colour bar / legend of a scalar or ID map in the same place; boxes with nothing to draw are not shown
+  (the placeholder texts "no colour bar ..." / "IPF key: only on IPF maps" are gone). Hidden items keep their settings.
+- **Legend snapping** (3.12): `LegendItem.anchor` (tl / tc / tr / bl / bc / br), `margin` (fraction of the map width,
+  default 2 %), `auto` (width = 22 / 30 / 18 % of the map width for scale bar / colour bar / IPF key). Dragging within
+  28 px of a snap position snaps (blue outline); 'Legend layout' menu in the map toolbar sets position, auto size and
+  margin; a manual resize switches auto off. The viewer writes the resulting x / y / w back, so exports need nothing new.
+  New legends start snapped (scale bar bottom left, colour bar bottom right, IPF key top right).
+- **History right-click** (3.13): Show parameters / Delete…; no dependents -> deleted at once; dependents -> "Delete them
+  too" or "Keep them, mark stale" (`service.delete_step(dependents=...)`); one undo entry either way.
+- **Results right-click** (3.14): figures (figure / recon.figure / grainsize.figure steps): Delete (the step, undoable),
+  Save (editable: MATLAB `.fig` via `savefig` + `.svg` / `.pdf` vector; pymtex `.svg` (text as text) / `.pdf`), Export
+  (png / jpg / tif / svg / pdf). Both re-draw the recorded step with the recorded backend and parameters
+  (`service.render_figure_as`, `OpContext.figure_ext`; jpg from the PNG). MATLAB `+ti64/+plot/saveFigure.m` picks the
+  writer by extension (render.m, renderChart.m, renderKey.m use it). Tables: "Delete from Results", Save = their CSV /
+  XLSX / JSON folder in Explorer.
+- **Histogram range** (3.15): grainsize.figure `min_um` / `max_um` (GUI "shown from / up to [µm]", MCP
+  `grain_size_figure`): bins start at min and end at max (`hist_edges(lo, hi)`), the title says how many grains are
+  outside; statistics, log-normal fit and area fractions remain those of all grains.
+- **Viewer**: re-fits only when the extent really changes (each `set()` sent a new extent array and threw the user out
+  of a zoomed view, found while testing the zoomable stitch result).

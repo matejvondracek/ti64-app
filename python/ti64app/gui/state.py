@@ -96,7 +96,11 @@ class GuiState:
         *keys, value = keys_and_value
         d = self.d
         for k in keys[:-1]:
-            d = d.setdefault(k, {})
+            # an older gui_state.json may hold a plain value where a dict is expected now (e.g. layer.<map> = "phase"
+            # before the map tabs): replace it, else the EBSD tab never showed the map after loading (fix 3.8)
+            if not isinstance(d.get(k), dict):
+                d[k] = {}
+            d = d[k]
         if d.get(keys[-1]) == value:
             return
         d[keys[-1]] = value

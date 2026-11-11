@@ -324,18 +324,19 @@ def _setting_key(t: TileInfo) -> tuple:
             r(t.scan_rotation_deg, 2), r(t.stage_rotation_deg, 2), r(t.stage_tilt_deg, 2))
 
 
-def stitch_sets(tiles: list[TileInfo], min_overlap_frac: float = 0.0) -> list[StitchSet]:
+def stitch_sets(tiles: list[TileInfo], min_overlap_frac: float = 0.0, use_stage: bool = True) -> list[StitchSet]:
     """Group images into stitch sets: same setting (detector, magnification, pixel size, size, rotation, tilt) and
     overlapping stage footprints (field of view around the stage position; components of the overlap graph). Without
-    stage data a setting group is one set (overlap unknown until registration). Single images are sets of one
-    (nothing to stitch). Sorted by detector, magnification, first image number."""
+    stage data or with use_stage=False ('Do not use stage positions') a setting group is one set (overlap unknown
+    until registration). Single images are sets of one (nothing to stitch). Sorted by detector, magnification, first
+    image number."""
     groups: dict[tuple, list[TileInfo]] = {}
     for t in sorted(tiles, key=lambda t: (t.image_number or 0, t.name)):
         groups.setdefault(_setting_key(t), []).append(t)
     out: list[StitchSet] = []
     for key, tl in groups.items():
         ps = tl[0].pixel_size_um
-        if ps and all(t.has_stage for t in tl) and len(tl) > 1:
+        if use_stage and ps and all(t.has_stage for t in tl) and len(tl) > 1:
             fw, fh = tl[0].width * ps, tl[0].height * ps                 # um
             S = np.array([stage_um(t) for t in tl])
             parent = list(range(len(tl)))
@@ -359,13 +360,14 @@ def stitch_sets(tiles: list[TileInfo], min_overlap_frac: float = 0.0) -> list[St
         else:
             parts = [(tl, len(tl) > 1 and not (ps and all(t.has_stage for t in tl)))]
         for c, _ in parts:
-            has_stage = bool(ps) and all(t.has_stage for t in c)
+            has_stage = use_stage and bool(ps) and all(t.has_stage for t in c)
             out.append(StitchSet(
                 id="", detector_class=key[0], magnification=c[0].magnification, pixel_size_um=ps,
                 size_px=(c[0].width, c[0].height), names=[t.name for t in c], paths=[t.path for t in c],
                 image_numbers=[t.image_number for t in c], overlapping=len(c) > 1,
                 note=("" if len(c) > 1 and has_stage else "single image: nothing to stitch" if len(c) == 1
-                      else "no stage data: overlaps are found by registration")))
+                      else ("stage positions not used" if not use_stage and ps else "no stage data") +
+                      ": overlaps are found by registration")))
     out.sort(key=lambda s: (s.detector_class, -(s.magnification or 0), min(n or 0 for n in s.image_numbers)))
     for k, s in enumerate(out):
         s.id = f"{s.detector_class}-{(s.magnification or 0):g}x-{k + 1}"
@@ -404,6 +406,8 @@ class StitchParams(BaseModel):
     locked: list[str] = Field([], description="tiles (stem or image number) that keep their manual position")
     refine_radius: float = Field(0.10, description="with manual_layout: search radius around the given positions, as "
                                                    "a fraction of the tile size")
+    use_stage: bool = Field(True, description="False: do not use the stage positions; placement only from image "
+                                              "matching (all pairs over the full tile) or the manual layout")
     stage_map: Literal["auto", "default"] | tuple[tuple[int, int], tuple[int, int]] = Field(
         "auto", description="stage -> image axes: auto (chosen from the data), default (measured JSM-IT500HR "
                             "mapping), or a 2x2 signed permutation ((col<-X, col<-Y), (row<-X, row<-Y))")
@@ -848,20 +852,15 @@ def _num_label(t: TileInfo) -> str:
 
 
 def stage_analysis(tiles: list[TileInfo]) -> dict:
-    """Which stage axes really carry position information (decisions D23).
+    """Identical stage positions and possible repeats of a set (decisions D28 (c)).
 
-    JU04: stage Y is 0.237 mm in all 20 images and images at the same X share identical stage positions (and beam
-    shift), so their vertical position is NOT in the metadata. Rules:
     - identical: groups of different images with the same stage position (within the 1 um stage resolution);
-    - an axis without spread (< 0.5 um) is UNKNOWN when identical positions exist (the stage did not record the
-      movement between those images). Without identical positions a constant axis is a legitimate single row /
-      column (data/test/stitch: X constant, Y stepped) and stays known;
-    - when identical positions exist although both axes vary, both axes are unknown for the registration;
     - repeats: identical stage position AND magnification (and pixel size) = possible repeated images. Registration
       confirms a repeat when the two images match at (almost) zero offset.
-    Returns spread_um, unknown_axes ('X' / 'Y'), identical / repeats (lists of image labels), beam_shift_same per
-    group, and a plain-language message ('' when everything is in order)."""
-    out = {"spread_um": None, "unknown_axes": [], "identical": [], "repeats": [], "message": "", "notes": []}
+    A stage axis without spread is NOT treated as unknown any more (fix 3.17: the JU04 case was a faulty stage; the
+    user ticks 'Do not use stage positions' instead, decisions D30).
+    Returns spread_um, identical / repeats (lists of image labels), beam_shift_same per group and notes."""
+    out = {"spread_um": None, "identical": [], "repeats": [], "notes": []}
     st = [t for t in tiles if t.has_stage]
     if len(st) < 2 or len(st) != len(tiles):
         return out
@@ -881,21 +880,6 @@ def stage_analysis(tiles: list[TileInfo]) -> dict:
         rep += [m for m in by_mag.values() if len(m) > 1]
     out["repeats"] = [[_num_label(t) for t in g] for g in rep]
     out["beam_shift_same"] = [len({tuple(t.beam_shift or ()) for t in g}) == 1 for g in rep]
-    flat = span < 0.5
-    out["unknown_axes"] = [a for k, a in enumerate("XY") if flat[k]] or (["X", "Y"] if ident else [])
-    if out["unknown_axes"]:
-        ax = out["unknown_axes"]
-        consts = [f"stage {a} is {st[0].stage_x_mm if a == 'X' else st[0].stage_y_mm:g} mm in all {len(st)} images"
-                  for k, a in enumerate("XY") if flat[k]]
-        parts = list(consts)
-        if out["identical"]:
-            parts.append("images " + "; ".join(" + ".join(g) for g in out["identical"]) +
-                         " have identical stage positions")
-        what = ("the position along stage " + " and ".join(ax) +
-                (" (vertical in the image)" if ax == ["Y"] else " (horizontal in the image)" if ax == ["X"] else ""))
-        out["message"] = (" and ".join(parts) + f": {what} is not in the metadata. 'Stitch' finds it by image "
-                          "matching over the full range.")
-        out["notes"].append(out["message"])
     if rep:
         out["notes"].append("possible repeats (same stage position and magnification): " +
                             "; ".join(" = ".join(g) for g in out["repeats"]))
@@ -1151,6 +1135,30 @@ def _seam_weight(inside: np.ndarray, band: float) -> np.ndarray:
     return w
 
 
+def seam_segments(owner: np.ndarray, max_px: int = 4096) -> dict[str, np.ndarray]:
+    """Seam lines of an owner map (canvas px; boundaries between two tiles only, not the mosaic edge), read at a
+    stride so that the longer side is <= max_px; collinear edge runs are merged. For the Result viewer (fix 3.16)."""
+    H, W = owner.shape
+    k = max(1, math.ceil(max(H, W) / max_px))
+    o = np.asarray(owner[::k, ::k])
+    out: dict[str, list] = {"x1": [], "y1": [], "x2": [], "y2": []}
+
+    def runs(m: np.ndarray) -> list[tuple[int, int]]:
+        d = np.diff(np.r_[0, m.astype(np.int8), 0])
+        return list(zip(np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]))
+    v = (o[:, :-1] != o[:, 1:]) & (o[:, :-1] >= 0) & (o[:, 1:] >= 0)          # between columns c and c + 1
+    for c in np.nonzero(v.any(axis=0))[0]:
+        for a, b in runs(v[:, c]):
+            out["x1"].append((c + 1) * k), out["x2"].append((c + 1) * k)
+            out["y1"].append(a * k), out["y2"].append(min(H, b * k))
+    h = (o[:-1] != o[1:]) & (o[:-1] >= 0) & (o[1:] >= 0)                      # between rows r and r + 1
+    for r in np.nonzero(h.any(axis=1))[0]:
+        for a, b in runs(h[r]):
+            out["y1"].append((r + 1) * k), out["y2"].append((r + 1) * k)
+            out["x1"].append(a * k), out["x2"].append(min(W, b * k))
+    return {n: np.asarray(v_, np.float32) for n, v_ in out.items()}
+
+
 def render(store: TileStore, Q: np.ndarray, O: np.ndarray, canvas: tuple[int, int], out: np.ndarray,
            gains: list[tuple[float, float]] | None, blend: str, dtype, work_dir: Path, seam: str = "midline",
            blend_band_px: float = 32.0, pairs: list[PairResult] | None = None, band_px: int = 2048,
@@ -1179,6 +1187,10 @@ def render(store: TileStore, Q: np.ndarray, O: np.ndarray, canvas: tuple[int, in
             if seam == "min_difference" and pairs:
                 report["min_difference_seams"] = min_difference_seams(store, Qs, O, shapes, canvas, owner, pairs,
                                                                       gains if blend == "seam" else None)
+            try:
+                report["_seams"] = seam_segments(owner)
+            except Exception:  # noqa: BLE001  (display only)
+                pass
         if blend == "none":
             for k in range(n):
                 rs, cs, ts, us = _footprint(O[k], shapes[k], canvas)
@@ -1347,6 +1359,7 @@ class MosaicResult:
     sidecar: Path
     table: dict
     info: dict = field(default_factory=dict)
+    seams: Path | None = None                  # npz: seam lines (x1, y1, x2, y2 in mosaic px) for the viewer
 
 
 def _match(t: TileInfo, keys: list[str] | dict) -> str | None:
@@ -1396,7 +1409,7 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
     shapes = [store.shape(i) for i in range(n)]
     ps = min(t.pixel_size_um for t in tiles) if all(t.pixel_size_um for t in tiles) else None
     coarse = max(1, int(round(max(shapes[0]) / 640)))
-    use_stage = ps is not None and all(t.has_stage for t in tiles) and n > 1
+    use_stage = p.use_stage and ps is not None and all(t.has_stage for t in tiles) and n > 1
     report: dict = {}
     prior = None
     prior_w = None
@@ -1414,9 +1427,9 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
         report = {"notes": [f"manual layout (Arrange view): pairs searched within {100 * p.refine_radius:g} % of the "
                             f"tile size ({search:.0f} px) around the given positions"],
                   "locked": [tiles[k].name for k in locked]}
-    elif use_stage and (sa := stage_analysis(tiles))["unknown_axes"] and p.stage_map == "auto":
-        return _register_unknown_axes(tiles, store, p, label, ps, sa)
-    elif use_stage:
+    elif not use_stage:
+        return _register_by_matching(tiles, store, p, label, ps)
+    else:
         _progress(f"{label}: stage mapping", 0.02)
         if p.stage_map == "auto":
             M, report = choose_stage_map(tiles, store, ps, p, coarse)
@@ -1430,10 +1443,6 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
         report["matrix"] = [list(map(int, r)) for r in M]
         pair_ids = candidate_pairs(prior, shapes, p.min_overlap_px)
         search = p.search_um / ps
-    else:
-        report = {"notes": ["no stage positions / pixel size: all pairs tried"]}
-        pair_ids = list(combinations(range(n), 2))
-        search = None
     pairs: list[PairResult] = []
     for k, (i, j) in enumerate(pair_ids):
         _progress(f"{label}: pair {k + 1}/{len(pair_ids)}", 0.05 + 0.6 * k / max(1, len(pair_ids)))
@@ -1453,128 +1462,116 @@ def _register_layout(tiles: list[TileInfo], store: TileStore, p: StitchParams, l
     return P, pairs, stage_only, report, prior
 
 
-def _register_unknown_axes(tiles: list[TileInfo], store: TileStore, p: StitchParams, label: str, ps: float,
-                           sa: dict):
-    """Registration when the stage did not record one (or both) axes (stage_analysis, decisions D23): every pair
-    whose KNOWN stage axis allows an overlap is matched over the full range (coarse phase correlation + NCC of the
-    whole tiles); the known axis' image direction and sign are chosen as the ones most good matches agree with, and
-    a match is used only if it agrees with the known stage axis within the search radius (`refine_radius` of the
-    tile size, at least the 1 um stage resolution). Matches are refined at full resolution, then placed by the usual
-    global least squares (weak prior: known axis from the stage, unknown axis 0)."""
+def _consistent_with_tree(n: int, ok: list[PairResult], tol: float) -> list[PairResult]:
+    """Maximum spanning tree (Kruskal) of the matches by score (coarse score where known); a match outside the tree
+    whose offset disagrees with the tree positions by more than `tol` px is rejected. Returns the tree."""
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    tree = []
+    for r in sorted(ok, key=lambda r: -(r.coarse_score if r.coarse_score is not None else r.score)):
+        a, b = find(r.i), find(r.j)
+        if a != b:
+            parent[a] = b
+            tree.append(r)
+    pos: dict[int, np.ndarray] = {}
+    adj: dict[int, list] = {}
+    for r in tree:
+        adj.setdefault(r.i, []).append((r.j, np.asarray(r.offset, float)))
+        adj.setdefault(r.j, []).append((r.i, -np.asarray(r.offset, float)))
+    for s in range(n):
+        if s in pos:
+            continue
+        pos[s] = np.zeros(2)
+        todo = [s]
+        while todo:
+            a = todo.pop()
+            for b, d in adj.get(a, []):
+                if b not in pos:
+                    pos[b] = pos[a] + d
+                    todo.append(b)
+    for r in ok:
+        if r in tree:
+            continue
+        dev = float(np.hypot(*(pos[r.j] - pos[r.i] - np.asarray(r.offset, float))))
+        if dev > tol:
+            r.ok, r.reason = False, f"disagrees with the stronger matches by {dev:.0f} px"
+    return tree
+
+
+def _register_by_matching(tiles: list[TileInfo], store: TileStore, p: StitchParams, label: str,
+                          ps: float | None):
+    """Placement from image matching only ('Do not use stage positions', or no stage data / pixel size): every pair is
+    matched over the full range (coarse phase correlation + NCC of the whole tiles), good coarse matches (coarse NCC
+    >= min_score; at full resolution noisy tiles score lower although the match is clear, JU04 9478/9479: 0.90 coarse,
+    0.26 full) are refined at full resolution and placed by the global least squares (first tile of each connected
+    group fixed, no stage prior). Repeats (two images of the same field) are confirmed when they match at < 5 % of
+    the tile size (decisions D28 (c), D30)."""
     n = len(tiles)
     shapes = [store.shape(i) for i in range(n)]
     coarse = max(1, int(round(max(shapes[0]) / 640)))
     ext = max(shapes[0])
-    tol = max(p.refine_radius * ext, STAGE_RES_UM / ps)
-    S = np.array([stage_um(t) for t in tiles])
-    S = S - S[0]
-    unknown = sa["unknown_axes"]
-    known = [k for k, a in enumerate("XY") if a not in unknown]
-    pair_ids = [(i, j) for i, j in combinations(range(n), 2)
-                if all(abs(S[j, k] - S[i, k]) / ps < ext + tol for k in known)]
+    pair_ids = list(combinations(range(n), 2))
     coarse_res = []
     for c, (i, j) in enumerate(pair_ids):
-        _progress(f"{label}: full-range search, pair {c + 1}/{len(pair_ids)}", 0.02 + 0.4 * c / max(1, len(pair_ids)))
+        _progress(f"{label}: matching pair {c + 1}/{len(pair_ids)}", 0.02 + 0.4 * c / max(1, len(pair_ids)))
         r = register_pair(None, None, None, None, p.min_overlap_px, coarse, store=(store, i, j), coarse_only=True)
         r.i, r.j = i, j
         coarse_res.append(r)
-    Md = np.array(DEFAULT_STAGE_MAP)
-    # options for the known axis: (image axis 0 = row / 1 = col, sign); None = no known axis
-    if known:
-        k = known[0]
-        d_idx = int(np.argmax(np.abs(Md[:, k])))           # default: M row index (0 = col, 1 = row)
-        default = (1 - d_idx, int(np.sign(Md[d_idx, k])))
-        options = [default] + [(a, s) for a in (0, 1) for s in (1, -1) if (a, s) != default]
-    else:
-        k, options = None, [None]
-
-    def consistent(r: PairResult, opt) -> bool:
-        if not r.ok or r.score < p.min_score:
-            return False
-        if opt is None:
-            return True
-        a, s = opt
-        return abs(r.offset[a] - s * (S[r.j, k] - S[r.i, k]) / ps) <= tol
-    scored = [(sum(r.score for r in coarse_res if consistent(r, o)), -i, o) for i, o in enumerate(options)]
-    best = max(scored)[2]
-    # prior: known axis from the stage, unknown axis 0 (weak)
-    prior = np.zeros((n, 2))
-    M = Md.copy()
-    if best is not None:
-        a, s = best
-        prior[:, a] = s * S[:, k] / ps
-        M = np.zeros((2, 2), int)
-        M[1 - a, k] = s                                     # M rows = (col, row)
-        M[a, 1 - k] = int(np.sign(Md[:, 1 - k].sum())) or 1
+    good = [r for r in coarse_res if r.ok and r.score >= p.min_score]
     pairs: list[PairResult] = []
-    good = [r for r in coarse_res if consistent(r, best)]
     for c, r0 in enumerate(good):
         _progress(f"{label}: refining pair {c + 1}/{len(good)}", 0.42 + 0.23 * c / max(1, len(good)))
         r = register_pair(None, None, r0.offset, 2 * coarse + 2, p.min_overlap_px, coarse, store=(store, r0.i, r0.j))
         r.i, r.j = r0.i, r0.j
-        # the threshold applies to the coarse score (1/f resolution, pixel noise averaged out): at full resolution
-        # noisy tiles score lower (JU04 9478/9479: 0.90 coarse, 0.26 full) although the match is clear
         r.coarse_score = r0.score
-        if r.ok and r0.score < p.min_score:
-            r.ok, r.reason = False, f"NCC {r0.score:.2f} < {p.min_score}"
-        if r.ok and not consistent(dataclasses.replace(r, score=r0.score), best):
-            r.ok, r.reason = False, "refined match disagrees with the known stage axis"
+        if p.rotation_check and r.ok:
+            r.rotation_deg = rotation_check(store.get(r.i), store.get(r.j), r.offset)
         pairs.append(r)
     for r in coarse_res:
-        if r not in good:
-            r.ok = False
-            r.reason = r.reason or (f"NCC {r.score:.2f} < {p.min_score}" if r.score < p.min_score else
-                                    f"offset disagrees with stage {'XY'[k]} by more than {tol:.0f} px")
+        if r not in good and r.ok:                    # a weak match is listed with its reason (no overlap: left out)
+            r.ok, r.reason = False, f"NCC {r.score:.2f} < {p.min_score}"
             pairs.append(r)
-    # very weak prior: the unknown axis is anchored at 0 only for tiles without a match (a weight of 1e-4 pulled
-    # tiles 10 000 px away by ~1 px and showed as misalignment in the overlaps)
-    P, pairs, stage_only = solve_positions(n, pairs, prior if known else None, prior_weight=1e-9,
-                                           max_residual_px=p.max_residual_px)
-    if not known and len(_components(n, [r for r in pairs if r.used])) > 1:
-        raise ValueError("the stage positions of these images are identical and the images do not form one "
-                         "connected group of good matches; drag the tiles into place on the 'Arrange' tab and press "
-                         "'Stitch' again, or untick unrelated images under 'Images of the set'")
-    # repeats confirmed by matching: (almost) the same field of view
-    confirmed = []
-    for r in pairs:
-        if r.used and math.hypot(*r.offset) < 0.05 * ext:
-            confirmed.append(f"{_num_label(tiles[r.i])} = {_num_label(tiles[r.j])}")
-    notes = list(sa["notes"])
-    notes.append(f"unknown stage axis {' and '.join(unknown)}: positions found by image matching over the full range"
-                 + (f"; known axis {'XY'[k]} -> image {'rows' if best[0] == 0 else 'columns'} "
-                    f"({'+' if best[1] > 0 else '-'}), matches within {tol:.0f} px of it" if best else ""))
-    if stage_only:
-        notes.append("no good match for " + ", ".join(_num_label(tiles[q]) for q in stage_only) +
-                     ": placed at the stage position (unknown axis 0); drag " + ("it" if len(stage_only) == 1 else "them") +
-                     " into place on the 'Arrange' tab and press 'Stitch' again")
+    # Without a stage prior, false matches of repetitive microstructure (coarse NCC 0.6-0.8) outvoted true ones in the
+    # least squares (JU04 crack path: the 0.99 match 9465/9466 was dropped). Robust start as in MIST (Chalfoun 2017):
+    # maximum spanning tree of the strongest matches; other matches are used only if they agree with it.
+    _consistent_with_tree(n, [r for r in pairs if r.ok], tol=max(4.0 * coarse, 0.02 * ext))
+    P, pairs, stage_only = solve_positions(n, pairs, None, max_residual_px=p.max_residual_px)
+    if len(_components(n, [r for r in pairs if r.used])) > 1:
+        raise ValueError("the images do not form one connected group of good matches; drag the tiles roughly into "
+                         "place on the 'Arrange' tab and press 'Stitch' again, or untick unrelated images under "
+                         "'Images of the set'")
+    confirmed = [f"{_num_label(tiles[r.i])} = {_num_label(tiles[r.j])}" for r in pairs
+                 if r.used and math.hypot(*r.offset) < 0.05 * ext]
+    why = ("stage positions not used ('Do not use stage positions')" if not p.use_stage
+           else "no stage positions / pixel size")
+    notes = [f"{why}: positions from image matching of all pairs over the full tile"]
     if confirmed:
         notes.append("repeat confirmed by matching (same field of view): " + "; ".join(confirmed))
+    sa = stage_analysis(tiles) if ps else {"repeats": []}
     if sa["repeats"]:
         moved = sorted({_num_label(tiles[q]) for r in pairs if r.used and math.hypot(*r.offset) >= 0.05 * ext
                         for q in (r.i, r.j)} & {x for g in sa["repeats"] for x in g})
         if moved:
             notes.append("not repeats (matched at different positions): " + ", ".join(moved))
-    report = {"chosen": [list(map(int, r)) for r in M], "matrix": [list(map(int, r)) for r in M],
-              "unknown_axes": unknown, "stage_check": sa, "notes": notes, "search_px": round(float(tol), 1),
-              "known_axis_map": None if best is None else {"stage_axis": "XY"[k], "image_axis": "row col".split()[best[0]],
-                                                            "sign": best[1]},
-              "candidates": [{"option": None if o is None else list(o), "score_sum": round(float(sc), 3)}
-                             for sc, _, o in scored],
-              "repeats_confirmed": confirmed}
-    return P, pairs, stage_only, report, (prior if known else None)
+    report = {"notes": notes, "stage_used": False, "repeats_confirmed": confirmed}
+    return P, pairs, stage_only, report, None
 
 
 def _stage_transform(tiles: list[TileInfo], pos_px: np.ndarray, report: dict, ps: float | None) -> dict | None:
     """Affine stage (X, Y in mm) -> mosaic (col, row in px) fitted to the final tile origins; axes along which the
     stage did not move take the chosen signed-permutation mapping."""
-    if ps is None or not all(t.has_stage for t in tiles):
+    if ps is None or not all(t.has_stage for t in tiles) or report.get("stage_used") is False:
         return None
     S = np.array([[t.stage_x_mm, t.stage_y_mm] for t in tiles])
     C = np.stack([pos_px[:, 1], pos_px[:, 0]], axis=1)          # col, row
     M0 = np.asarray(report.get("matrix", DEFAULT_STAGE_MAP), float) * 1000.0 / ps
     span = S.max(axis=0) - S.min(axis=0)
-    unknown = report.get("unknown_axes") or []
-    moved = (span > 0.0005) & np.array([a not in unknown for a in "XY"])
+    moved = span > 0.0005
     M = M0.copy()
     if moved.all() and len(tiles) >= 3:
         A = np.c_[S, np.ones(len(S))]
@@ -1596,8 +1593,7 @@ def _stage_transform(tiles: list[TileInfo], pos_px: np.ndarray, report: dict, ps
     return {"description": "mosaic [col, row] px = matrix @ [stage X, stage Y] mm + offset (tile origin = "
                            "top-left pixel of the tile's strip-free image)",
             "matrix_px_per_mm": M.round(4).tolist(), "offset_px": off.round(3).tolist(), "rms_px": round(rms, 2),
-            "axis_map": report.get("matrix"), "fitted_axes": ["XY"[k] for k in range(2) if moved[k]],
-            "unknown_axes": unknown}
+            "axis_map": report.get("matrix"), "fitted_axes": ["XY"[k] for k in range(2) if moved[k]]}
 
 
 def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) -> dict[str, MosaicResult]:
@@ -1681,9 +1677,10 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
             table = _tile_table(tl, P, Q, O, ps, pairs, stage_only, nud, gains, se_matches, bool(p.manual_layout))
             side = _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, strip_info, notes,
                             gains, normalize, se_matches, table)
+            seams = rinfo.pop("_seams", None)
             side["render"] = rinfo
             side["stage_check"] = stage_check
-            for q in (report.get("notes") or []) if report.get("unknown_axes") else stage_check["notes"]:
+            for q in stage_check["notes"] + list(report.get("notes") or []):    # 'possible repeats' first
                 if q not in side["notes"]:
                     side["notes"].append(q)
             tif = out_dir / f"mosaic_{det}.tif"
@@ -1695,7 +1692,11 @@ def stitch(p: StitchParams, out_dir: Path, tiles: list[TileInfo] | None = None) 
             side = _json_safe(side)
             sc = out_dir / f"mosaic_{det}.json"
             sc.write_text(json.dumps(side, indent=1, ensure_ascii=False), encoding="utf-8")
-            results[det] = MosaicResult(det, tif, prev, sc, table, side)
+            seam_file = None
+            if seams is not None:
+                seam_file = out_dir / f"mosaic_{det}_seams.npz"
+                np.savez(seam_file, **seams)
+            results[det] = MosaicResult(det, tif, prev, sc, table, side, seam_file)
         finally:
             mosaic = final = None                    # release the memory maps before deleting their files
             for f in out_dir.glob(f".mosaic_{det}*.raw"):
@@ -1906,36 +1907,28 @@ def _sidecar(p, det, tl, Q, O, ps, pairs, stage_only, report, prior, canvas, str
     }
 
 
-def layout_preview(tiles: list[TileInfo], thumb_px: int = 256) -> dict:
-    """Stage-predicted layout (default JSM-IT500HR mapping, no registration) for a thumbnail preview."""
+def layout_preview(tiles: list[TileInfo], thumb_px: int = 256, use_stage: bool = True) -> dict:
+    """Stage-predicted layout (default JSM-IT500HR mapping, no registration) for the Arrange view; without stage data
+    or with use_stage=False ('Do not use stage positions') the tiles are laid out in a grid in image-number order, as
+    a starting point to drag from."""
     if not tiles:
         return {"tiles": [], "width": 0, "height": 0}
     ps = tiles[0].pixel_size_um
-    sa = stage_analysis(tiles) if ps and all(t.has_stage for t in tiles) else {"unknown_axes": []}
-    if ps and all(t.has_stage for t in tiles):
+    if use_stage and ps and all(t.has_stage for t in tiles):
         pos = predict_positions(tiles, DEFAULT_STAGE_MAP, ps)
-        src = "stage"
-        if sa["unknown_axes"]:
-            # images with the same stage position would lie on top of each other: spread every group of identical
-            # positions along the unknown axis' image direction (rows for Y; columns when only X is unknown), in
-            # image-number order, as a starting point to drag from
-            a = 1 if sa["unknown_axes"] == ["X"] else 0
-            groups: dict[tuple, list[int]] = {}
-            for k, t in enumerate(tiles):
-                groups.setdefault((round(t.stage_x_mm * 1000), round(t.stage_y_mm * 1000)), []).append(k)
-            for g in groups.values():
-                g.sort(key=lambda k: (tiles[k].image_number or 0, tiles[k].name))
-                for m, k in enumerate(g):
-                    pos[k][a] += m * 1.05 * (tiles[k].height if a == 0 else tiles[k].width)
-            src = ("stage; position along " + " and ".join(sa["unknown_axes"]) + " unknown: images with the same stage "
-                   "position spread out in image-number order")
         pos = pos - pos.min(axis=0)
+        src = "stage"
     else:
-        pos = np.array([[0.0, k * t.width * 1.05] for k, t in enumerate(tiles)])
-        src = "none (no stage data: tiles in a row)"
+        order = sorted(range(len(tiles)), key=lambda k: (tiles[k].image_number or 0, tiles[k].name))
+        ncol = max(1, math.ceil(math.sqrt(len(tiles))))
+        pos = np.zeros((len(tiles), 2))
+        for m, k in enumerate(order):
+            pos[k] = ((m // ncol) * tiles[k].height * 1.05, (m % ncol) * tiles[k].width * 1.05)
+        src = ("none (stage positions not used: tiles in a grid)" if use_stage is False
+               else "none (no stage data: tiles in a grid)")
     W = float(max(pos[k][1] + t.width for k, t in enumerate(tiles)))
     H = float(max(pos[k][0] + t.height for k, t in enumerate(tiles)))
-    return {"source": src, "width": W, "height": H, "unknown_axes": sa["unknown_axes"],
+    return {"source": src, "width": W, "height": H,
             "tiles": [{"name": t.name, "x": float(pos[k][1]), "y": float(pos[k][0]), "w": t.width, "h": t.height,
                        "image_number": t.image_number} for k, t in enumerate(tiles)]}
 

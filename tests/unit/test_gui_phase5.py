@@ -60,12 +60,16 @@ async def test_viewer_layer_overlay_and_export_dialog(gproj, tmp_path):
         await user.should_see(marker="exp_fmt")
         user.find(marker="run_export").click()
         await user.should_see("Exported EBMX-1_JU02_c300_ipf.png", retries=300)
-    steps = gproj.recipe().steps
-    assert steps[-1].op == "export.map" and steps[-1].params["overlays"] == ["hagb"]
-    assert steps[-1].params["layer"]["ipf_keys"]["Ti (alpha)"]["key"] == "ipfHKLKey"
+    from ti64app import exportlog
+
+    assert all(s.op != "export.map" for s in gproj.recipe().steps)       # exports are not recipe steps (fix 3.4)
+    e = exportlog.load(gproj.root)[-1]                                    # ... but logged
+    assert e.op == "export.map" and e.params["overlays"] == ["hagb"] and e.file == str(target)
+    assert e.params["layer"]["ipf_keys"]["Ti (alpha)"]["key"] == "ipfHKLKey"
     assert target.is_file() and target.with_suffix(".json").is_file()
     assert gproj.gui_state()["export"]["map"]["format"] == "png"           # last choices remembered
-    assert [it["kind"] for it in steps[-1].params["legends"]] == ["scale_bar"]   # as shown on the map (WYSIWYG)
+    assert gproj.gui_state()["export_folder"] == str(target.parent)       # last folder per project (fix 3.3)
+    assert [it["kind"] for it in e.params["legends"]] == ["scale_bar"]   # as shown on the map (WYSIWYG)
     assert gproj.gui_state()["overlays"]["JU02_c300"] == {"alpha": ["hagb"]}         # per map tab
 
 

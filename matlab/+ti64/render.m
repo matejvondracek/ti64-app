@@ -100,7 +100,7 @@ if isfield(o, 'exact') && o.exact
   printExact(f, ax, o, outPng);
 else
   f.Position = [1 1 w w * diff(R.ydata) / diff(R.xdata) + 1.5];
-  exportgraphics(f, outPng, 'Resolution', o.dpi, 'BackgroundColor', 'white');
+  ti64.plot.saveFigure(f, outPng, o.dpi);
 end
 close(f);
 end

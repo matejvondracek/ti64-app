@@ -5,17 +5,22 @@ Format PNG / TIFF / SVG / PDF; resolution native (1 px per measurement / image p
 typed in pixels (width OR height, the aspect ratio is locked) or a width in mm at a chosen DPI. The dialog shows the
 final size in pixels, the physical size in um and an estimated file size. Legends (scale bar, colour bar, IPF key)
 are NOT chosen here: the export shows exactly the ones placed on the map / image view (what you see is what you get).
-Location by the Windows save dialog. The export is a recipe step (its output stays in the project) and is copied to
-the chosen file. The last choices are remembered (gui_state.json of the project)."""
+Location by the Windows save dialog; the first default folder is the user's Pictures folder, then the last folder
+used in the project. Exports are NOT recipe steps (fix 3.4): service.export runs the op unrecorded, keeps the file in
+exports/<id>/, copies it to the chosen file and adds an entry to the export log ("Export again" repeats one with the
+same settings). What is included (overlays, annotations, the microscope info bar) starts from what the view shows
+(view_state, fix 3.5: what you see is what you get); format and resolution are remembered (gui_state.json)."""
 from __future__ import annotations
 
 import math
-import shutil
 from pathlib import Path
 
+from nicegui import run as ng_run
 from nicegui import ui
 
+from .. import exportlog, service
 from ..project import Project
+from ..settings import pictures_dir
 from . import dialogs
 from .shell import error, notify_actions
 from .state import GuiState
@@ -24,8 +29,12 @@ EXT = {"png": ".png", "tiff": ".tif", "svg": ".svg", "pdf": ".pdf", "bigtiff": "
 TYPES = {"png": ("PNG image", "*.png"), "tiff": ("TIFF image", "*.tif;*.tiff"), "svg": ("SVG vector", "*.svg"),
          "pdf": ("PDF document", "*.pdf"), "bigtiff": ("BigTIFF image (tiled)", "*.tif;*.tiff")}
 FRACTIONS = {"1/2": 2, "1/4": 4, "1/8": 8}          # images / mosaics: export size as a fraction of the original
-DEFAULTS = {"format": "png", "res": "native", "width_mm": 120.0, "dpi": 600, "px_w": None, "overlays": True,
-            "annotations": True, "info_strip": True, "region": "map", "folder": ""}
+DEFAULTS = {"format": "png", "res": "native", "width_mm": 120.0, "dpi": 600, "px_w": None, "region": "map"}
+INFO_BAR_LABEL = ("Add the microscope info bar under the image (detector, kV, WD, magnification, scale bar, image "
+                  "number, date)")
+INFO_BAR_TIP = ("The JEOL-style data bar below the image: detector, accelerating voltage, working distance, "
+                "magnification, a scale bar, the image number(s) and the date, as recorded in the .txt files. With "
+                "it, the scale bar placed on the view is left out (only one scale bar).")
 LEGEND_NAMES = {"scale_bar": "scale bar", "colorbar": "colour bar / colour legend", "ipf_key": "IPF colour key"}
 HEX_NOTE = ("Hexagonal map: native and 2× draw each measurement as a rectangle (brick layout: one step wide, rows "
             "shifted by half a step, like hexRaster in EBSD_part2.m; exact, one pixel per measurement at native). "
@@ -85,10 +94,19 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                         layer: dict | None = None, overlays: list[str] | None = None, view: dict | None = None,
                         rois: dict | None = None, stitch_step=None, detector: str = "BSE",
                         sample_id: str | None = None, image: str | None = None, geometry: dict | None = None,
-                        legends: list[dict] | None = None, overlay_style: dict | None = None) -> None:
+                        legends: list[dict] | None = None, overlay_style: dict | None = None,
+                        view_state: dict | None = None) -> None:
     """geometry: {extent: [x0, x1, y0, y1] um, step: [dx, dy], hex, roi_boxes: {id: (x0, y0, x1, y1)}} for maps;
-    {size_px: [W, H], pixel_size_um} for images / mosaics. legends: the items placed on the view."""
+    {size_px: [W, H], pixel_size_um} for images / mosaics. legends: the items placed on the view. view_state:
+    {overlays, annotations, info_strip} = what the view shows; the Include boxes start from it (what you see is what
+    you get). run_step is not used for the export itself (exports are not recipe steps)."""
     last = {**DEFAULTS, **(gs.get("export", kind) or {})}
+    vs_ = view_state or {}
+    shown = {"overlays": bool(vs_.get("overlays", bool(overlays))), "annotations": bool(vs_.get("annotations", True)),
+             "info_strip": bool(vs_.get("info_strip", True))}
+    folder = gs.get("export_folder") or last.get("folder") or ""
+    if not folder or not Path(folder).is_dir():
+        folder = str(pictures_dir())
     geometry = geometry or {}
     legends = legends or []
     is_map = kind == "map"
@@ -145,29 +163,30 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
             ui.label("Include").classes("w-24 ti-muted")
             ov = ann = strip = None
             if is_map:
-                ov = ui.checkbox(f"overlays ({', '.join(overlays or []) or 'none shown'})", value=last["overlays"]) \
-                    .mark("exp_overlays")
-                ann = ui.checkbox("annotations", value=last["annotations"]).mark("exp_annotations")
+                ov = ui.checkbox(f"overlays ({', '.join(overlays or []) or 'none shown'})",
+                                 value=shown["overlays"] and bool(overlays)).mark("exp_overlays")
+                ann = ui.checkbox("annotations", value=shown["annotations"]).mark("exp_annotations")
             else:
-                strip = ui.checkbox("info strip / data bar", value=last["info_strip"]).mark("exp_strip")
+                strip = ui.checkbox(INFO_BAR_LABEL, value=shown["info_strip"]).mark("exp_strip") \
+                    .tooltip(INFO_BAR_TIP)
         leg_lab = ui.label().classes("text-xs ti-muted").mark("exp_legends")
 
         def legends_text(_=None):
             names = [LEGEND_NAMES[it["kind"]] for it in legends]
             strip_bar = (not is_map and strip is not None and strip.value
                          and any(it["kind"] == "scale_bar" for it in legends))
-            if strip_bar:                 # the info strip / data bar has its own scale bar (user test, fix 16)
+            if strip_bar:                 # the info bar has its own scale bar (user test, fix 16)
                 names = [n for n in names if n != LEGEND_NAMES["scale_bar"]]
             leg_lab.text = ("Legends as placed on the view: " + (", ".join(names) if names else "none") +
                             ". Move, resize, show or hide them on the view; the export puts them exactly there." +
-                            (" The scale bar comes from the info strip / data bar (the one on the view is left "
+                            (" The scale bar comes from the microscope info bar (the one on the view is left "
                              "out, so there is only one)." if strip_bar else ""))
         legends_text()
         if strip is not None:
             strip.on_value_change(legends_text)
         with ui.row().classes("w-full items-end gap-2 no-wrap"):
-            dest = ui.input("Save as", value=str(Path(last["folder"] or Path.home() / "Documents") /
-                                                 (base + EXT[last["format"]]))).classes("grow").mark("exp_dest")
+            dest = ui.input("Save as", value=str(Path(folder) / (base + EXT.get(last["format"], ".png")))) \
+                .classes("grow").mark("exp_dest")
 
             async def browse():
                 f = await dialogs.save_file("Export as", Path(dest.value).name, str(Path(dest.value).parent),
@@ -278,7 +297,7 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
 
         def choices() -> dict:
             c = {"format": fmt.value, "res": res.value, "width_mm": float(wmm.value or 120), "dpi": int(dpi.value or 600),
-                 "px_w": pw.value, "folder": str(Path(dest.value).parent)}
+                 "px_w": pw.value}
             if is_map:
                 c.update(overlays=ov.value, annotations=ann.value, region=region.value)
             else:
@@ -287,7 +306,7 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
 
         async def go():
             c = choices()
-            gs.set("export", kind, c)
+            gs.set("export", kind, {k: v for k, v in c.items() if k in DEFAULTS})
             target = Path(dest.value)
             if not target.parent.is_dir():
                 ui.notify(f"Folder {target.parent} does not exist.", type="warning")
@@ -315,7 +334,7 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                     prm["roi"] = (view["x0"], view["y0"], view["x1"], view["y1"])
                 elif c["region"] not in ("map", "view"):
                     prm["roi_id"] = c["region"]
-                step = await run_step("export.map", prm, "export", None, with_map=False)
+                op = "export.map"
             else:
                 prm = {"detector": detector, "format": c["format"],
                        "mode": ("native" if c["res"] == "native" else "scale" if c["res"] in FRACTIONS else "width"),
@@ -323,25 +342,54 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
                        "info_strip": c["info_strip"], "name": target.stem, "sample_id": sample_id,
                        "legends": legends, "scale_bar": False}
                 prm.update({"stitch": stitch_step} if kind == "mosaic" else {"image": image})
-                step = await run_step("sem.export", prm, "export", None, with_map=False)
-            if not step:
-                return
-            try:
-                src = p.root / step.outputs["export"].path
-                shutil.copy2(src, target)
-                side = p.root / step.outputs["sidecar"].path
-                shutil.copy2(side, target.with_suffix(".json"))
-                notify_actions(f"Exported {target.name} to {target.parent}",
-                               [("Show", f"() => fetch('/api/ti64/reveal?path={_q(target)}', {{method: 'POST'}})")],
-                               type="positive", multi_line=False)
-            except Exception as e:  # noqa: BLE001
-                error(e, "Could not write the exported file")
+                op = "sem.export"
+            gs.set("export_folder", str(target.parent))           # remembered per project (fix 3.3)
+            await run_export(p, op, prm, target)
+
+        earlier = [e for e in reversed(exportlog.load(p.root))
+                   if e.op == ("export.map" if is_map else "sem.export")
+                   and (not is_map or e.map_id == map_id)][:8]
+        if earlier:
+            with ui.expansion(f"Earlier exports ({len(earlier)})", icon="history").classes("w-full text-sm") \
+                    .mark("exp_earlier"):
+                for e in earlier:
+                    with ui.row().classes("w-full items-center no-wrap gap-2"):
+                        with ui.column().classes("grow min-w-0 gap-0"):
+                            ui.label(e.label()).classes("text-sm truncate")
+                            ui.label(f"{e.date.replace('T', ' ')} · {Path(e.file).name if e.file else 'kept in the project'}"
+                                     ).classes("text-xs ti-muted truncate")
+                        ui.button("Export again", icon="replay",
+                                  on_click=lambda e=e: again(e)).props("flat dense no-caps") \
+                            .mark(f"exp_again_{e.id}").tooltip("Export again with exactly these settings (to the same "
+                                                               "file, or the 'Save as' file above if it had none)")
+
+        async def again(e):
+            dlg.close()
+            t = Path(e.file) if e.file else Path(dest.value).with_suffix(EXT.get(e.params.get("format", "png"), ".png"))
+            await run_export(p, e.op, e.params, t, e.backend)
         with ui.row().classes("w-full justify-end"):
             ui.button("Cancel", on_click=dlg.close).props("flat").mark("exp_cancel")
             state["btn"] = ui.button("Export", icon="ios_share", on_click=go).mark("run_export")
         if not is_map:
             update()                                   # enable / disable Export from the size check
     dlg.open()
+
+
+async def run_export(p: Project, op: str, params: dict, target: Path, backend: str | None = None) -> None:
+    """Run one export (not a recipe step) with a spinner, copy it to `target`, log it; say where it went."""
+    n = ui.notification(f"Exporting {target.name} …", spinner=True, timeout=None)
+    try:
+        res = await ng_run.io_bound(service.export, p, op, params, backend, target)
+    except Exception as e:  # noqa: BLE001
+        error(e, "Export failed")
+        return
+    finally:
+        n.dismiss()
+    if res is None:                                   # app shutting down
+        return
+    notify_actions(f"Exported {target.name} to {target.parent} (listed under 'Earlier exports' in the Export dialog)",
+                   [("Show", f"() => fetch('/api/ti64/reveal?path={_q(target)}', {{method: 'POST'}})")],
+                   type="positive", multi_line=False)
 
 
 def _q(path: Path) -> str:

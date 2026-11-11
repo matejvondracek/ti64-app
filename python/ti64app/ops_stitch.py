@@ -64,6 +64,14 @@ def _sem_stitch(ctx: OpContext) -> None:
         ctx.output(f"preview_{det}", "png", r.preview, f"{pre}mosaic_{det}_preview")
         ctx.output(f"sidecar_{det}", "json", r.info, f"{pre}mosaic_{det}")
         ctx.output(f"tiles_{det}", "csv", r.table, f"{pre}tiles_{det}")
+        if r.seams is not None and Path(r.seams).is_file():     # seam lines for the Result viewer (fix 3.16)
+            import numpy as np  # noqa: PLC0415
+
+            with np.load(r.seams) as z:
+                seams = {k: z[k] for k in z.files}
+            if Path(r.seams).name != f"{pre}mosaic_{det}_seams.npz":
+                Path(r.seams).unlink(missing_ok=True)
+            ctx.output(f"seams_{det}", "npz", seams, f"{pre}mosaic_{det}_seams")
         ctx.metrics.update({f"{det}_tiles": r.info["n_tiles"], f"{det}_width_px": r.info["mosaic_px"][0],
                             f"{det}_height_px": r.info["mosaic_px"][1],
                             f"{det}_residual_max_px": r.info["residual_px"]["max"] or 0.0,

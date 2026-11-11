@@ -30,7 +30,7 @@ grain-size statistics, 4-point-bending stress mapping and fatigue-crack analysis
 | MCP server | `ti64 mcp` (stdio). Register in Claude Code (machine-local, not committed): `claude mcp add ti64 --scope local -- C:\Users\matej\miniforge3\envs\ti64\Scripts\ti64.exe mcp`; check with `claude mcp get ti64`; new tools appear in the next Claude Code session |
 | MCP demo (stdio client, both backends) | `python scripts/mcp_demo.py <map.ang> --angle <BD deg> [--map-id ID] [--prefix demo_mcp]` → projects `<prefix>_pymtex`, `<prefix>_matlab`, log `projects/<prefix>_log.json` |
 | CLI | `ti64 backends`, `ti64 ops`, `ti64 run <recipe.json> [--project P] [--backend B] [--include-stale] [--until ID] [--no-compare] [--json]`, `ti64 replay <project>` |
-| Stitch SEM images | `ti64 stitch <folder or files> [--scan] [--detector BSE\|SE\|both] [--se-layout bse] [--info-strip none\|keep\|generate] [--blend seam\|feather\|none] [--seam midline\|min_difference] [--band 32] [--exclude 9771 ...] [--project P] [--json]`; GUI Stitch tab; MCP `scan_sem_images` (lists the stitch sets), `stitch_images` |
+| Stitch SEM images | `ti64 stitch <folder or files> [--scan] [--detector BSE\|SE\|both] [--se-layout bse] [--info-strip none\|keep\|generate] [--blend seam\|feather\|none] [--seam midline\|min_difference] [--band 32] [--no-stage] [--exclude 9771 ...] [--project P] [--json]`; GUI Stitch tab; MCP `scan_sem_images` (lists the stitch sets), `stitch_images` |
 | Hexagons of both backends side by side | `python scripts/hex_backends.py` → `projects/_gui_screenshots/hex_backends.png` (+ `_detail.png`) |
 | Tests | `python -m pytest` (`-m "not slow and not matlab"` for the fast part); MATLAB: `runtests('matlab/tests')` |
 | Test crops | `python scripts/make_crops.py` (300×300 and 1000×1000 points, into `data/test/crops/`) |
@@ -228,6 +228,36 @@ Decisions D23–D28.
 
 Screenshots of the changed screens: `python scripts/gui_screenshots_fix2.py` → `projects/_gui_screenshots_fix2/`
 (git-ignored; `index.html`).
+
+### Phase 6.6 fix 3 – View and Stitch (third user test, decisions D30)
+
+| Change | Where |
+| --- | --- |
+| **View**: .bmp / .tif images open with the **microscope info bar** ON (JEOL data bar: detector, kV, WD, magnification, scale bar, image number, date) and the app's scale bar OFF; an image without an info bar shows the app's scale bar; the choice is remembered per image; the export starts from what the view shows | `gui/view_tab.py` |
+| **Stitch result zoomable**: the mosaic opens in the tiled viewer (pan / zoom to full resolution; pyramid TIFF read lazily, a few tens of MB), optional **tile borders** (coloured by match score, image number · score) and **seams** (saved by `sem.stitch` as output `seams_<DET>`; older steps: midline seams computed for display); click a tile to nudge / exclude it | `gui/mosaic_tiles.py`, `gui/stitch_page.py`, `modules/stitching.py` (`seam_segments`) |
+| **No stage-axis warning / no automatic full-range search** along a constant stage axis (JU04 was a faulty stage); new option **Do not use stage positions** (`sem.stitch use_stage=False`; Stitch tab under 'Stitch sets', MCP `stitch_images use_stage`, CLI `--no-stage`): placement only from image matching of all pairs (maximum spanning tree of the strongest matches, then least squares) or the Arrange positions; sets are not split by stage position; the Arrange view starts from a grid | `modules/stitching.py` (`_register_by_matching`, `_consistent_with_tree`, `stitch_sets`, `layout_preview`), `gui/stitch_page.py`, `mcp_server.py`, `cli.py` |
+| Tests | `tests/unit/test_stitching.py` (no unknown axis, matching without stage, repeats, seam lines), `test_gui_stitch.py` (option + zoomable result, lazy pyramid reader, View defaults) |
+
+Screenshots: `python scripts/gui_screenshots_fix3_stitch.py` → `projects/_screens_fix3/` (git-ignored).
+
+### Phase 6.6 fix 3 – top bar, export log, EBSD tab (third user test, decisions D29, D31)
+
+| Change | Where |
+| --- | --- |
+| **Memory** in the top bar: app (Python + MATLAB engine) and PC used / total, every 3 s, tooltip, orange above 80 % | `sysinfo.py`, `gui/shell.py` (`right_tools`) |
+| **Feedback** button: Bug / Idea / Question, description, version, backend, OS, last 100 log lines (paths shortened to file names), optional window screenshot (off by default); "Open GitHub issue" (pre-filled) or "Send e-mail" (subject "[Ti64] Bug" / "Idea" / "Question", report .zip selected in Explorer); repo URL and address in Settings > Feedback | `feedback.py`, `gui/shell.py`, `settings.FeedbackSettings` |
+| **Exports are not recipe steps**: `export_log.json` (settings, file, date), files in `exports/<id>/`, "Earlier exports → Export again" in the Export dialog, MCP `export_log` / `export_again`; old projects migrated on open | `exportlog.py`, `service.export / export_again`, `gui/export_dialog.py` |
+| Export: default folder = Pictures, then the last folder per project; Include boxes = what the view shows; "Add the microscope info bar under the image (…)" with tooltip | `settings.pictures_dir`, `gui/export_dialog.py` |
+| **EBSD load**: progress bar with the stage names in the map area; JU02 click → first image 1.8–4.6 s (pymtex), see D29 | `progress.py`, `gui/ebsd_tab.py` |
+| **KAM / GROD / GOS / GND** in the map list, computed on first use; section 'KAM / GROD / GOS / GND' holds only the parameters | `gui/ebsd_tab.py` |
+| **Prior-β grains**: 'Grains and boundaries' on the prior β tab segments the reconstructed parent map (both backends); stays on the tab, HAGB overlay on there | `ops_ebsd.resolve_grains`, `layers.newest_grains`, `matlab/+ti64/calcGrains.m` |
+| **Legends**: IPF key only on IPF maps (colour bar instead on scalar maps, no placeholder text); snap to corners / edge centres with a margin, while dragging or in 'Legend layout'; auto size | `gui/map_viewer.js`, `legends.LegendItem`, `gui/ebsd_tab.py` |
+| **History** right-click → Delete (dependents: delete too / mark stale; undoable) | `gui/history_panel.py`, `service.delete_step` |
+| **Results** right-click → Delete / Save (MATLAB .fig, .svg / .pdf vector) / Export (png, jpg, tif, svg, pdf) | `service.save_figure / export_result`, `matlab/+ti64/+plot/saveFigure.m` |
+| Grain-size histogram: shown range min / max (µm) besides the bin width | `ops_grainsize`, `modules/grain_size.hist_edges` |
+| Tests | `tests/unit/test_fix3.py`, `test_fix3_gui.py`, `test_fix3_load.py`, `tests/conformance/test_fix3.py` (prior-β grains + Save formats in both backends) |
+
+Screenshots: `python scripts/gui_screenshots_fix3.py` → `projects/_screens_fix3/main/` (full JU02 map; git-ignored).
 
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.

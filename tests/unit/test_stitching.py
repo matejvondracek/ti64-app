@@ -470,54 +470,65 @@ def _flatten_stage(folder, y_mm=0.237, x_by_num=None):
 JU04_LIKE = [(0.0, 0.0), (381.3, 2.4), (14.6, 405.2), (393.8, 401.7)]    # two columns of two, ~20 % overlap
 
 
-def test_stage_analysis_unknown_axis_and_repeats(tmp_path):
+def test_stage_analysis_repeats_no_unknown_axis(tmp_path):
+    """Fix 3.17: a constant stage axis is no longer 'unknown' (no warning, no spreading); identical positions and
+    possible repeats are still listed."""
     make_tiles(tmp_path, JU04_LIKE)
     # columns: same stage X per column (as JU04: images of one column share the position), Y constant
     _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0, 9773: 0.980, 9774: 0.980})
     tl = stitching.scan(tmp_path)
     sa = stitching.stage_analysis(tl)
-    assert sa["unknown_axes"] == ["Y"] and sa["spread_um"][1] == 0.0
+    assert "unknown_axes" not in sa and "message" not in sa and sa["spread_um"][1] == 0.0
     assert sa["identical"] == [["9771", "9772"], ["9773", "9774"]]
     assert sa["repeats"] == [["9771", "9772"], ["9773", "9774"]]
-    assert "stage Y is 0.237 mm in all 4 images" in sa["message"] and "not in the metadata" in sa["message"]
-    # legitimate single column (X constant, Y stepped, no identical positions): X unknown, Y known, no repeats
-    col = tmp_path / "col"
-    col.mkdir()
-    make_tiles(col, [(0.0, 0.0), (381.3, 2.4), (760.0, -1.0)])
-    sb = stitching.stage_analysis(stitching.scan(col))
-    assert sb["unknown_axes"] == ["X"] and not sb["repeats"]
-    # the Arrange preview spreads the images of one position along the unknown axis (rows), image-number order
+    assert any("possible repeats" in q for q in sa["notes"])
+    # the Arrange preview puts the tiles at their stage positions (no spreading along an axis)
     lay = stitching.layout_preview(tl)
     ys = {t["image_number"]: t["y"] for t in lay["tiles"]}
-    assert ys[9772] - ys[9771] > TH and ys[9774] - ys[9773] > TH and lay["unknown_axes"] == ["Y"]
+    assert ys[9772] == ys[9771] and lay["source"] == "stage"
+    # without stage use: a grid in image-number order, no overlaps
+    g = stitching.layout_preview(tl, use_stage=False)
+    pos = {t["image_number"]: (t["x"], t["y"]) for t in g["tiles"]}
+    assert len(set(pos.values())) == 4 and "not used" in g["source"]
+    # stitch sets: a faulty stage does not split the set when the stage is not used
+    assert len(stitching.stitch_sets(tl, use_stage=False)) == 1
 
 
-def test_unknown_axis_found_by_matching(tmp_path):
-    """JU04: the vertical position is not in the metadata; Stitch searches it over the full range (X from the
-    stage), places every tile within a pixel, and reports the repeats as not confirmed."""
+def test_no_stage_positions_by_matching(tmp_path):
+    """'Do not use stage positions' (fix 3.17): placement only from image matching of all pairs; JU04-like faulty
+    stage (Y constant, identical positions per column) is placed within a pixel."""
     files, pos = make_tiles(tmp_path, JU04_LIKE)
     _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0, 9773: 0.980, 9774: 0.980})
-    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")["BSE"].info
+    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), use_stage=False), tmp_path / "o")["BSE"].info
     err = _rel(side, pos, [f.stem for f in files])
     assert np.abs(err).max() < 1.0, err
-    assert side["stage_only_tiles"] == [] and side["stage_map"]["unknown_axes"] == ["Y"]
-    assert side["misalignment_px"]["max"] < 0.5
+    assert side["stage_only_tiles"] == [] and side["misalignment_px"]["max"] < 0.5
     notes = " ".join(side["notes"])
-    assert "not in the metadata" in notes and "possible repeats" in notes and "not repeats" in notes
-    assert side["stage_to_mosaic"]["unknown_axes"] == ["Y"] and side["stage_to_mosaic"]["fitted_axes"] == ["X"]
-    # the old behaviour (stage prior with Y = constant) put the two rows on top of each other: forcing the default
-    # stage map (no unknown-axis search) shows it
-    old = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), stage_map="default"), tmp_path / "o2")
+    assert "stage positions not used" in notes and "possible repeats" in notes and "not repeats" in notes
+    assert "not in the metadata" not in notes and side["stage_to_mosaic"] is None
+    # with the (faulty) stage positions the rows land on top of each other: no automatic full-range search any more
+    old = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o2")
     assert np.abs(_rel(old["BSE"].info, pos, [f.stem for f in files])).max() > 100
+    assert "not in the metadata" not in " ".join(old["BSE"].info["notes"])
 
 
 def test_repeat_confirmed(tmp_path):
     """Two images of the same field (same stage position and magnification) are confirmed as a repeat."""
     make_tiles(tmp_path, [(0.0, 0.0), (0.4, -0.3)], seed=4)
     _flatten_stage(tmp_path, x_by_num={9771: 1.0, 9772: 1.0})
-    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")["BSE"].info
-    assert side["stage_map"]["unknown_axes"] == ["X", "Y"]
+    side = stitching.stitch(stitching.StitchParams(folder=str(tmp_path), use_stage=False), tmp_path / "o")["BSE"].info
     assert any("repeat confirmed" in q and "9771 = 9772" in q for q in side["notes"])
+
+
+def test_seam_lines_saved(tmp_path):
+    """The seam lines of a stitch are saved for the Result viewer (fix 3.16): between tiles only, inside the canvas."""
+    make_tiles(tmp_path, JU04_LIKE)
+    r = stitching.stitch(stitching.StitchParams(folder=str(tmp_path)), tmp_path / "o")["BSE"]
+    assert r.seams is not None and r.seams.is_file()
+    with np.load(r.seams) as z:
+        assert z["x1"].size > 0
+        W, H = r.info["mosaic_px"]
+        assert z["x2"].max() <= W and z["y2"].max() <= H and z["x1"].min() > 0
 
 
 def test_export_estimate_and_guard():

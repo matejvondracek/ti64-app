@@ -17,7 +17,7 @@ from nicegui import run as ng_run
 from nicegui import ui
 
 from .. import layers as lay
-from .. import service
+from .. import progress, service
 from ..annotations import ROI_TYPES, Annotation, load_annotations, roi_box
 from ..backends import backend_status
 from ..project import Project
@@ -37,6 +37,13 @@ RECON_FIG_KINDS = ["parent_ipf", "alpha_parent_gb", "fit", "variant", "packet", 
                    "mis_hist", "fit_hist", "ecd_hist", "n_variants_hist"]
 DEFAULT_OV_COLOR = {"hagb": "#000000", "lagb": "#a6a6a6", "interface": "#d91a1a", "beta_gb": "#000000",
                     "crack": "#e00000"}
+ON_DEMAND = ("kam", "grod", "gos", "gnd")             # listed in the map selector, computed on first use (fix 3.9)
+IPF_KINDS = ("ipf", "parent_ipf")
+# rough share of the whole load (click -> first image) per stage, for the progress bar when a stage gives no fraction
+STAGE_FRAC = {"starting": 0.02, "reading file": 0.1, "transferring data": 0.4, "cleanup from cache": 0.45,
+              "building grid": 0.6, "colouring map": 0.75, "drawing": 0.92}
+ANCHOR_LABELS = {"": "free (where dragged)", "tl": "top left", "tc": "top centre", "tr": "top right",
+                 "bl": "bottom left", "bc": "bottom centre", "br": "bottom right"}
 
 
 def key_url(pngs) -> str:
@@ -155,8 +162,11 @@ def ebsd_page() -> None:
     check_interrupted(p)
     opts = map_options(p)
     sel = gs.get("selected_file")
+    import uuid  # noqa: PLC0415
+
     st: dict = {"map": sel if sel in opts else next(iter(opts), None), "layer": None, "view": None, "busy": False,
-                "mtab": "alpha", "ovsel": [], "legends": []}
+                "mtab": "alpha", "ovsel": [], "legends": [], "pch": f"ebsd-{uuid.uuid4().hex[:8]}",
+                "loading_ui": False, "selecting": False}
     viewer: dict = {"v": None}
     tab_vis: list = []                          # (element, tab) shown only on that map tab
     OP_NAMES = {"recon.run": "reconstruction", "grainsize.run": "grain size"}
@@ -229,6 +239,11 @@ def ebsd_page() -> None:
                         .props("dense flat round").mark(f"legend_btn_{k}") \
                         .tooltip(f"Show / hide the {lab} on the map (drag it, resize it at its corner); exports show "
                                  "it exactly there")
+                lay_btn = ui.button(icon="dashboard_customize").props("dense flat round").mark("legend_layout") \
+                    .tooltip("Legend layout: snap the scale bar / colour bar / IPF key to a corner of the map, the "
+                             "margin, auto size")
+                with lay_btn:
+                    lay_menu = ui.menu().props("anchor='bottom left' self='top left'").mark("legend_layout_menu")
             tool = ui.select(TOOLS, value="pan", label="tool").classes("w-32").props("dense").mark("viewer_tool")
             ui.space()
             hist_toggle = ui.button(icon="history", on_click=lambda: toggle_history()).props("flat round dense") \
@@ -237,6 +252,7 @@ def ebsd_page() -> None:
         with mtabs:
             t_alpha = ui.tab("alpha", label="α map", icon="map").mark("mtab_alpha")
             t_beta = ui.tab("beta", label="prior β", icon="hub").mark("mtab_beta")
+            t_beta.set_visibility(False)                # shown once the map has a reconstruction
             ui.tab("results", label="Results", icon="insights").mark("rtab_results")
         with ui.row().classes("w-full grow no-wrap gap-0 items-stretch min-h-0"):
             with ui.column().classes("grow gap-0 min-w-0 h-full") as map_col:
@@ -277,16 +293,20 @@ def ebsd_page() -> None:
         return
 
     # ---- running steps -----------------------------------------------------------------------------------------
-    async def run_step(op: str, params: dict, label: str, backend: str | None = None, with_map: bool = True):
+    async def run_step(op: str, params: dict, label: str, backend: str | None = None, with_map: bool = True,
+                       channel: str | None = None):
         if st["busy"]:
             ui.notify("Another step is still running.", type="warning")
             return None
         st["busy"] = True
         busy_lab.text = f"{label} ({backend or p.info().backend})…"
-        busy_row.set_visibility(True)
+        busy_row.set_visibility(channel is None)       # with a channel the map area shows the progress
         try:
             prm = {"map_id": st["map"], **params} if with_map else params
-            step = await ng_run.io_bound(service.run, p, op, prm, backend)
+            if channel:                     # stage names of the work go to the map area's progress bar (fix 3.7)
+                step = await ng_run.io_bound(progress.run_in, channel, service.run, p, op, prm, backend)
+            else:
+                step = await ng_run.io_bound(service.run, p, op, prm, backend)
             ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
             for n in service.pop_notices():
                 ui.notify(n, type="warning", multi_line=True, timeout=20000, close_button="OK")
@@ -324,23 +344,123 @@ def ebsd_page() -> None:
         mtabs.value = t
         st["switching"] = False
 
-    def show_image(path: Path, title: str, focus: bool = True) -> None:
+    def show_image(path: Path, title: str, focus: bool = True, step=None) -> None:
+        """A figure on the Results tab. Right-click: Delete (the figure step, undoable), Save (editable: MATLAB .fig,
+        .svg / .pdf vector), Export (png / jpg / tif / svg / pdf)."""
         with results:
-            with ui.column().classes("ti-card p-3 w-full gap-1"):
+            with ui.column().classes("ti-card p-3 w-full gap-1").mark("result_card") as card:
                 ui.label(title).classes("font-semibold")
                 ui.image(str(path)).classes("w-full max-w-4xl").props("fit=contain")
+                result_menu(card, title, step)
         if focus:
             set_tab("results")
         res_col.scroll_to(percent=1.0, duration=0.3)          # the newest figure / table is at the bottom
 
-    def show_block(fn, title: str, focus: bool = True) -> None:
+    def show_block(fn, title: str, focus: bool = True, step=None) -> None:
         with results:
-            with ui.column().classes("ti-card p-3 w-full gap-1"):
+            with ui.column().classes("ti-card p-3 w-full gap-1").mark("result_card") as card:
                 ui.label(title).classes("font-semibold")
                 fn()
+                result_menu(card, title, step)
         if focus:
             set_tab("results")
         res_col.scroll_to(percent=1.0, duration=0.3)
+
+    def result_menu(card, title: str, step) -> None:
+        figure = step is not None and step.op in service.FIGURE_OPS
+        with ui.context_menu().mark("result_menu"):
+            if figure:
+                ui.menu_item("Delete", on_click=lambda: delete_result(card, step)).mark("result_delete")
+                be = step.backend or p.info().backend
+                fmts = service.EDITABLE_FORMATS.get(be, ("svg", "pdf"))
+                ui.menu_item("Save (" + ", ".join(f".{f_}" for f_ in fmts) + ")…",
+                             on_click=lambda: save_result(step, title)).mark("result_save")
+                ui.menu_item("Export (png, jpg, tif, svg, pdf)…",
+                             on_click=lambda: export_result(step, title)).mark("result_export")
+            else:
+                ui.menu_item("Delete from Results", on_click=lambda: card.delete()).mark("result_delete")
+                if step is not None:
+                    d = p.find_step_dir(step.id)
+                    if d is not None:
+                        ui.menu_item("Save: show the table files (CSV / XLSX / JSON) in Explorer",
+                                     on_click=lambda d=d: _reveal_dir(d)).mark("result_save")
+
+    async def delete_result(card, step) -> None:
+        try:
+            service.delete_step(p, step.id)
+        except KeyError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            error(e, "Could not delete the figure")
+            return
+        card.delete()
+        ui.notify(f"Figure {step.id} deleted (also from History). Undo (Ctrl+Z) brings the step back.", type="positive")
+        if hooks.get("history"):
+            hooks["history"]()
+
+    async def save_result(step, title: str) -> None:
+        be = step.backend or p.info().backend
+        fmts = service.EDITABLE_FORMATS.get(be, ("svg", "pdf"))
+        types = {"fig": ("MATLAB figure", "*.fig"), "svg": ("SVG vector (editable)", "*.svg"),
+                 "pdf": ("PDF vector", "*.pdf")}
+        folder = gs.get("export_folder") or str(_pictures())
+        f_ = await dialogs.save_file("Save figure (editable)", f"{st['map']}_{step.op.split('.')[0]}_{step.id}.{fmts[0]}",
+                                     folder, [types[x] for x in fmts])
+        if not f_:
+            return
+        fmt = Path(f_).suffix.lower().lstrip(".")
+        if fmt not in fmts:
+            f_, fmt = str(Path(f_).with_suffix("." + fmts[0])), fmts[0]
+        gs.set("export_folder", str(Path(f_).parent))
+        n = ui.notification(f"Saving {Path(f_).name} ({be}) …", spinner=True, timeout=None)
+        try:
+            await ng_run.io_bound(service.save_figure, p, step.id, fmt, f_)
+            ui.notify(f"Saved {Path(f_).name} in {Path(f_).parent}", type="positive")
+        except Exception as e:  # noqa: BLE001
+            error(e, "Could not save the figure")
+        finally:
+            n.dismiss()
+
+    def export_result(step, title: str) -> None:
+        folder = gs.get("export_folder") or str(_pictures())
+        with ui.dialog() as dlg, ui.card().classes("w-[34rem] max-w-full gap-3").mark("result_export_dialog"):
+            ui.label(f"Export {title}").classes("text-lg font-semibold")
+            fmt = ui.toggle({k: k.upper() for k in service.EXPORT_FORMATS}, value=gs.get("result_fmt") or "png") \
+                .props("no-caps rounded unelevated toggle-color=primary").mark("rexp_fmt")
+            dest = ui.input("Save as", value=str(Path(folder) / f"{st['map']}_{step.op.split('.')[0]}_{step.id}."
+                                                f"{fmt.value}")).classes("w-full").mark("rexp_dest")
+            fmt.on_value_change(lambda e: dest.set_value(str(Path(dest.value).with_suffix("." + e.value))))
+            ui.label(f"Drawn again by {step.backend} with the figure's settings (Settings: width, DPI). Exports are "
+                     "listed under 'Earlier exports' of the Export dialog.").classes("text-xs ti-muted")
+
+            async def browse():
+                f_ = await dialogs.save_file("Export as", Path(dest.value).name, str(Path(dest.value).parent),
+                                             [(fmt.value.upper(), f"*.{fmt.value}")])
+                if f_:
+                    dest.value = f_
+
+            async def go():
+                t = Path(dest.value)
+                if not t.parent.is_dir():
+                    ui.notify(f"Folder {t.parent} does not exist.", type="warning")
+                    return
+                dlg.close()
+                gs.set("export_folder", str(t.parent))
+                gs.set("result_fmt", fmt.value)
+                n = ui.notification(f"Exporting {t.name} …", spinner=True, timeout=None)
+                try:
+                    await ng_run.io_bound(service.export_result, p, step.id, fmt.value, t)
+                    ui.notify(f"Exported {t.name} to {t.parent}", type="positive")
+                except Exception as e:  # noqa: BLE001
+                    error(e, "Export failed")
+                finally:
+                    n.dismiss()
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Browse…", icon="folder", on_click=browse).props("outline")
+                ui.space()
+                ui.button("Cancel", on_click=dlg.close).props("flat")
+                ui.button("Export", icon="ios_share", on_click=go).mark("rexp_go")
+        dlg.open()
 
     # ---- viewer helpers ----------------------------------------------------------------------------------------
     ipf_w: dict = {}
@@ -423,12 +543,72 @@ def ebsd_page() -> None:
 
     # legends on the map (WYSIWYG for exports)
     def legend_items() -> list[dict]:
-        return list(st["legends"])
+        """What is drawn on the map: the IPF key only on IPF maps, a colour bar / legend only on maps that have one
+        (an IPF key switched on is shown as the colour bar of a scalar map in the same place)."""
+        ipf = kind.value in IPF_KINDS
+        items = list(st["legends"])
+        if not ipf and any(i["kind"] == "ipf_key" for i in items) and not any(i["kind"] == "colorbar" for i in items):
+            k = next(i for i in items if i["kind"] == "ipf_key")
+            items.append({**default_item("colorbar").model_dump(), "anchor": k.get("anchor"),
+                          "margin": k.get("margin"), "x": k["x"], "y": k["y"]})
+        return [i for i in items if not (i["kind"] == "ipf_key" and not ipf) and not (i["kind"] == "colorbar" and ipf)]
 
     def save_legends():
         gs.set("legends", st["map"], tabkey(), st["legends"])
+        upd_legend_buttons()
+        refresh_layout_menu()
+
+    def upd_legend_buttons():
+        ipf = kind.value in IPF_KINDS
         for k, b in lg_btns.items():
-            b.props(f"color={'primary' if any(i['kind'] == k for i in st['legends']) else 'grey-7'}")
+            on = any(i["kind"] == k for i in st["legends"])
+            usable = not ((k == "ipf_key" and not ipf) or (k == "colorbar" and ipf))
+            b.props(f"color={'primary' if on and usable else 'grey-7'}")
+            b.set_enabled(usable)
+        lg_btns["ipf_key"].set_visibility(ipf)
+        lg_btns["colorbar"].set_visibility(not ipf)
+
+    def refresh_layout_menu():
+        lay_menu.clear()
+        shown = legend_items()
+        with lay_menu, ui.column().classes("p-3 gap-2 w-80").mark("legend_layout_body"):
+            ui.label("Legend layout").classes("font-semibold")
+            if not shown:
+                ui.label("No legend on this map: switch one on with the buttons left of this one.") \
+                    .classes("text-xs ti-muted")
+            names = {"scale_bar": "scale bar", "colorbar": "colour bar / legend", "ipf_key": "IPF key"}
+            for it in shown:
+                with ui.row().classes("w-full items-end no-wrap gap-2"):
+                    ui.label(names[it["kind"]]).classes("w-24 text-sm pb-2")
+                    ui.select(ANCHOR_LABELS, value=it.get("anchor") or "", label="position").props("dense") \
+                        .classes("grow").mark(f"legend_anchor_{it['kind']}") \
+                        .on_value_change(lambda e, k=it["kind"]: set_legend(k, anchor=e.value or None))
+                    ui.checkbox("auto size", value=bool(it.get("auto"))).props("dense") \
+                        .mark(f"legend_auto_{it['kind']}") \
+                        .tooltip("Width follows the map (scale bar 22 %, colour bar 30 %, IPF key 18 % of the map "
+                                 "width). Resizing it at its blue corner switches this off.") \
+                        .on_value_change(lambda e, k=it["kind"]: set_legend(k, auto=bool(e.value)))
+            m0 = next((i.get("margin") for i in st["legends"] if i.get("margin") is not None), None)
+            ui.number("margin to the map edge [% of the map width]", value=round(100 * (m0 if m0 is not None else 0.02),
+                                                                                    2),
+                      min=0, max=25, step=0.5).props("dense").classes("w-full").mark("legend_margin") \
+                .on_value_change(lambda e: set_legend(None, margin=max(0.0, float(e.value or 0)) / 100))
+            ui.label("Dragging a legend near a corner or an edge centre of the map snaps it there.") \
+                .classes("text-xs ti-muted")
+
+    def set_legend(k: str | None, **upd):
+        """Change anchor / auto / margin of one legend (k) or the margin of all (k None) and redraw."""
+        if "auto" in upd and upd["auto"]:
+            from ..legends import AUTO_W  # noqa: PLC0415
+
+            upd["w"] = AUTO_W.get(k, 0.2)
+        st["legends"] = [{**i, **upd} if (k is None or i["kind"] == k) else i for i in st["legends"]]
+        if k is not None and not any(i["kind"] == k for i in st["legends"]):      # the colour bar shown in place of
+            st["legends"] = st["legends"] + [{**default_item(k).model_dump(), **upd}]   # the IPF key
+        gs.set("legends", st["map"], tabkey(), st["legends"])
+        upd_legend_buttons()
+        if viewer["v"]:
+            viewer["v"].set(legends=legend_items())
 
     async def toggle_legend(k: str):
         on = not any(i["kind"] == k for i in st["legends"])
@@ -443,12 +623,16 @@ def ebsd_page() -> None:
                 viewer["v"].set(legend_data=await legend_data(st["layer"]))
 
     def on_legends(e):
-        st["legends"] = [{**dict(i), "frame": "map"} for i in e.args.get("items", [])]
-        save_legends()
+        got = [{**dict(i), "frame": "map"} for i in e.args.get("items", [])]
+        kinds = {i["kind"] for i in got}
+        # items hidden on this map (IPF key on a scalar map ...) are kept as they were
+        st["legends"] = got + [i for i in st["legends"] if i["kind"] not in kinds]
+        gs.set("legends", st["map"], tabkey(), st["legends"])
+        upd_legend_buttons()
         if viewer["v"]:
             viewer["v"]._props["legends"] = legend_items()
 
-    async def legend_data(L: lay.Layer) -> dict:
+    async def legend_data(L: lay.Layer, with_key: bool = True) -> dict:
         info = L.info
         d: dict = {"colorbar": None, "swatches": [], "key_url": ""}
         if info.get("colorbar"):
@@ -457,7 +641,7 @@ def ebsd_page() -> None:
                              "label": info.get("colorbar_label") or ""}
         elif info.get("legend"):
             d["swatches"] = [list(x) for x in info["legend"][:14]]
-        if kind.value in ("ipf", "parent_ipf") and any(i["kind"] == "ipf_key" for i in st["legends"]):
+        if with_key and kind.value in IPF_KINDS and any(i["kind"] == "ipf_key" for i in st["legends"]):
             try:
                 pngs = await ng_run.io_bound(lay.key_pngs, p, st["map"], layer_params())
                 if pngs:
@@ -587,6 +771,8 @@ def ebsd_page() -> None:
             return
         ovs = []
         lp = layer_params()
+        if tabkey() == "beta":                  # HAGB / LAGB of the prior-beta grains (fix 3.10)
+            lp.grains = lay.newest_grains(p.recipe().steps, st["map"], "beta")
         lw = float((vs["lw"].value if "lw" in vs else 1.0) or 1.0)
         sty = ov_style()
         for name in st["ovsel"]:
@@ -617,9 +803,15 @@ def ebsd_page() -> None:
     async def show():
         if not kind.value:
             return
+        ch = st["pch"]
+        if viewer["v"] is None and not st["loading_ui"]:       # first image of this map: progress in the map area
+            loading(st["map"], "Drawing")
+        progress.set(ch, "colouring map")
         try:
-            L = await ng_run.io_bound(lay.get_layer, p, st["map"], layer_params())
+            L = await ng_run.io_bound(progress.run_in, ch, lay.get_layer, p, st["map"], layer_params())
         except Exception as e:  # noqa: BLE001
+            progress.clear(ch)
+            st["loading_ui"] = False
             from ..sample import SheetIncomplete  # noqa: PLC0415
 
             # never leave the previous map (e.g. of the other map tab) on screen under this tab's labels
@@ -636,8 +828,10 @@ def ebsd_page() -> None:
         st["layer"] = L
         gs.set("layer", st["map"], tabkey(), kind.value)
         ext = list(L.layout.extent)
+        progress.set(ch, "drawing")
         if viewer["v"] is None or viewer["v"]._props["base"] != L.layout.cw:
             holder.clear()
+            st["loading_ui"] = False
             with holder:
                 v = MapViewer(L.layout.cw, ext).classes("w-full h-full").mark("map_viewer")
                 v._props["initial_view"] = gs.get("view", st["map"])
@@ -653,11 +847,17 @@ def ebsd_page() -> None:
             ui.run_javascript(f"window.ti64Viewer = {v.id}")
         viewer["v"].set(layer_url=tiles.layer_url(tiles.register_layer(L)), extent=ext,
                         layer_opacity=float((vs["opacity"].value if "opacity" in vs else 1.0) or 1.0),
-                        tool=tool.value, legends=legend_items(), legend_data=await legend_data(L),
+                        tool=tool.value, legends=legend_items(), legend_data=await legend_data(L, with_key=False),
                         hex_grid=bool(L.layout.hex), cell_um=float(L.layout.dx))
+        progress.clear(ch)
+        upd_legend_buttons()
+        refresh_layout_menu()
         show_legend(L)
         refresh_annotations()
         await show_overlays()
+        if kind.value in IPF_KINDS and any(i["kind"] == "ipf_key" for i in st["legends"]) and viewer["v"]:
+            # the IPF key after the map is on screen (first MATLAB figure render of an engine takes ~45 s, fix 3.8)
+            viewer["v"].set(legend_data=await legend_data(L))
         status.text = (f"{st['map']}: {L.layout.lut.shape[0]} rows, {'hex' if L.layout.hex else 'square'} grid, "
                        f"step {L.layout.dx:.3g} µm; {L.info.get('title', '')}")
         await prepare_original(L)
@@ -688,10 +888,12 @@ def ebsd_page() -> None:
             # fix 2: the selected map loads by itself (progress bar under the edit menu); sample and build direction
             # are not needed for loading
             loading(m)
-            step = await run_step("ebsd.load", {}, f"loading {m}")
+            step = await run_step("ebsd.load", {}, f"loading {m}", channel=st["pch"])
             if st["map"] != m:                     # the user picked another map meanwhile
                 return
             if step is None:
+                st["loading_ui"] = False
+                progress.clear(st["pch"])
                 not_ready(f"{m} could not be loaded (the message says why).", "Try again",
                           lambda: select_map(m, draw, tab))
                 return
@@ -705,12 +907,20 @@ def ebsd_page() -> None:
         gs.set("mtab", m, t)
         set_tab(t)
         kinds = [k for k in av["layers"] if (k in lay.RECON_KINDS) == (t == "beta")]
+        if t == "alpha" and av["loaded"]:           # KAM / GROD / GOS / GND listed, computed on first use (fix 3.9)
+            kinds += [k for k in ON_DEMAND if k not in kinds]
         update_tab_parts(t, av)
-        kind.options = {k: lay.LAYER_LABELS[k] for k in kinds}
+        kind.options = kind_labels(kinds, av["layers"])
         saved = gs.get("layer", m)
         saved = saved.get(t) if isinstance(saved, dict) else (saved if t == "alpha" else None)
-        kind.set_value(saved if saved in kinds else ("parent_ipf" if t == "beta" and "parent_ipf" in kinds
-                                                      else (kinds[0] if kinds else None)))
+        if saved in ON_DEMAND and saved not in av["layers"]:
+            saved = None                             # never computed on its own (e.g. stale): start with IPF
+        st["selecting"] = True
+        try:
+            kind.set_value(saved if saved in kinds else ("parent_ipf" if t == "beta" and "parent_ipf" in kinds
+                                                          else (kinds[0] if kinds else None)))
+        finally:
+            st["selecting"] = False
         kind.update()
         ov_av = lay.available(p, m, t)["overlays"]
         saved_ov = gs.get("overlays", m)
@@ -720,7 +930,7 @@ def ebsd_page() -> None:
         st["ovsel"] = [o for o in (saved_ov or []) if o in ov_av]
         refresh_overlay_menu(ov_av)
         st["legends"] = [dict(i) for i in (gs.get("legends", m, t) or [default_item("scale_bar").model_dump()])]
-        save_legends()
+        gs.set("legends", m, t, st["legends"])
         hist_title.text = f"History · {'prior β map' if t == 'beta' else 'α map'}"
         if hooks.get("history"):
             hooks["history"]()
@@ -730,19 +940,46 @@ def ebsd_page() -> None:
         if draw:
             await show()
 
-    def loading(m: str) -> None:
+    def loading(m: str, what: str = "Loading") -> None:
+        """Progress in the map area (fix 3.7): bar + the stage running now (reading file / building grid / cleanup
+        from cache / colouring map / drawing) and the time of the stages done."""
+        import time  # noqa: PLC0415
+
         holder.clear()
         viewer["v"] = None
+        ch = st["pch"]
+        progress.clear(ch)
+        progress.set(ch, "starting")
+        st["loading_ui"] = True
+        t0 = time.perf_counter()
         with holder:
-            with ui.row().classes("p-8 gap-3 items-center"):
-                ui.spinner(size="lg")
-                ui.label(f"Loading {m} … (once per map and backend; the progress bar is under the edit menu)") \
-                    .classes("text-base").mark("viewer_loading")
+            with ui.column().classes("w-full h-full items-center justify-center gap-2").mark("viewer_loading"):
+                ui.label(f"{what} {m}").classes("text-lg font-semibold")
+                bar = ui.linear_progress(value=0.02, show_value=False, size="10px") \
+                    .props("rounded color=primary animation-speed=250").classes("w-[28rem] max-w-full").mark("load_progress")
+                stage = ui.label("starting …").classes("text-sm").mark("load_stage")
+                done = ui.label("").classes("text-xs ti-muted text-center").mark("load_stages_done")
+
+            def tick():
+                d = progress.get(ch)
+                if not d:
+                    return
+                f_ = d.get("frac")
+                bar.value = max(bar.value or 0, f_ if f_ is not None else STAGE_FRAC.get(d["stage"], bar.value or 0))
+                stage.text = f"{d['stage']} …  ({time.perf_counter() - t0:.0f} s)"
+                done.text = "  ·  ".join(f"{s_} {t_:.1f} s" for s_, t_ in progress.timings(ch)[:-1]
+                                         if s_ != "starting")
+            ui.timer(0.25, tick)
+
+    def kind_labels(kinds: list[str], done: list[str]) -> dict[str, str]:
+        return {k: lay.LAYER_LABELS[k] + ("" if k in done or k not in ON_DEMAND else " · computed on first use")
+                for k in kinds}
 
     def update_tab_parts(t: str, av: dict) -> None:
         """Edit-menu parts that belong to one map tab, and figure lists that only offer what exists (fix 8 / 9)."""
         for el, tb in tab_vis:
             el.set_visibility(tb == t)
+        sg.title_label.text = "Grains and boundaries · " + ("prior β" if t == "beta" else "α map")
         gs_title.text = "Grain size · " + ("prior β" if t == "beta" else "α map")
         kinds = [k for k in GS_FIG_KINDS if (k in GS_BETA_KINDS) == (t == "beta")]
         gfk.options = {k: GS_FIG_LABELS[k] for k in kinds}
@@ -766,7 +1003,15 @@ def ebsd_page() -> None:
         return d
     # the edit menu starts from the values of the last applied step of this map (else the defaults)
     lc = lastp("ebsd.cleanup").get("overrides") or {}
-    lg, lk = lastp("grains.calc"), lastp("map.compute")
+    lg = lastp("grains.calc")
+
+    def last_kind(*kinds):
+        for s_ in reversed(p.recipe().steps):
+            if s_.op == "map.compute" and not s_.stale and s_.params.get("map_id") == st["map"] \
+                    and s_.params.get("kind") in kinds:
+                return s_.params
+        return {}
+    lk, lgnd = last_kind("kam"), last_kind("gnd")
     lr, ls = lastp("recon.run").get("params") or {}, lastp("grainsize.run")
     hooks: dict = {"history": None}
 
@@ -867,7 +1112,7 @@ def ebsd_page() -> None:
                                                          **({"clim": lp.clim} if lp.clim else {})}, f"figure {fk}")
                         if step:
                             show_image(p.root / step.outputs["figure"].path, f"{fk} figure ({step.backend})",
-                                       focus=False)
+                                       focus=False, step=step)
                     si.applied()
 
                 def save_default():
@@ -887,7 +1132,7 @@ def ebsd_page() -> None:
                         prm["custom_vector"] = [float(c.value or 0) for c in vs["cv"]]
                     step = await run_step("figure", prm, "IPF key")
                     if step:
-                        show_image(p.root / step.outputs["figure"].path, f"IPF key {ph} ({step.backend})")
+                        show_image(p.root / step.outputs["figure"].path, f"IPF key {ph} ({step.backend})", step=step)
                 with ui.row().classes("w-full gap-2"):
                     ui.button("Apply", icon="check", on_click=apply_ipf).mark("viewer_apply")
                     ui.button("IPF key", icon="donut_large", on_click=draw_key).props("outline").mark("viewer_ipfkey")
@@ -906,46 +1151,63 @@ def ebsd_page() -> None:
                        step=0.5, min=0)
 
                 async def apply_grains():
-                    step = await run_step("grains.calc", {
-                        "grains": {"hagb_deg": sg.v("hagb_deg"), "lagb_deg": sg.v("lagb_deg"), "alpha": sg.v("alpha"),
-                                   "min_px": int(sg.v("min_px") or 1)},
-                        "boundaries": {"burgers_tol_deg": sg.v("burgers_tol_deg")}}, "grains")
+                    """On the α map: α grains of the loaded / cleaned map. On the prior β tab: prior-β grains of the
+                    newest reconstruction (grains.calc on the parent map, fix 3.10). Stays on that tab and switches
+                    the new HAGB overlay on there."""
+                    t = tabkey()
+                    prm = grains_params()
+                    if t == "beta":
+                        r_ = service.latest_step(p, ("recon.run",), map_id=st["map"])
+                        if r_ is None:
+                            ui.notify("Reconstruct the prior-β map first (section 'Prior-β reconstruction').",
+                                      type="warning")
+                            return
+                        prm["source"] = r_.id
+                    step = await run_step("grains.calc", prm, "prior-β grains" if t == "beta" else "grains")
                     if step:
                         sg.applied()
                         n = step.metrics.get("n_grains")
-                        await select_map(st["map"], tab="alpha")
-                        if "hagb" not in st["ovsel"]:
-                            await toggle_overlay("hagb", True)
-                            refresh_overlay_menu(lay.available(p, st["map"], "alpha")["overlays"])
+                        ovs = gs.get("overlays", st["map"])
+                        ovs = dict(ovs) if isinstance(ovs, dict) else {"alpha": ovs or []}
+                        ovs[t] = sorted(set(ovs.get(t) or (["beta_gb"] if t == "beta" else [])) | {"hagb"},
+                                        key=lay.OVERLAYS.index)
+                        gs.set("overlays", st["map"], ovs)
+                        await select_map(st["map"], tab=t)
                         if n:
-                            status.text = f"{int(n)} grains"
+                            status.text = f"{int(n)} {'prior-β ' if t == 'beta' else ''}grains"
                 ui.button("Apply", icon="check", on_click=apply_grains).mark("run_grains")
 
-            # 4 KAM / GND
-            with Section(gs, "kam", "KAM / GND", "blur_on") as sk:
-                sk.select("kind", {"kam": "KAM", "grod": "GROD", "gos": "GOS", "gnd": "GND"},
-                          g(lk, "kind", default="kam"), "map", "kam_kind")
-                with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(
-                        sk.fields["kind"], "value", backward=lambda v: v == "kam"):
+            def grains_params() -> dict:
+                return {"grains": {"hagb_deg": sg.v("hagb_deg"), "lagb_deg": sg.v("lagb_deg"), "alpha": sg.v("alpha"),
+                                   "min_px": int(sg.v("min_px") or 1)},
+                        "boundaries": {"burgers_tol_deg": sg.v("burgers_tol_deg")}}
+
+            # 4 KAM / GROD / GOS / GND
+            with Section(gs, "kam", "KAM / GROD / GOS / GND", "blur_on") as sk:
+                ui.label("Pick KAM, GROD, GOS or GND in the 'map' list of the map toolbar: each is computed the first "
+                         "time it is shown (inside the α grains of 'Grains and boundaries'). These are their "
+                         "parameters; Apply recomputes the map shown.").classes("text-xs ti-muted")
+                ui.label("KAM").classes("text-sm font-semibold")
+                with ui.row().classes("w-full no-wrap gap-2"):
                     sk.num("kam_order", "KAM order", g(lk, "kam_order", default=1), step=1, min=1, max=5)
                     sk.num("kam_threshold_deg", "KAM cutoff [°]", g(lk, "kam_threshold_deg", default=5.0), step=0.5,
                            min=0)
-                with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(
-                        sk.fields["kind"], "value", backward=lambda v: v == "gnd"):
-                    sk.select("gnd_stencil", ["1hop", "oneSided", "full"], g(lk, "gnd_stencil", default="1hop"),
+                ui.label("GND").classes("text-sm font-semibold")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sk.select("gnd_stencil", ["1hop", "oneSided", "full"], g(lgnd, "gnd_stencil", default="1hop"),
                               "GND stencil")
-                    sk.num("poisson", "Poisson's ratio", g(lk, "poisson", default=0.34), step=0.01, min=0, max=0.5)
+                    sk.num("poisson", "Poisson's ratio", g(lgnd, "poisson", default=0.34), step=0.01, min=0, max=0.5)
+                ui.label("GROD and GOS have no parameters (grain mean orientation of the α grains).") \
+                    .classes("text-xs ti-muted")
 
                 async def apply_kam():
-                    step = await run_step("map.compute", {"kind": sk.v("kind"), "kam_order": int(sk.v("kam_order") or 1),
-                                                          "kam_threshold_deg": sk.v("kam_threshold_deg"),
-                                                          "gnd_stencil": sk.v("gnd_stencil"),
-                                                          "poisson": sk.v("poisson")}, sk.v("kind").upper())
-                    if step:
+                    k = kind.value if kind.value in ON_DEMAND else None
+                    if k is None:
+                        ui.notify("Show KAM, GROD, GOS or GND first (the 'map' list of the map toolbar); Apply "
+                                  "recomputes the map shown with these parameters.", type="warning", multi_line=True)
+                        return
+                    if await compute_kind(k):
                         sk.applied()
-                        await select_map(st["map"], draw=False)
-                        if sk.v("kind") in kind.options:
-                            kind.set_value(sk.v("kind"))
                         await show()
                 ui.button("Apply", icon="check", on_click=apply_kam).mark("run_map")
 
@@ -987,7 +1249,7 @@ def ebsd_page() -> None:
                         sr.applied()
                         # the summary goes to Results, but the prior-beta MAP gets the focus (its own map tab)
                         show_block(lambda: recon_summary(p, step), f"Reconstruction {step.id} ({step.backend})",
-                                   focus=False)
+                                   focus=False, step=step)
                         gs.set("layer", st["map"], "beta", "parent_ipf")
                         ovs = gs.get("overlays", st["map"])
                         if isinstance(ovs, dict):                  # a new reconstruction shows its boundaries
@@ -1007,7 +1269,8 @@ def ebsd_page() -> None:
                     async def recon_fig():
                         step = await run_step("recon.figure", {"kind": rfk.value}, f"figure {rfk.value}")
                         if step:
-                            show_image(p.root / step.outputs["figure"].path, f"{rfk.value} ({step.backend})")
+                            show_image(p.root / step.outputs["figure"].path, f"{rfk.value} ({step.backend})",
+                                       step=step)
                     ui.button("Draw", icon="brush", on_click=recon_fig).props("outline").mark("run_recon_fig")
                 ui.label("Parameter sweep").classes("text-sm font-semibold mt-2")
                 sr.text("sweep_thr", "thresholds [°]", "5, 8", "sweep_thr")
@@ -1020,7 +1283,7 @@ def ebsd_page() -> None:
                                                                    "mergeThreshold": _floats(sr.v("sweep_merge"))}},
                                           "sweep")
                     if step:
-                        show_block(lambda: sweep_table(p, step), f"Parameter sweep {step.id}")
+                        show_block(lambda: sweep_table(p, step), f"Parameter sweep {step.id}", step=step)
                 ui.button("Run sweep", icon="tune", on_click=sweep).props("outline").mark("run_sweep")
 
             # 6 grain size: works on the map tab it is started from (α map: α grains / laths / colonies; prior β tab:
@@ -1055,8 +1318,11 @@ def ebsd_page() -> None:
                             "prior-β grain size")
                     else:
                         hagb = float(sz.v("hagb") or 15.0)
+                        from ..ops_ebsd import grains_target  # noqa: PLC0415
+
                         g_ = next((s_ for s_ in reversed(p.recipe().steps)
                                    if s_.op == "grains.calc" and not s_.stale and s_.params.get("map_id") == st["map"]
+                                   and grains_target(p, s_) == "alpha"
                                    and abs(float(s_.params["grains"]["hagb_deg"]) - hagb) < 1e-9), None)
                         if g_ is None:
                             g_ = await run_step("grains.calc", {"grains": {"hagb_deg": hagb}}, "grains")
@@ -1067,7 +1333,8 @@ def ebsd_page() -> None:
                             "colony": {"burgers_tol_deg": sz.v("colony_tol")}}, "α grain size")
                     if step:
                         sz.applied()
-                        show_block(lambda: grainsize_summary(p, step), f"Grain size {step.id} ({step.backend})")
+                        show_block(lambda: grainsize_summary(p, step), f"Grain size {step.id} ({step.backend})",
+                                   step=step)
                         update_tab_parts(tabkey(), lay.available(p, st["map"]))
                 ui.button("Apply", icon="check", on_click=apply_gs).mark("run_gs")
                 gs_fig_row = ui.column().classes("w-full gap-1 mt-2")
@@ -1079,11 +1346,22 @@ def ebsd_page() -> None:
                             bw = sz.num("bin_um", "bin width [µm] (empty = automatic)", None, "gs_bin", step=0.5,
                                         min=0).props("clearable")
                         bw.bind_visibility_from(gfk, "value", backward=lambda v: v != "colony_map")
+                    with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(
+                            gfk, "value", backward=lambda v: v != "colony_map"):
+                        sz.num("min_um", "shown from [µm]", None, "gs_range", step=0.5, min=0) \
+                            .props("clearable")
+                        sz.num("max_um", "up to [µm]", None, "gs_range", step=1, min=0).props("clearable")
+                    with ui.row().classes("w-full no-wrap gap-2 items-end"):
+                        ui.space()
 
                         async def gs_fig():
                             prm = {"kind": gfk.value}
                             if gfk.value != "colony_map" and sz.v("bin_um"):
                                 prm["bin_width_um"] = float(sz.v("bin_um"))
+                            if gfk.value != "colony_map":
+                                for k_ in ("min_um", "max_um"):
+                                    if sz.v(k_) not in (None, ""):
+                                        prm[k_] = float(sz.v(k_))
                             from ..ops_grainsize import grainsize_step_for  # noqa: PLC0415
 
                             sid = grainsize_step_for(p, st["map"], "prior_beta" if gfk.value in GS_BETA_KINDS
@@ -1093,7 +1371,7 @@ def ebsd_page() -> None:
                                                   s_.backend if s_ else None)
                             if step:
                                 show_image(p.root / step.outputs["figure"].path,
-                                           f"{GS_FIG_LABELS[gfk.value]} ({step.backend})")
+                                           f"{GS_FIG_LABELS[gfk.value]} ({step.backend})", step=step)
                         ui.button("Draw", icon="brush", on_click=gs_fig).props("outline").mark("run_gs_fig")
 
                 async def gs_oim():
@@ -1164,7 +1442,39 @@ def ebsd_page() -> None:
     async def on_map_change(e):
         await select_map(e.value)
     msel.on_value_change(on_map_change)
-    kind.on_value_change(lambda e: show() if e.value else None)
+    async def compute_kind(k: str) -> bool:
+        """KAM / GROD / GOS / GND of the shown map with the section's parameters (fix 3.9); α grains first if the
+        map has none yet."""
+        if lay.available(p, st["map"])["grains_alpha"] is None:
+            ui.notify(f"{k.upper()} is computed inside α grains: running 'Grains and boundaries' with its values "
+                      "first.", type="info")
+            if not await run_step("grains.calc", grains_params(), "grains", channel=st["pch"]):
+                return False
+        prm = {"kind": k, "kam_order": int(sk.v("kam_order") or 1), "kam_threshold_deg": sk.v("kam_threshold_deg"),
+               "gnd_stencil": sk.v("gnd_stencil"), "poisson": sk.v("poisson")}
+        step = await run_step("map.compute", prm, k.upper(), channel=st["pch"] if st["loading_ui"] else None)
+        if not step:
+            return False
+        av = lay.available(p, st["map"])
+        kind.options = kind_labels(list(kind.options), av["layers"])
+        kind.update()
+        return True
+
+    async def on_kind(e):
+        if not e.value or st["selecting"]:
+            return
+        if e.value in ON_DEMAND and e.value not in lay.available(p, st["map"])["layers"]:
+            loading(st["map"], f"Computing {e.value.upper()} for")
+            progress.set(st["pch"], f"computing {e.value.upper()}")
+            if not await compute_kind(e.value):
+                st["loading_ui"] = False
+                await show_or_back()
+                return
+        await show()
+
+    async def show_or_back():
+        kind.set_value("ipf" if "ipf" in kind.options else next(iter(kind.options), None))
+    kind.on_value_change(on_kind)
     tool.on_value_change(lambda e: viewer["v"] and viewer["v"].set(tool=e.value))
     vs["opacity"].on_value_change(lambda e: viewer["v"] and viewer["v"].set(layer_opacity=float(e.value or 1)))
     vs["lw"].on_value_change(lambda e: show_overlays())
@@ -1202,11 +1512,27 @@ def ebsd_page() -> None:
         sty = {k: v for k, v in ov_style().items() if k in st["ovsel"]}
         await export_dialog(p, gs, kind="map", map_id=st["map"], layer=layer_params().model_dump(mode="json"),
                             overlays=list(st["ovsel"]), view=st["view"], rois=rois, run_step=run_step,
-                            geometry=geometry, legends=legend_items(), overlay_style=sty)
+                            geometry=geometry, legends=legend_items(), overlay_style=sty,
+                            view_state={"overlays": bool(st["ovsel"]), "annotations": True})
     do_export = stable(do_export)
 
     sheet_info()
     ui.timer(0.05, lambda: select_map(st["map"]), once=True)
+
+
+def _pictures() -> Path:
+    from ..settings import pictures_dir  # noqa: PLC0415
+
+    return pictures_dir()
+
+
+def _reveal_dir(d: Path) -> None:
+    import os  # noqa: PLC0415
+
+    try:
+        os.startfile(str(d))              # noqa: S606
+    except Exception as e:  # noqa: BLE001
+        error(e)
 
 
 def _floats(text: str) -> list[float]:

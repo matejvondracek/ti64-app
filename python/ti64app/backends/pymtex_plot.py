@@ -149,7 +149,9 @@ def render(ebsd, spec: RenderSpec, out_png: Path, keep: np.ndarray, perm: np.nda
     if spec.exact:
         _save_exact(fig, ax, spec, out_png)
     else:
-        fig.savefig(out_png, dpi=spec.dpi, bbox_inches="tight", metadata={"Software": None})
+        with plt.rc_context({"svg.hashsalt": "ti64", "svg.fonttype": "none"}):  # editable text in SVG (fix 3.14)
+            fig.savefig(out_png, dpi=spec.dpi, bbox_inches="tight",
+                        metadata=SAVE_META.get(Path(out_png).suffix.lower()))
     plt.close(fig)
     return out_png
 
@@ -213,7 +215,7 @@ def render_key(cs, key: str, vec, out_png: Path, dpi: int = 300) -> Path:
     make_key(cs, key, vec).plot()
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    plt.gcf().savefig(out_png, dpi=dpi, bbox_inches="tight", metadata={"Software": None})
+    plt.gcf().savefig(out_png, dpi=dpi, bbox_inches="tight", metadata=SAVE_META.get(out_png.suffix.lower()))
     plt.close("all")
     return out_png
 
@@ -246,6 +248,7 @@ def render_chart(spec, out_png: Path) -> Path:
         ax.set_title(spec.title, fontsize=9)
     out_png = Path(out_png)
     out_png.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_png, dpi=spec.dpi, bbox_inches="tight", metadata={"Software": None})
+    with plt.rc_context({"svg.hashsalt": "ti64", "svg.fonttype": "none"}):      # editable text in SVG (fix 3.14)
+        fig.savefig(out_png, dpi=spec.dpi, bbox_inches="tight", metadata=SAVE_META.get(out_png.suffix.lower()))
     plt.close(fig)
     return out_png

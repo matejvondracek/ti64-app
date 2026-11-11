@@ -72,7 +72,7 @@ def _report_text(rep) -> str:
 
 # ---- History ------------------------------------------------------------------------------------------------
 OP_LABEL = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "Grains and boundaries",
-            "map.compute": "KAM / GND map", "figure": "Figure", "export.map": "Export", "annotations.set": "Annotations",
+            "map.compute": "KAM / GROD / GOS / GND map", "figure": "Figure", "annotations.set": "Annotations",
             "recon.run": "Prior-β reconstruction", "recon.figure": "Reconstruction figure", "recon.sweep": "Parameter sweep",
             "grainsize.run": "Grain size", "grainsize.figure": "Grain-size figure",
             "grainsize.compare_oim": "Grain size vs OIM", "compare.oim": "Compare with OIM", "sample.set": "Map sheet",
@@ -80,14 +80,24 @@ OP_LABEL = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "
 RECON_OPS = ("recon.run", "recon.figure", "recon.sweep")
 
 
+def step_label(s, tab: str = "alpha") -> str:
+    """Plain name of a step in History: the map kind of map.compute, prior-beta grains on the prior beta tab."""
+    if s.op == "map.compute" and s.params.get("kind"):
+        return f"{str(s.params['kind']).upper()} map"
+    if s.op == "grains.calc" and tab == "beta":
+        return "Prior-β grains and boundaries"
+    return OP_LABEL.get(s.op, s.op)
+
+
 def tab_steps(p: Project, map_id: str | None, tab: str, include_stale: bool = True) -> list:
     """Steps of one map shown in a map tab: 'beta' = the reconstruction and what uses it (its history starts at the
     reconstruction step); 'alpha' = everything else of the map."""
     from ..layers import RECON_KINDS  # noqa: PLC0415
 
+    recon_ids = {s.id for s in p.recipe().steps if s.op == "recon.run"}
+
     def is_beta(s) -> bool:
-        lay = s.params.get("layer") if isinstance(s.params.get("layer"), dict) else {}
-        return (s.op in RECON_OPS or (s.op == "export.map" and lay.get("kind") in RECON_KINDS)
+        return (s.op in RECON_OPS or (s.op == "grains.calc" and s.params.get("source") in recon_ids)
                 or (s.op == "figure" and s.params.get("kind") in RECON_KINDS)
                 or (s.op == "grainsize.run" and s.params.get("target") == "prior_beta")
                 or (s.op == "grainsize.figure" and str(s.params.get("kind", "")).startswith("beta")))
@@ -133,7 +143,7 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
         live = [s for s in steps if not s.stale]
         ui.label(("Prior-β map" if tab == "beta" else "α map") + f" {mid or ''}: {len(live)} step{'' if len(live) == 1 else 's'}"
                  + (f" (+ {len(steps) - len(live)} stale)" if len(steps) > len(live) else "")
-                 + ". Drag a step onto another to change the order.").classes("text-xs ti-muted").mark("history_info")
+                 + ". Drag a step onto another to change the order; right-click a step to delete it.").classes("text-xs ti-muted").mark("history_info")
         with ui.row().classes("w-full items-center gap-1 no-wrap"):
             ui.button("Delete all steps…", icon="delete_sweep", on_click=lambda: confirm_delete(False)) \
                 .props("flat dense no-caps size=sm color=negative").mark("delete_all_steps") \
@@ -160,10 +170,15 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
                     ui.icon("drag_indicator" if not s.stale else "block", size="18px").classes("ti-muted")
                     ui.label(str(n) if not s.stale else "–").classes("text-xs ti-muted w-4")
                     with ui.column().classes("gap-0 grow min-w-0"):
-                        ui.label(OP_LABEL.get(s.op, s.op) + (" (stale)" if s.stale else "")) \
+                        ui.label(step_label(s, tab) + (" (stale)" if s.stale else "")) \
                             .classes("text-sm truncate" + (" ti-muted line-through" if s.stale else ""))
                         ui.label(f"{s.id} · {s.backend or 'no backend'} · {s.timestamp[5:16].replace('T', ' ')}") \
                             .classes("text-xs ti-muted truncate")
+                    with ui.context_menu().mark(f"hist_menu_{s.id}"):       # right-click (fix 3.13)
+                        ui.menu_item("Show parameters", on_click=lambda s=s: select(s.id))
+                        ui.separator()
+                        ui.menu_item("Delete…", on_click=lambda s=s: delete_one(s.id)) \
+                            .classes("text-negative").mark(f"hist_delete_{s.id}")
                 row.on("click", lambda s=s: select(s.id))
                 row.on("keydown.enter", lambda s=s: select(s.id))
                 if not s.stale:
@@ -343,6 +358,65 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
                 ok = ui.button("Delete", icon="delete", on_click=stable(go)).props("color=negative") \
                     .mark("delete_ok")
             describe()
+        dlg.open()
+
+    async def after_change():
+        body.refresh()
+        if on_changed:
+            r = on_changed()
+            if hasattr(r, "__await__"):
+                await r
+
+    async def delete_one(sid: str):
+        """Right-click > Delete: no dependents -> deleted at once (undoable); else ask: delete them too / keep them
+        marked stale."""
+        try:
+            plan = service.plan_delete(p, [sid])
+            s = p.recipe().step(sid)
+        except KeyError:
+            return
+        name = OP_LABEL.get(s.op, s.op)
+        if not plan["dependents"]:
+            try:
+                service.delete_step(p, sid)
+            except Exception as e:  # noqa: BLE001
+                error(e, "Could not delete the step")
+                return
+            ui.notify(f"'{name}' ({sid}) deleted. Undo (Ctrl+Z or the undo button at the top of History) brings it "
+                      "back.", type="positive", multi_line=True)
+            st["sel"] = None if st["sel"] == sid else st["sel"]
+            await after_change()
+            return
+        deps = [p.recipe().step(i) for i in plan["dependents"]]
+        with ui.dialog() as dlg, ui.card().classes("w-[32rem] max-w-full gap-2").mark("delete_one_dialog"):
+            ui.label(f"Delete '{name}' ({sid})?").classes("text-lg font-semibold")
+            ui.label(f"{len(deps)} later step{'s use' if len(deps) != 1 else ' uses'} its result:").classes("text-sm")
+            with ui.column().classes("gap-0 pl-2"):
+                for d in deps[:12]:
+                    ui.label(f"• {OP_LABEL.get(d.op, d.op)} ({d.id})").classes("text-sm")
+                if len(deps) > 12:
+                    ui.label(f"… and {len(deps) - 12} more").classes("text-sm ti-muted")
+            ui.label("Delete them too, or keep them marked stale (crossed out; their results stay but are no longer "
+                     "current). Undo brings everything back.").classes("text-xs ti-muted")
+
+            async def go(mode: str):
+                dlg.close()
+                try:
+                    res = service.delete_step(p, sid, dependents=mode)
+                except Exception as e:  # noqa: BLE001
+                    error(e, "Could not delete the step")
+                    return
+                ui.notify(f"'{name}' deleted" + (f" with {len(res['delete']) - 1} later step(s)" if mode == "delete"
+                                                 else f"; {len(res['stale'])} later step(s) marked stale")
+                          + ". Undo brings it back.", type="positive", multi_line=True)
+                st["sel"] = None
+                await after_change()
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=dlg.close).props("flat").mark("delete_one_cancel")
+                ui.button("Keep them, mark stale", icon="block", on_click=stable(lambda: go("stale"))) \
+                    .props("outline").mark("delete_one_stale")
+                ui.button("Delete them too", icon="delete", on_click=stable(lambda: go("delete"))) \
+                    .props("color=negative").mark("delete_one_all")
         dlg.open()
 
     def dropped(target: str | None):

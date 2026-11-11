@@ -1,5 +1,8 @@
 """View tab: open any image or mosaic of the project (JEOL .bmp / .tif / .png, stitched mosaics) with zoom / pan, a
-metadata panel, a scale bar (from the pixel size) and Export; .up2 pattern files open here too (header table and a
+metadata panel, the microscope info bar (JEOL data bar: detector, kV, WD, magnification, scale bar, image number,
+date) and the app's scale bar (from the pixel size) and Export. Images open with the info bar ON and the app's scale
+bar OFF (the info bar has its own scale bar; fix 3.6); an image without an info bar shows the app's scale bar. The
+choice is remembered per image; .up2 pattern files open here too (header table and a
 pattern viewer: the pattern at a chosen scan row / column, step through the neighbours). Indexing of the patterns
 comes in phase 9."""
 from __future__ import annotations
@@ -130,7 +133,7 @@ def view_page() -> None:
     want = gs.get("view_file")
     key0 = f"file:{want}" if want and f"file:{want}" in opts else (gs.get("view_source") if gs.get("view_source") in opts
                                                                     else next(iter(opts), None))
-    st: dict = {"key": key0, "src": None, "viewer": None, "timers": []}
+    st: dict = {"key": key0, "src": None, "viewer": None, "timers": [], "setting": False}
 
     with ui.row().classes("w-full no-wrap gap-0 items-stretch").style("height: calc(100vh - 56px)"):
         left = ui.column().classes("h-full shrink-0 bg-white border-r gap-0").style("width: 360px").mark("view_left")
@@ -150,10 +153,13 @@ def view_page() -> None:
         bar = ui.row().classes("w-full items-center gap-3 px-3 py-2 no-wrap bg-white border-b")
         with bar:
             title = ui.label("").classes("font-semibold truncate grow").mark("view_title")
-            sbar = ui.checkbox("scale bar", value=gs.get("view_opts", "scale_bar", default=True)).mark("view_sbar") \
-                .tooltip("Show the scale bar (from the pixel size in the JEOL .txt / mosaic sidecar)")
-            with_bar = ui.checkbox("data bar", value=gs.get("view_opts", "data_bar", default=False)) \
-                .mark("view_databar").tooltip("Show the JEOL data bar / info strip below the image")
+            sbar = ui.checkbox("scale bar", value=False).mark("view_sbar") \
+                .tooltip("Show the app's scale bar on the image (from the pixel size in the JEOL .txt / mosaic "
+                         "sidecar; drag and resize it). Off by default when the microscope info bar is shown: that "
+                         "bar has its own scale bar.")
+            with_bar = ui.checkbox("microscope info bar", value=True).mark("view_databar") \
+                .tooltip("Show the microscope info bar under the image (detector, kV, WD, magnification, scale bar, "
+                         "image number, date), as saved by the SEM / the stitched mosaic")
         holder = ui.column().classes("w-full grow gap-0 min-h-0")
         status = ui.label("").classes("text-xs ti-muted px-3 py-1 bg-white border-t w-full").mark("view_status")
 
@@ -174,9 +180,24 @@ def view_page() -> None:
                     ui.label(k).classes("ti-muted whitespace-nowrap")
                     ui.label(str(v)).style("overflow-wrap: anywhere")
 
+    def view_opts(key: str) -> dict | None:
+        """The info-bar / scale-bar choice the user made for this image or mosaic (None = defaults)."""
+        o = gs.get("view_opts_src", key, default=None)
+        return dict(o) if isinstance(o, dict) else None
+
+    def set_checks(scale_bar: bool, info_bar: bool) -> None:
+        st["setting"] = True                     # no reload / no saving while the defaults are put in
+        try:
+            sbar.value = scale_bar
+            with_bar.value = info_bar
+        finally:
+            st["setting"] = False
+
     async def show():
         key = st["key"]
         gs.set("view_source", key)
+        o = view_opts(key) if key else None
+        set_checks(*((o.get("scale_bar", False), o.get("info_bar", True)) if o else (False, True)))
         for t in st["timers"]:                       # progress polling of a previous .up2 overview pass
             t.deactivate()
         st["timers"].clear()
@@ -194,6 +215,12 @@ def view_page() -> None:
             error(e, "Could not open the image")
             return
         st["src"] = d
+        if not d["strip_px"]:                    # nothing to show below the image: the app's scale bar instead
+            if o is None:
+                set_checks(bool(d["ps"]), False)
+            with_bar.disable()                   # (status line: "no microscope info bar")
+        else:
+            with_bar.enable()
         meta_table(d["rows"])
         title.text = d["title"]
         ps = d["ps"] or 1.0
@@ -210,7 +237,9 @@ def view_page() -> None:
         v.on("legends", on_legends)
         v.set(layer_url=tiles.image_url(tok), legends=legends() if d["ps"] else [], legend_data={})
         st["viewer"] = v
-        status.text = (f"{d['img'].shape[1]} × {d['img'].shape[0]} px" +
+        status.text = ((f"{d['img'].shape[1]} × {d['img'].shape[0] - (d['strip_px'] if with_bar.value else 0)} px"
+                        + (f" + {d['strip_px']} px info bar" if with_bar.value and d["strip_px"] else "")
+                        + ("" if d["strip_px"] else ", no microscope info bar")) +
                        (f", {d['ps'] * 1000:.3g} nm per pixel" if d["ps"] else ", no pixel size: scale bar off"))
         exp_btn.enable()
 
@@ -518,14 +547,22 @@ def view_page() -> None:
             if st["viewer"]:
                 st["viewer"]._props["legends"] = legends()
 
+    def remember_opts():
+        if st["key"]:
+            gs.set("view_opts_src", st["key"], {"scale_bar": bool(sbar.value), "info_bar": bool(with_bar.value)})
+
     def sbar_change(e):
-        gs.set("view_opts", "scale_bar", bool(e.value))
+        if st["setting"]:
+            return
+        remember_opts()
         if st["viewer"]:
             st["viewer"].set(legends=legends() if (st["src"] is None or st["src"]["ps"]) else [])
     sbar.on_value_change(sbar_change)
 
     async def bar_change(e):
-        gs.set("view_opts", "data_bar", bool(e.value))
+        if st["setting"]:
+            return
+        remember_opts()
         await show()
     with_bar.on_value_change(bar_change)
 
@@ -545,13 +582,15 @@ def view_page() -> None:
         img = d["img"]
         geometry = {"size_px": [img.shape[1], img.shape[0] - (d["strip_px"] if with_bar.value else 0)],
                     "pixel_size_um": d["ps"]}
+        # export defaults = what the view shows (fix 3.5): info bar as on the view, no overlays / annotations here
+        shown = {"info_strip": bool(with_bar.value and d["strip_px"]), "overlays": False, "annotations": False}
         if d["kind"] == "mosaic":
             await export_dialog(p, gs, kind="mosaic", run_step=run_step, stitch_step=d["stitch"],
                                 detector=d["detector"], sample_id=d["sample_id"], geometry=geometry,
-                                legends=legends() if d["ps"] else [])
+                                legends=legends() if d["ps"] else [], view_state=shown)
         else:
             await export_dialog(p, gs, kind="image", run_step=run_step, image=d["file"], sample_id=d["sample_id"],
-                                geometry=geometry, legends=legends() if d["ps"] else [])
+                                geometry=geometry, legends=legends() if d["ps"] else [], view_state=shown)
     do_export = stable(do_export)
 
     ui.timer(0.05, show, once=True)

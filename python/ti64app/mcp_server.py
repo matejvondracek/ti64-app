@@ -41,8 +41,8 @@ server = MCPServer(
         "it). The build direction, the specimen and any 4PB geometry must come from the user, never guessed; they are "
         "only needed by the steps that use them (IPF along the build direction, prior-beta length / width along BD, "
         "4PB), which say so when they are missing. Typical chain: set_sample_sheet -> load_map -> cleanup_map -> calc_grains -> reconstruct_beta -> "
-        "grain_size -> export_map. Every action is a recipe step (resource ti64://projects/{project}/recipe), "
-        "undoable and replayable. compare_backends runs one step on both backends and shows numbers + both figures. "
+        "grain_size -> export_map. Every analysis action is a recipe step (resource ti64://projects/{project}/recipe), "
+        "undoable and replayable; exports are not recipe steps but go to an export log (export_log, export_again). compare_backends runs one step on both backends and shows numbers + both figures. "
         "Map frame: x right, y down (EDAX setting 2); build-direction angle from +x toward +y. Units: um, deg, MPa; "
         "4PB geometry in mm, load in N. Long steps on full maps take 10 s - 3 min."),
 )
@@ -106,7 +106,8 @@ ExportOptions = _options(ExportParams, "ExportOptions",
                          "line_px, background, name.")
 FigurePatch = _partial(FigureStyle, "FigurePatch", "Figure settings to change (None = keep).")
 StitchOptions = _options(StitchParams, "StitchOptions",
-                         {"folder", "files", "detector", "se_layout", "info_strip", "blend", "exclude", "nudge"},
+                         {"folder", "files", "detector", "se_layout", "info_strip", "blend", "exclude", "nudge",
+                          "use_stage"},
                          "Further stitching options: strip_px, manual_layout, locked, refine_radius, seam, blend_band_px, "
                          "stage_map, search_um, min_overlap_px, "
                          "min_score, se_min_score, se_search_px, max_residual_px, rotation_check, normalize, "
@@ -468,11 +469,15 @@ def grain_size(project: str, map_id: str, params: GrainSizeOptions | None = None
 def grain_size_figure(project: str, map_id: str,
                       kind: Literal["alpha_ecd", "alpha_ecd_area", "lath_thickness", "lath_minor_axis", "colony_ecd",
                                     "colony_ecd_area", "beta_ecd", "beta_width", "beta_length", "colony_map"],
-                      grainsize: str | None = None) -> dict[str, Any]:
+                      grainsize: str | None = None, bin_width_um: float | None = None,
+                      min_um: float | None = None, max_um: float | None = None) -> dict[str, Any]:
     """Histogram with log-normal fit (or the colony map) of the newest (or given) grain-size step, drawn by the
-    backend that computed it. Returns the PNG path."""
+    backend that computed it. bin_width_um = bin width (empty: automatic); min_um / max_um = range shown (the fit and
+    the statistics stay those of all grains). Returns the PNG path."""
     p = _project(project)
-    step = service.run(p, "grainsize.figure", _clean({"map_id": map_id, "kind": kind, "grainsize": grainsize}),
+    step = service.run(p, "grainsize.figure", _clean({"map_id": map_id, "kind": kind, "grainsize": grainsize,
+                                                      "bin_width_um": bin_width_um, "min_um": min_um,
+                                                      "max_um": max_um}),
                        backend=_backend_of(p, "grainsize.run", map_id, grainsize))
     return {**_step_summary(step), "png": _path(p, step, "figure")}
 
@@ -597,9 +602,11 @@ def export_map(project: str, map_id: str, kind: str = "ipf",
     params = {"map_id": map_id, "layer": lay, "overlays": overlays or [], "mode": mode, "scale": scale,
               "width_mm": width_mm, "dpi": dpi, "format": format, "roi": roi, "roi_id": roi_id,
               **_set(ExportOptions, options)}
-    step = service.run(p, "export.map", _clean(params), backend=backend)
-    return {**_step_summary(step), "file": _path(p, step, "export"), "sidecar": _path(p, step, "sidecar"),
-            "meta": _json_out(p, step, "sidecar")}
+    step, e = service.export(p, "export.map", _clean(params), backend=backend)
+    return {"export_id": e.id, "backend": step.backend, "seconds": step.metrics.get("seconds"),
+            "file": _path(p, step, "export"), "sidecar": _path(p, step, "sidecar"),
+            "meta": _json_out(p, step, "sidecar"),
+            "note": "exports are not recipe steps; listed by export_log, repeatable with export_again"}
 
 
 # ---- SEM image stitching (phase 6.5) ---------------------------------------------------------
@@ -630,7 +637,7 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
                   detector: Literal["BSE", "SE", "both"] = "BSE", se_layout: Literal["own", "bse"] = "own",
                   info_strip: Literal["none", "keep", "generate"] = "none",
                   blend: Literal["seam", "feather", "none"] = "seam", exclude: list[str] | None = None,
-                  nudge: dict[str, tuple[float, float]] | None = None,
+                  nudge: dict[str, tuple[float, float]] | None = None, use_stage: bool = True,
                   options: StitchOptions | None = None) -> dict[str, Any]:  # type: ignore[valid-type]
     """Stitch overlapping JEOL SEM images into one mosaic per detector (BSE = BED-*, SE = SED/...; never mixed;
     check counts with scan_sem_images first). se_layout 'bse' stitches BSE and places each SE tile with the BSE
@@ -639,13 +646,14 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
     ranges, image numbers and a redrawn scale bar). blend 'seam' (default) places tiles at subpixel positions and
     blends only in a narrow band around each seam (no ghosting); 'feather' blends whole overlaps; 'none' keeps raw
     pixel values. Different magnifications are never stitched together (scan_sem_images lists the stitch sets).
-    exclude / nudge (dx, dy px)
+    use_stage=False ('Do not use stage positions', e.g. a faulty stage): placement only from image matching of all
+    pairs (or manual_layout in options). exclude / nudge (dx, dy px)
     by file stem or image number. Returns per detector the TIFF, preview PNG, sidecar path, mosaic size, residuals,
     weak pairs and tiles placed by the stage only."""
     p = _project(project)
     params = {"folder": folder, "files": files, "detector": detector, "se_layout": se_layout,
               "info_strip": info_strip, "blend": blend, "exclude": exclude or [], "nudge": nudge or {},
-              **_set(StitchOptions, options)}
+              "use_stage": use_stage, **_set(StitchOptions, options)}
     step = service.run(p, "sem.stitch", _clean(params))
     out = _step_summary(step)
     for det in ("BSE", "SE"):
@@ -656,7 +664,7 @@ def stitch_images(project: str, folder: str | None = None, files: list[str] | No
                         "pixel_size_um": side["pixel_size_um"], "residual_px": side["residual_px"],
                         "stage_only_tiles": side["stage_only_tiles"], "strip": side["strip"],
                         "stage_map": side["stage_map"].get("chosen"),
-                        "notes": side.get("notes", []),            # unknown stage axis, possible / confirmed repeats
+                        "notes": side.get("notes", []),            # stage not used, possible / confirmed repeats
                         "weak_pairs": [q for q in side["pairs"] if not q["ok"]],
                         "tiles": [{k: t[k] for k in ("name", "x_px", "y_px", "best_score", "placed_by")}
                                   for t in side["tiles"]]}
@@ -675,10 +683,34 @@ def export_mosaic(project: str, stitch: str, detector: Literal["BSE", "SE"] = "B
     is included) and the mosaic's info strip. Sizes that do not fit in memory are refused with the alternatives. The
     file stays in the project (path returned) with a JSON sidecar giving the pixel size of the exported image."""
     p = _project(project)
-    step = service.run(p, "sem.export", {"stitch": stitch, "detector": detector, "format": format, "mode": mode,
-                                         "scale": scale, "width_mm": width_mm, "dpi": dpi, "scale_bar": scale_bar,
-                                         "info_strip": info_strip, "name": name})
-    return {**_step_summary(step), "file": _path(p, step, "export"), "sidecar": _json_out(p, step, "sidecar")}
+    step, e = service.export(p, "sem.export", {"stitch": stitch, "detector": detector, "format": format,
+                                               "mode": mode, "scale": scale, "width_mm": width_mm, "dpi": dpi,
+                                               "scale_bar": scale_bar, "info_strip": info_strip, "name": name})
+    return {"export_id": e.id, "seconds": step.metrics.get("seconds"), "file": _path(p, step, "export"),
+            "sidecar": _json_out(p, step, "sidecar")}
+
+
+@server.tool()
+def export_log(project: str) -> dict[str, Any]:
+    """Exports of a project (not recipe steps): id, what (map / layer / mosaic), format, resolution, date, the file it
+    was saved to and the copy kept in the project. Use export_again to repeat one with the same settings."""
+    from . import exportlog  # noqa: PLC0415
+
+    p = _project(project)
+    return {"exports": [{"id": e.id, "what": e.label(), "op": e.op, "date": e.date, "file": e.file,
+                         "project_file": str(p.root / e.project_file) if e.project_file else "",
+                         "backend": e.backend, "params": e.params, "migrated_from_recipe": e.migrated}
+                        for e in exportlog.load(p.root)]}
+
+
+@server.tool()
+def export_again(project: str, export_id: str, file: str | None = None,
+                 backend: Backend | None = None) -> dict[str, Any]:
+    """Repeat a logged export with the same settings (id from export_log); `file` = where to save it (default: the
+    same file as before, if it had one). Uses the recorded backend unless `backend` is given."""
+    p = _project(project)
+    step, e = service.export_again(p, export_id, file, backend)
+    return {"export_id": e.id, "file": e.file or _path(p, step, "export"), "sidecar": _path(p, step, "sidecar")}
 
 
 @server.tool()

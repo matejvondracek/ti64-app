@@ -32,7 +32,7 @@ REQUIRES: dict[str, tuple[tuple[str, ...], str]] = {
 }
 REF_KEYS = ("source", "grains", "recon", "values", "grainsize")
 NAMES = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "Grains and boundaries",
-         "map.compute": "KAM / GND map", "figure": "Figure", "export.map": "Export", "compare.oim": "Compare with OIM",
+         "map.compute": "KAM / GROD / GOS / GND map", "figure": "Figure", "compare.oim": "Compare with OIM",
          "recon.run": "Prior-β reconstruction", "recon.sweep": "Parameter sweep", "recon.figure": "Reconstruction figure",
          "grainsize.run": "Grain size", "grainsize.figure": "Grain-size figure",
          "grainsize.compare_oim": "Grain size vs OIM", "annotations.set": "Annotations"}
@@ -52,6 +52,8 @@ def check_order(steps: list[RecipeStep]) -> str | None:
         req = REQUIRES.get(s.op)
         if s.op == "grainsize.run" and s.params.get("target") == "prior_beta":
             req = (("recon.run",), "a prior-β reconstruction")
+        if s.op == "grains.calc" and any(t.id == s.params.get("source") and t.op == "recon.run" for t in steps):
+            req = (("recon.run",), "a prior-β reconstruction")            # prior-β grains (fix 3.10)
         if req and not any(o in seen for o in req[0]):
             return f"step {k + 1} ({NAMES.get(s.op, s.op)}) needs {req[1]} before it"
         if s.op == "ebsd.load" and k > 0 and any(o in REQUIRES for o in seen):

@@ -31,6 +31,6 @@ if isfield(o, 'curve_x') && ~isempty(o.curve_x)
 end
 xlabel(ax, char(o.xlabel), 'Interpreter', 'none'); ylabel(ax, char(o.ylabel), 'Interpreter', 'none');
 if strlength(string(o.title)) > 0, title(ax, char(o.title), 'FontSize', 9, 'Interpreter', 'none'); end
-exportgraphics(f, outPng, 'Resolution', o.dpi, 'BackgroundColor', 'white');
+ti64.plot.saveFigure(f, outPng, o.dpi);
 close(f);
 end

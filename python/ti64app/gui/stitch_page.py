@@ -4,11 +4,12 @@ stitched together) and a checklist of the images of the chosen set (pick a subse
 blending, seam, band width, search radius, min. score). Right: Arrange (thumbnails at their stage positions, or in a
 row without stage data: drag them roughly into place, zoom, lock a tile, select with click / Shift-click / Shift-drag;
 once tiles were moved, the one 'Stitch' button searches only within the search radius around these positions and the
-manual layout is saved in the recipe. A stage axis that is not recorded (no spread, or images with identical stage
-positions, e.g. JU04: stage Y the same in every image) is named under 'Stitch sets', its images are spread out along
-it on the Arrange tab and Stitch searches it by image matching over the full range),
-Result (mosaic with tile borders coloured by match score, nudge / exclude a tile, pairs with their residual
-misalignment) and Overlaps (difference image of one overlap: ghosting shows as double edges).
+manual layout is saved in the recipe. 'Do not use stage positions' (under 'Stitch sets', e.g. for a faulty stage):
+the Arrange view starts from a grid and Stitch places the tiles by image matching of all pairs or from the Arrange
+positions only (fix 3.17)),
+Result (the mosaic zoomable down to full resolution in the tiled viewer, optional tile borders coloured by match
+score and seams, click a tile to nudge / exclude it, pairs with their residual misalignment; fix 3.16) and Overlaps
+(difference image of one overlap: ghosting shows as double edges).
 Everything runs through service.run("sem.stitch", ...) (recorded in the recipe); Export uses the shared export
 dialog (sem.export). Single images are opened on the View tab."""
 from __future__ import annotations
@@ -25,9 +26,11 @@ from .. import service
 from ..modules import stitching
 from . import dialogs, tiles
 from .export_dialog import export_dialog
+from .mosaic_tiles import border_overlay, open_mosaic, seam_overlay
 from .shell import check_interrupted, error, header
 from .state import GuiState, stable
 from .tips import tip
+from .viewer import MapViewer
 
 STITCH_STATE: dict = {"msg": "", "frac": 0.0, "busy": False}
 
@@ -82,9 +85,10 @@ def tile_key(t: stitching.TileInfo) -> str:
     return str(t.image_number) if t.image_number is not None else t.name
 
 
-def stage_layout(tl: list[stitching.TileInfo]) -> dict[str, list[float]]:
-    """Positions (x, y px, top-left corners) from the stage (default JSM-IT500HR mapping), or in a row."""
-    lay = stitching.layout_preview(tl)
+def stage_layout(tl: list[stitching.TileInfo], use_stage: bool = True) -> dict[str, list[float]]:
+    """Positions (x, y px, top-left corners) from the stage (default JSM-IT500HR mapping), or in a grid without stage
+    data / with 'Do not use stage positions'."""
+    lay = stitching.layout_preview(tl, use_stage=use_stage)
     return {tile_key(t): [L["x"], L["y"]] for t, L in zip(tl, lay["tiles"])}
 
 
@@ -149,6 +153,8 @@ def stitch_page() -> None:
                                 label="detector").classes("w-full").tooltip(tip("st_detector")).mark("st_detector")
                 counts = ui.column().classes("w-full gap-1")
                 ui.label("Stitch sets").classes("font-semibold").tooltip(tip("st_sets"))
+                no_stage = ui.checkbox("Do not use stage positions", value=not saved.get("use_stage", True)) \
+                    .props("dense").classes("text-sm").tooltip(tip("st_no_stage")).mark("st_no_stage")
                 sets_box = ui.column().classes("w-full gap-1").mark("st_sets")
                 stage_box = ui.column().classes("w-full gap-1").mark("st_stage_check")
                 ui.label("Images of the set").classes("font-semibold") \
@@ -179,9 +185,7 @@ def stitch_page() -> None:
                     radius = ui.number("search radius [% of tile]", value=saved.get("radius", 10), min=1, max=50,
                                        step=1, format="%g").classes("grow").mark("st_radius") \
                         .tooltip("How far a match may lie from the position on the 'Arrange' tab (after you moved "
-                                 "tiles there), or from the recorded stage axis when the other axis is not recorded "
-                                 "(e.g. stage Y the same in every image). In % of the tile size; at least the 1 µm "
-                                 "stage resolution.")
+                                 "tiles there), in % of the tile size.")
                     min_score = ui.number("min. match score", value=saved.get("min_score", 0.3), step=0.05,
                                           min=0, max=1).classes("w-32").tooltip(tip("st_min_score"))
         with ui.column().classes("w-full p-3 gap-2 border-t"):
@@ -191,7 +195,8 @@ def stitch_page() -> None:
                 ui.button("Stitch", icon="view_module", on_click=lambda: do_stitch()).classes("grow") \
                     .mark("st_run").tooltip("Register and stitch the ticked images: from the positions on the "
                                             "'Arrange' tab (within the search radius) or, if you did not move any "
-                                            "tile, from the stage positions")
+                                            "tile, from the stage positions (by image matching only when "
+                                            "'Do not use stage positions' is ticked)")
                 exp_btn = ui.button("Export", icon="ios_share", on_click=lambda: do_export()).props("outline") \
                     .classes("grow").mark("st_export")
     with right:
@@ -204,9 +209,10 @@ def stitch_page() -> None:
             with ui.tab_panel("arrange").classes("p-0 h-full"):
                 with ui.column().classes("w-full h-full gap-0"):
                     with ui.row().classes("w-full items-center gap-2 px-3 py-2 bg-white border-b no-wrap"):
-                        ui.button("Stage positions", icon="restart_alt", on_click=lambda: reset_layout()) \
+                        reset_btn = ui.button("Stage positions", icon="restart_alt", on_click=lambda: reset_layout()) \
                             .props("outline dense no-caps").mark("st_reset") \
-                            .tooltip("Put every tile back at its stage position (or in a row without stage data)")
+                            .tooltip("Put every tile back at its stage position (in a grid without stage data or with "
+                                     "'Do not use stage positions')")
                         ui.button("Lock", icon="lock", on_click=lambda: lock(True)).props("outline dense no-caps") \
                             .mark("st_lock").tooltip("Selected tiles keep their position when you press 'Stitch'")
                         ui.button("Unlock", icon="lock_open", on_click=lambda: lock(False)) \
@@ -215,7 +221,7 @@ def stitch_page() -> None:
                             .tooltip("Fit all tiles (double-click the background)").mark("st_fit")
                         arr_lab = ui.label("").classes("text-xs ti-muted truncate grow").mark("st_arrange_info")
                     arr = ArrangeView().classes("w-full grow").style("min-height: 300px").mark("st_arrange")
-            with ui.tab_panel("result").classes("p-3"):
+            with ui.tab_panel("result").classes("p-3 h-full overflow-auto"):
                 result = ui.column().classes("w-full gap-3").mark("st_result")
                 with result:
                     ui.label("Press the 'Stitch' button (next to 'Export') to see the mosaic here.").classes("ti-muted")
@@ -233,7 +239,8 @@ def stitch_page() -> None:
     def remember():
         gs.set("stitch", {"source": source.value, "folder": src["folder"], "files": src["files"], "detector": det.value,
                           "se_bse": se_bse.value, "strip": strip.value, "blend": blend.value, "seam": seam.value,
-                          "band": band.value, "radius": radius.value, "min_score": min_score.value, "set": st["set"]})
+                          "band": band.value, "radius": radius.value, "min_score": min_score.value, "set": st["set"],
+                          "use_stage": not no_stage.value})
         gs.set("stitch_arrange", src_key(), {"set": st["set"], "checked": sorted(st["checked"]),
                                              "layout": st["layout"], "locked": sorted(st["locked"]),
                                              "manual": st["manual"]})
@@ -309,7 +316,7 @@ def stitch_page() -> None:
 
     def refresh_sets():
         tl = [t for t in src["tiles"] if t.detector_class == det_class()]
-        st["sets"] = stitching.stitch_sets(tl)
+        st["sets"] = stitching.stitch_sets(tl, use_stage=not no_stage.value)
         stitchable = [s for s in st["sets"] if s.n > 1]
         mem = gs.get("stitch_arrange", src_key()) or {}
         if st["set"] not in {s.id for s in stitchable}:
@@ -333,6 +340,18 @@ def stitch_page() -> None:
 
     det.on_value_change(lambda _: (refresh_sets(), remember()))
 
+    def no_stage_change(_=None):
+        """'Do not use stage positions' (fix 3.17): sets are no longer split by stage footprints; the Arrange view
+        starts from a grid unless the tiles were arranged by hand."""
+        reset_btn.text = "Grid" if no_stage.value else "Stage positions"
+        refresh_sets()
+        if not st["manual"]:
+            st["layout"] = stage_layout(set_tiles(), not no_stage.value)
+            refresh_arrange(fit=True)
+        remember()
+    no_stage.on_value_change(no_stage_change)
+    reset_btn.text = "Grid" if no_stage.value else "Stage positions"
+
     def choose_set(set_id: str):
         st["set"] = set_id
         load_arrangement({})
@@ -344,7 +363,7 @@ def stitch_page() -> None:
         st["checked"] = set(mem.get("checked") or keys) & keys
         st["layout"] = {k: v for k, v in (mem.get("layout") or {}).items() if k in keys}
         if set(st["layout"]) != keys:
-            st["layout"] = stage_layout(tl)
+            st["layout"] = stage_layout(tl, not no_stage.value)
         st["locked"] = set(mem.get("locked") or []) & keys
         st["manual"] = bool(mem.get("manual"))
         refresh_checklist()
@@ -352,18 +371,15 @@ def stitch_page() -> None:
         refresh_arrange(fit=True)
 
     def show_stage_check(tl: list[stitching.TileInfo]):
-        """Stage axes that are not recorded and possible repeats of the chosen set (fix 18, JU04)."""
-        st["stage_check"] = sa = stitching.stage_analysis(tl) if len(tl) > 1 else {"unknown_axes": [], "repeats": []}
+        """Possible repeats of the chosen set (same stage position and magnification). A stage axis without spread
+        is no longer reported (fix 3.17); 'Do not use stage positions' is the way around a faulty stage."""
+        st["stage_check"] = sa = stitching.stage_analysis(tl) if len(tl) > 1 else {"repeats": []}
         stage_box.clear()
-        if not sa["unknown_axes"] and not sa["repeats"]:
+        if not sa["repeats"]:
             return
         with stage_box, ui.row().classes("w-full no-wrap gap-2 p-2 rounded bg-amber-50 border border-amber-300"):
             ui.icon("warning", size="20px").classes("text-amber-700 shrink-0")
             with ui.column().classes("gap-1 min-w-0"):
-                if sa["unknown_axes"]:
-                    ui.label(sa["message"][:1].upper() + sa["message"][1:] + " Check the mosaic on the 'Result' tab; "
-                             "if a tile is wrong, drag it into place on the 'Arrange' tab and press 'Stitch' again.") \
-                        .classes("text-xs").mark("st_unknown_axis")
                 if sa["repeats"]:
                     ui.label("Possible repeats (same stage position and magnification): " +
                              "; ".join(" = ".join(g) for g in sa["repeats"]) +
@@ -401,11 +417,10 @@ def stitch_page() -> None:
         if fit:
             arr.fit()
         n = len(checked_tiles())
-        unk = (st.get("stage_check") or {}).get("unknown_axes") or []
         arr_lab.text = (f"{n} of {len(tl)} images selected · " +
-                        ("manual arrangement" if st["manual"] else "stage positions" + (
-                            f" (stage {' and '.join(unk)} not recorded: images with the same position are spread out "
-                            "in image-number order; Stitch finds their place, or drag them)" if unk else "")) +
+                        ("manual arrangement" if st["manual"] else
+                         "stage positions not used: tiles in a grid; Stitch places them by image matching, or drag "
+                         "them roughly into place" if no_stage.value else "stage positions") +
                         (f" · locked: {', '.join(sorted(st['locked']))}" if st["locked"] else ""))
         update_strip_option()
 
@@ -446,7 +461,7 @@ def stitch_page() -> None:
     arr.on("select", on_select)
 
     def reset_layout():
-        st["layout"] = stage_layout(set_tiles())
+        st["layout"] = stage_layout(set_tiles(), not no_stage.value)
         st["manual"] = False
         refresh_arrange(fit=True)
         remember()
@@ -484,7 +499,7 @@ def stitch_page() -> None:
               "info_strip": strip.value, "blend": blend.value, "seam": seam.value,
               "blend_band_px": int(band.value or 0), "min_score": float(min_score.value or 0.3),
               "exclude": sorted(edits["exclude"]), "nudge": {k: list(v) for k, v in edits["nudge"].items()},
-              "refine_radius": float(radius.value or 10) / 100.0}
+              "refine_radius": float(radius.value or 10) / 100.0, "use_stage": not no_stage.value}
         if manual:                       # tiles moved on the Arrange tab: their positions replace the stage
             pr.update(manual_layout={tile_key(t): st["layout"][tile_key(t)] for t in tl},
                       locked=sorted(st["locked"] & {tile_key(t) for t in tl}))
@@ -527,8 +542,6 @@ def stitch_page() -> None:
                     continue
                 side = json.loads((p.root / step.outputs[f"sidecar_{d}"].path).read_text(encoding="utf-8"))
                 st["side"][d] = side
-                prev = p.root / step.outputs[f"preview_{d}"].path
-                sc = side.get("preview_scale", 1.0)
                 w, h = side["mosaic_px"]
                 mis = side.get("misalignment_px") or {}
                 with ui.column().classes("ti-card p-3 w-full gap-2"):
@@ -541,25 +554,12 @@ def stitch_page() -> None:
                                                            if side.get('render', {}).get('blend') == 'seam' else "")) \
                         .classes("text-sm").mark(f"st_summary_{d}")
                     stage_notes = [q for q in side.get("notes", []) if not q.startswith("MP_BEAM_SHIFT")]
-                    if stage_notes:                       # unknown stage axis, repeats (confirmed or not), unmatched
+                    if stage_notes:                       # stage not used, repeats (confirmed or not), unmatched
                         with ui.column().classes("w-full gap-0 p-2 rounded bg-amber-50 border border-amber-300") \
                                 .mark(f"st_notes_{d}"):
                             for q in stage_notes:
                                 ui.label("• " + q[:1].upper() + q[1:]).classes("text-xs")
-                    img = ui.interactive_image(str(prev), content=tile_svg(side, sc, None, side["params"]["min_score"]),
-                                               events=["click"]).classes("max-w-xl").mark(f"st_result_{d}")
-                    tile_box = ui.column().classes("w-full gap-2")
-
-                    def click(e, side=side, img=img, sc=sc, tile_box=tile_box):
-                        x, y = e.image_x * sc, e.image_y * sc
-                        hit = [t for t in side["tiles"] if t["x_px"] <= x < t["x_px"] + t["width_px"]
-                               and t["y_px"] <= y < t["y_px"] + t["height_px"]]
-                        if not hit:
-                            return
-                        t = hit[-1]
-                        img.content = tile_svg(side, sc, t["name"], side["params"]["min_score"])
-                        tile_panel(t, tile_box)
-                    img.on_mouse(click)
+                    mosaic_view(step, d, side)
                     with ui.row().classes("gap-2"):
                         ui.button(f"Export {d}…", icon="ios_share", on_click=lambda d=d: do_export(d)) \
                             .props("outline").mark(f"st_export_{d}")
@@ -576,6 +576,94 @@ def stitch_page() -> None:
                         .props("dense flat").classes("w-full").mark(f"st_pairs_{d}")
                     tbl.on("rowClick", lambda e, d=d, side=side: show_overlap(d, side, e.args[1]["a"], e.args[1]["b"]))
         show_overlap_picker()
+
+    def mosaic_view(step, d: str, side: dict):
+        """The mosaic in the tiled viewer: pan / zoom down to full resolution (pyramid read lazily), tile borders
+        coloured by match score and the seams as optional overlays, click a tile to nudge / exclude it (fix 3.16)."""
+        ps = side.get("pixel_size_um") or 1.0
+        key = f"mos_{step.id}_{d}"
+        try:
+            url, ext = open_mosaic(key, p.root / step.outputs[f"mosaic_{d}"].path, ps, int(side["mosaic_px"][1]))
+        except Exception as e:  # noqa: BLE001
+            error(e, "Could not open the mosaic")
+            return
+        ms = side["params"]["min_score"]
+        ui.add_css(".ti64-label span { font: 600 12px sans-serif; white-space: nowrap; "
+                   "text-shadow: 0 0 3px #fff, 0 0 2px #fff; }")
+        opts = gs.get("stitch_result_view", default=None) or {"borders": True, "seams": False}
+        seams_npz = (p.root / step.outputs[f"seams_{d}"].path) if f"seams_{d}" in step.outputs else None
+        cache: dict = {}
+        with ui.row().classes("w-full items-center gap-3 no-wrap"):
+            cb_b = ui.checkbox("tile borders", value=opts.get("borders", True)).props("dense") \
+                .mark(f"st_borders_{d}").tooltip("Outline of every tile at its final position, coloured by its best "
+                                                 "match score: green strong, orange acceptable, red weak or placed "
+                                                 "without a match. Labels: image number (score).")
+            cb_s = ui.checkbox("seams", value=opts.get("seams", False)).props("dense").mark(f"st_seams_{d}") \
+                .tooltip("Where one tile ends and the next begins in the mosaic (blending happens in a narrow band "
+                         "around these lines).")
+            seam_lab = ui.label("").classes("text-xs ti-muted truncate grow")
+        v = MapViewer(ps, ext).classes("w-full border").style("height: 62vh; min-height: 360px") \
+            .mark(f"st_result_{d}")
+        st.setdefault("viewers", {})[d] = v
+
+        def shapes(sel: str | None = None) -> list[dict]:
+            out = []
+            if cb_b.value:
+                for t in side["tiles"]:
+                    c = score_colour(t["best_score"], t["placed_by"], ms)
+                    out.append({"id": f"lab_{t['name']}", "type": "text", "width_pt": 1, "color": c,
+                                "xy": [[(t["x_px"] + 0.02 * t["width_px"]) * ps, (t["y_px"] + 0.04 * t["height_px"]) * ps]],
+                                "text": f"{t['image_number']} · " + (f"{t['best_score']:.2f}" if isinstance(
+                                    t["best_score"], (int, float)) else "no match")})
+            t = next((t for t in side["tiles"] if t["name"] == sel), None)
+            if t is not None:
+                out.append({"id": "sel", "type": "roi_rect", "width_pt": 2, "color": "#1e88e5", "text": t["name"],
+                            "xy": [[t["x_px"] * ps, t["y_px"] * ps],
+                                   [(t["x_px"] + t["width_px"]) * ps, (t["y_px"] + t["height_px"]) * ps]]})
+            return out
+
+        def overlays():
+            ov = []
+            if cb_b.value:
+                cache.setdefault("b", border_overlay(key, side, lambda t: score_colour(t["best_score"], t["placed_by"],
+                                                                                       ms)))
+                ov.append({"url": cache["b"], "opacity": 1})
+            if cb_s.value:
+                if "s" not in cache:
+                    try:
+                        cache["s"] = seam_overlay(key, side, seams_npz)
+                    except Exception as e:  # noqa: BLE001
+                        error(e, "Could not draw the seams")
+                        cache["s"] = None
+                if cache["s"]:
+                    url, why, n = cache["s"]
+                    ov.append({"url": url, "opacity": 1})
+                    seam_lab.text = (f"seams: {why}" if n else "no seams (feather blending: the whole overlap is "
+                                     "blended)")
+            else:
+                seam_lab.text = ""
+            gs.set("stitch_result_view", {"borders": bool(cb_b.value), "seams": bool(cb_s.value)})
+            v.set(overlays=ov, shapes=shapes(st.get("sel_tile", {}).get(d)))
+
+        box = ui.column().classes("w-full gap-2")
+
+        def probe(e):
+            x, y = e.args["xy"][0]
+            hit = [t for t in side["tiles"] if t["x_px"] * ps <= x < (t["x_px"] + t["width_px"]) * ps
+                   and t["y_px"] * ps <= y < (t["y_px"] + t["height_px"]) * ps]
+            if not hit:
+                return
+            t = hit[-1]
+            st.setdefault("sel_tile", {})[d] = t["name"]
+            v.set(shapes=shapes(t["name"]))
+            tile_panel(t, box)
+        v.on("probe", probe)
+        v.on("cursor", throttle=0.2, handler=lambda e: seam_lab.set_text(
+            f"x {e.args['x'] / ps:.0f} px, y {e.args['y'] / ps:.0f} px · click a tile to nudge or exclude it"))
+        v.set(layer_url=url, tool="probe", legends=[], legend_data={})
+        cb_b.on_value_change(lambda _: overlays())
+        cb_s.on_value_change(lambda _: overlays())
+        overlays()
 
     def tile_panel(t, box):
         box.clear()
@@ -665,10 +753,12 @@ def stitch_page() -> None:
         from ..legends import default_item  # noqa: PLC0415
 
         lg = gs.get("view_legend", default=None) or default_item("scale_bar").model_dump()
+        has_strip = bool((side.get("strip") or {}).get("height_px"))
         await export_dialog(p, gs, kind="mosaic", run_step=run_step, stitch_step=step.id, detector=d,
                             sample_id=step.sample_id, legends=[lg] if side.get("pixel_size_um") else [],
                             geometry={"size_px": side.get("mosaic_px") or [1, 1],
-                                      "pixel_size_um": side.get("pixel_size_um")})
+                                      "pixel_size_um": side.get("pixel_size_um")},
+                            view_state={"info_strip": has_strip, "overlays": False, "annotations": False})
     do_export = stable(do_export)
 
     upd_source()

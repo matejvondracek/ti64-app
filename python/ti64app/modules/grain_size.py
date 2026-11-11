@@ -247,26 +247,34 @@ def lognormal_pdf(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
     return np.where(x > 0, p, 0.0)
 
 
-def hist_edges(v: np.ndarray, max_bins: int = 40, bin_width: float | None = None) -> np.ndarray:
+def hist_edges(v: np.ndarray, max_bins: int = 40, bin_width: float | None = None, lo: float | None = None,
+               hi: float | None = None) -> np.ndarray:
     """Bin edges from 0 to the 99.5th percentile (Freedman-Diaconis width, at most max_bins bins), or bins of a
-    fixed width (um, user setting) from 0 to the largest value (at most 2000 bins)."""
+    fixed width (um, user setting) from 0 to the largest value (at most 2000 bins). lo / hi (um, user setting, fix
+    3.15): the shown range; edges start at lo and end at hi (else as above), the width is chosen from the values in
+    the range."""
     v = np.asarray(v, float)
     v = v[np.isfinite(v) & (v > 0)]
+    if lo is not None and hi is not None and hi <= lo:
+        raise ValueError(f"maximum grain size {hi:g} um must be larger than the minimum {lo:g} um")
+    a = float(lo) if lo else 0.0
+    v = v[(v >= a) & (v <= (hi if hi is not None else np.inf))]
     if bin_width:
         if bin_width <= 0:
             raise ValueError("bin width must be > 0")
-        hi = float(v.max(initial=bin_width))
-        nb = int(np.ceil(hi / bin_width - 1e-9)) or 1
+        top = float(hi) if hi is not None else float(v.max(initial=a + bin_width))
+        nb = int(np.ceil((top - a) / bin_width - 1e-9)) or 1
         if nb > 2000:
             raise ValueError(f"bin width {bin_width:g} um gives {nb} bins (max 2000): choose a larger bin width")
-        return np.arange(nb + 1) * float(bin_width)
+        return a + np.arange(nb + 1) * float(bin_width)
     if v.size < 2:
-        return np.array([0.0, max(float(v.max(initial=1.0)), 1e-6) * 1.05])
-    hi = float(np.percentile(v, 99.5)) * 1.02
+        top = float(hi) if hi is not None else max(float(v.max(initial=1.0)), 1e-6) * 1.05
+        return np.array([a, max(top, a + 1e-6)])
+    top = float(hi) if hi is not None else float(np.percentile(v, 99.5)) * 1.02
     iqr = np.subtract(*np.percentile(v, [75, 25]))
-    w = 2 * iqr / v.size ** (1 / 3) if iqr > 0 else hi / max_bins
-    nb = int(np.clip(np.ceil(hi / w), 5, max_bins))
-    return np.linspace(0.0, hi, nb + 1)
+    w = 2 * iqr / v.size ** (1 / 3) if iqr > 0 else (top - a) / max_bins
+    nb = int(np.clip(np.ceil((top - a) / w), 5, max_bins))
+    return np.linspace(a, top, nb + 1)
 
 
 # ---- OIM grain file (validation) ------------------------------------------------------------------

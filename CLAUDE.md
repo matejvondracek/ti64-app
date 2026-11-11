@@ -41,9 +41,10 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
 - Overlays from Python-only modules (crack paths, positions, annotations) are passed as vector data to
   the active backend's renderer, so each exported figure comes from one renderer.
 - Python-only modules consume backend results and never call a backend directly.
-- Every GUI or MCP action is a recipe step in project/recipe.json, recording the backend name and
+- Every ANALYSIS action from the GUI or MCP is a recipe step in project/recipe.json, recording the backend name and
   versions (app, mtex/pymtex, MATLAB). Replay uses the recorded backend unless the user overrides it.
   Switching backend for a project marks its results stale.
+- Exports are not recipe steps: they go to a separate export log (settings, file, date) for re-export.
 - If MATLAB or the engine is not installed, the matlab backend is shown as unavailable, not an error.
 
 ## Backend contract and conformance

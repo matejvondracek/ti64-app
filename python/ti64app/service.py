@@ -27,13 +27,14 @@ import numpy as np
 import psutil
 from pydantic import BaseModel
 
-from . import __version__, history
+from . import __version__, exportlog, history, progress
 from .backends import get_backend
 from .backends.base import BackendUnavailable, EBSDData, EBSDHandle, EngineRestarted, LoadParams
 from .hashing import array_hash, bytes_hash, file_fingerprint, json_hash, npz_hash, png_hash, xlsx_hash
 from .io import bse as bse_io
 from .io import up2 as up2_io
 from .project import Project, write_json
+from .exportlog import EXPORT_OPS, ExportEntry
 from .recipe import FileInput, OutputRef, RecipeStep
 from .sample import SampleSheet
 
@@ -49,6 +50,7 @@ class OpContext:
     outputs: dict[str, tuple] = field(default_factory=dict)   # name -> (kind, value[, file stem])
     metrics: dict[str, float] = field(default_factory=dict)
     need_object: bool = False                 # materialize(): the backend object is wanted (no cache shortcut)
+    figure_ext: str = ".png"                  # figure ops: file type of the figure ("Save" / "Export" of a result)
 
     def add_input(self, path: str | Path) -> None:
         p = Path(path)
@@ -142,6 +144,7 @@ def _ebsd_load(ctx: OpContext) -> None:
     cdir = ctx.project.cache_dir / "maps"
     cnpz, cmeta = cdir / f"{ctx.backend.name}_{key}.npz", cdir / f"{ctx.backend.name}_{key}.json"
     t0 = time.perf_counter()
+    progress.report("reading file", 0.05)
     if not ctx.need_object and cnpz.is_file() and cmeta.is_file():
         try:
             meta = json.loads(cmeta.read_text(encoding="utf-8"))
@@ -154,6 +157,7 @@ def _ebsd_load(ctx: OpContext) -> None:
             pass                                          # damaged cache entry: load again
     h = ctx.backend.load_ebsd(lp)
     t1 = time.perf_counter()
+    progress.report("transferring data", 0.35)
     data = ctx.backend.get_ebsd(h)
     t2 = time.perf_counter()
     ctx.remember(h)
@@ -285,9 +289,13 @@ def _backend(project: Project, spec: OpSpec, backend: str | None):
 
 
 def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
-        backend: str | None = None, record: bool = True, step_id: str | None = None) -> RecipeStep:
+        backend: str | None = None, record: bool = True, step_id: str | None = None,
+        out_dir: Path | None = None) -> RecipeStep:
     """Execute one operation, write its outputs and (by default) append it to the recipe.
-    `step_id` is only given by replay, so references between steps stay valid."""
+    `step_id` is only given by replay, so references between steps stay valid. Exports are not recipe steps: an
+    export op called with record=True is run through export() (export log) instead."""
+    if op_name in EXPORT_OPS and record:
+        return export(project, op_name, params, backend)[0]
     if op_name not in OPS:
         raise KeyError(f"unknown operation {op_name!r}; known: {sorted(OPS)}")
     spec = OPS[op_name]
@@ -301,7 +309,7 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
     if step_id:
         step.id = step_id
     step.sample_id = step_sample(project, op_name, params)
-    ctx = OpContext(project, step, params, be, project.step_dir(step.id, step.sample_id))
+    ctx = OpContext(project, step, params, be, out_dir or project.step_dir(step.id, step.sample_id))
     before = history.snapshot(project) if record else None     # undo point (state files only)
     if record:
         _mark_running(project, step)
@@ -349,6 +357,107 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
 
 
 from .sample import SHEET_RESULT_KEYS  # noqa: E402  (kept importable from here)
+
+
+# ---- exports (not recipe steps, fix 3.4) -----------------------------------------------------------
+def export(project: Project, op_name: str, params: dict[str, Any] | BaseModel, backend: str | None = None,
+           target: str | Path | None = None) -> tuple[RecipeStep, ExportEntry]:
+    """Run an export op WITHOUT recording it in the recipe: files go to exports/<id>/ in the project, a copy (+ the
+    JSON sidecar) to `target` if given, and one entry (settings, file, date) is appended to export_log.json.
+    Returns (the unrecorded step, for its outputs; the log entry)."""
+    import uuid  # noqa: PLC0415
+
+    if op_name not in EXPORT_OPS:
+        raise ValueError(f"{op_name} is not an export")
+    eid = uuid.uuid4().hex[:8]
+    step = run(project, op_name, params, backend, record=False, step_id=eid, out_dir=project.root / "exports" / eid)
+    file = ""
+    if target:
+        t = Path(target)
+        t.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project.root / step.outputs["export"].path, t)
+        if "sidecar" in step.outputs:
+            shutil.copy2(project.root / step.outputs["sidecar"].path, t.with_suffix(".json"))
+        file = str(t)
+    e = ExportEntry(id=eid, op=op_name, params=step.params, backend=step.backend, versions=step.versions,
+                    file=file, project_file=step.outputs["export"].path,
+                    sidecar=step.outputs["sidecar"].path if "sidecar" in step.outputs else "",
+                    sample_id=step.sample_id, map_id=step.params.get("map_id"),
+                    seconds=float(step.metrics.get("seconds", 0.0)))
+    exportlog.append(project.root, e)
+    return step, e
+
+
+def export_again(project: Project, entry_id: str, target: str | Path | None = None,
+                 backend: str | None = None) -> tuple[RecipeStep | None, ExportEntry]:
+    """Export again with the settings of a logged export (to `target`, default: the same file as before). Uses the
+    recorded backend unless `backend` overrides it."""
+    e = exportlog.get(project.root, entry_id)
+    t = target if target is not None else (e.file or None)
+    if e.op == RESULT_EXPORT:
+        if t is None:
+            raise ValueError("this export has no file to write again; choose one")
+        return None, export_result(project, e.params["step"], e.params["format"], t)
+    return export(project, e.op, e.params, backend or e.backend, t)
+
+
+# ---- results: save the figure in the backend's editable format, export as an image (fix 3.14) ---------------
+FIGURE_OPS = ("figure", "recon.figure", "grainsize.figure")
+RESULT_EXPORT = "result.export"
+EDITABLE_FORMATS = {"matlab": ("fig", "svg", "pdf"), "pymtex": ("svg", "pdf")}
+EXPORT_FORMATS = ("png", "jpg", "tif", "svg", "pdf")
+
+
+def render_figure_as(project: Project, step_id: str, fmt: str) -> Path:
+    """Draw a recorded figure step again (same op, parameters and backend, not recorded) as `fmt`: png, tif, svg,
+    pdf, fig (MATLAB only); jpg is converted from the PNG. Returns the file (in cache/save/)."""
+    import uuid  # noqa: PLC0415
+
+    s = project.recipe().step(step_id)
+    if s.op not in FIGURE_OPS:
+        raise ValueError(f"step {step_id} ({s.op}) is not a figure")
+    be = get_backend(s.backend or project.info().backend)
+    reason = be.unavailable_reason()
+    if reason:
+        raise BackendUnavailable(f"the figure was drawn by {be.name}, which is unavailable: {reason}")
+    if fmt == "fig" and be.name != "matlab":
+        raise ValueError("MATLAB .fig files can only be written by the MATLAB backend")
+    ext = ".png" if fmt == "jpg" else "." + fmt
+    out = project.cache_dir / "save" / uuid.uuid4().hex[:8]
+    ctx = OpContext(project, RecipeStep(op=s.op, params=dict(s.params), backend=be.name), dict(s.params), be, out,
+                    figure_ext=ext)
+    ctx.step.id = f"save_{step_id}"
+    out.mkdir(parents=True, exist_ok=True)
+    OPS[s.op].func(ctx)
+    f = Path(ctx.outputs["figure"][1])
+    if fmt == "jpg":
+        from PIL import Image  # noqa: PLC0415
+
+        j = f.with_suffix(".jpg")
+        with Image.open(f) as im:
+            im.convert("RGB").save(j, "JPEG", quality=95, dpi=im.info.get("dpi", (300, 300)))
+        f = j
+    return f
+
+
+def save_figure(project: Project, step_id: str, fmt: str, target: str | Path) -> Path:
+    """'Save' of a figure result: the backend's editable format (MATLAB .fig; pymtex / MATLAB .svg or .pdf vector)."""
+    t = Path(target)
+    t.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(render_figure_as(project, step_id, fmt), t)
+    return t
+
+
+def export_result(project: Project, step_id: str, fmt: str, target: str | Path) -> ExportEntry:
+    """'Export' of a figure result as png / jpg / tif / svg / pdf, logged in the export log (not a recipe step)."""
+    if fmt not in EXPORT_FORMATS:
+        raise ValueError(f"format {fmt!r}; choose one of {EXPORT_FORMATS}")
+    t = save_figure(project, step_id, fmt, target)
+    s = project.recipe().step(step_id)
+    return exportlog.append(project.root, ExportEntry(op=RESULT_EXPORT, params={"step": step_id, "format": fmt,
+                                                                                 "figure_op": s.op, **{k: v for k, v in s.params.items() if k in ("map_id", "kind")}},
+                                                      backend=s.backend, versions=s.versions, file=str(t),
+                                                      sample_id=s.sample_id, map_id=s.params.get("map_id")))
 
 
 def record_sheet(project: Project, map_id: str) -> RecipeStep | None:
@@ -451,6 +560,28 @@ def delete_steps(project: Project, ids: list[str] | set[str], label: str, only_u
     history.commit(project, f"{label} ({len(gone)} step{'s' if len(gone) != 1 else ''})", before)
     _release_steps(project, gone)
     return plan
+
+
+def delete_step(project: Project, step_id: str, dependents: str = "delete") -> dict:
+    """Delete one step (History right-click, fix 3.13). Later steps that use it are deleted too (dependents='delete')
+    or kept and marked stale (dependents='stale'). One undo entry. Returns plan_delete's dict + {stale: [ids]}."""
+    if dependents not in ("delete", "stale"):
+        raise ValueError("dependents must be 'delete' or 'stale'")
+    plan = plan_delete(project, [step_id])
+    if dependents == "delete":
+        res = delete_steps(project, plan["delete"], f"delete step {step_id}")
+        return {**res, "stale": []}
+    before = history.snapshot(project)
+    r = project.recipe()
+    deps = set(plan["dependents"])
+    r.steps = [s for s in r.steps if s.id != step_id]
+    for s in r.steps:
+        if s.id in deps:
+            s.stale = True
+    project.save_recipe(r)
+    history.commit(project, f"delete step {step_id} ({len(deps)} later step(s) stale)", before)
+    _release_steps(project, {step_id} | deps)
+    return {"delete": [step_id], "dependents": [], "kept": [], "stale": [i for i in plan["dependents"]]}
 
 
 def undo(project: Project) -> str | None:
@@ -637,6 +768,11 @@ def run_recipe(target: Project, steps: list[RecipeStep], backend: str | None = N
                     rep.input_changes.append(f"{s.id}: input changed: {p}")
         if on_step:
             on_step(k, len(todo), s)
+        if s.op in EXPORT_OPS:                # old / hand-written recipes: exports go to the export log (fix 3.4)
+            new, _e = export(target, s.op, s.params, backend=backend or s.backend)
+            rep.steps.append(StepRun(step_id=new.id, op=new.op, map_id=new.params.get("map_id"), backend=new.backend,
+                                     seconds=new.metrics.get("seconds", 0.0)))
+            continue
         new = run(target, s.op, s.params, backend=backend or s.backend, step_id=s.id)
         rep.steps.append(StepRun(step_id=new.id, op=new.op, map_id=new.params.get("map_id"), backend=new.backend,
                                  seconds=new.metrics.get("seconds", 0.0)))

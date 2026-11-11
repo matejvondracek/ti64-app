@@ -19,6 +19,7 @@ from typing import Any, Literal
 import numpy as np
 from pydantic import BaseModel
 
+from . import progress
 from .backends import get_backend
 from .backends.base import RenderSpec
 from .hashing import json_hash
@@ -101,7 +102,10 @@ def _recon_spec(ctx, map_id: str, lp: LayerParams):
         vec = _ipf_vector(ctx.project.sample(map_id), d, lp.custom_vector or s.custom_vector)
         rd = ReconData.from_arrays(step_npz(ctx, rid, "recon"))
         pg = pmap["prop_parent_grain"].astype(np.int64)
-        gcol = ctx.backend.ipf_colors_quat(handle(), BETA, rd.grain["mean_quat"], key, vec)
+        # only the crystal symmetry of the map is needed: in the viewer any live object (or the load step) instead of
+        # rebuilding the reconstruction's source (load + cleanup again after a restart, fix 3.8)
+        hq = handle() if ctx.step.op != "view" or handle_alive(ctx, src) else _any_map_handle(ctx, map_id)
+        gcol = ctx.backend.ipf_colors_quat(hq, BETA, rd.grain["mean_quat"], key, vec)
         lut = np.full(max(int(pg.max(initial=0)), int(rd.grain["id"].max(initial=0))) + 1, -1)
         lut[rd.grain["id"]] = np.arange(rd.grain["id"].size)
         rgb = np.full((n, 3), np.nan)
@@ -178,6 +182,7 @@ def layout_for(project: Project, map_id: str, step_id: str, output: str = "ebsd"
     """Brick cell layout of the points of a step's map output (cached per step)."""
     k = f"{project.root}|{step_id}"
     if k not in _LAYOUTS:
+        progress.report("building grid", 0.6)
         s = project.recipe().step(step_id)
         with np.load(project.root / s.outputs[output].path, allow_pickle=False) as z:
             x, y = z["x"], z["y"]
@@ -185,16 +190,64 @@ def layout_for(project: Project, map_id: str, step_id: str, output: str = "ebsd"
     return _LAYOUTS[k]
 
 
+def _op_of(project: Project, step_id: str | None) -> str | None:
+    try:
+        return project.recipe().step(step_id).op if step_id else None
+    except KeyError:
+        return None
+
+
 def _hex(c) -> str:
     return "#%02x%02x%02x" % tuple(int(round(255 * float(v))) for v in c[:3])
 
 
-def _cache_key(project: Project, map_id: str, lp: LayerParams, backend: str, extra: Any = None) -> str:
-    r = project.recipe()
-    steps = [(s.id, s.stale) for s in r.steps if s.params.get("map_id") == map_id and s.op in DATA_OPS]
+def _newest(steps: list[RecipeStep], ops: tuple[str, ...], **match) -> str | None:
+    """Id of the newest non-stale step (as service.latest_step, on an already parsed recipe)."""
+    live = [s for s in steps if not s.stale and all(s.params.get(k) == v for k, v in match.items())]
+    for o in ops:
+        hits = [s for s in live if s.op == o]
+        if hits:
+            return hits[-1].id
+    return None
+
+
+def newest_grains(steps: list[RecipeStep], map_id: str, target: str = "alpha") -> str | None:
+    """Newest current grains.calc of a map on the alpha map ('alpha') or on the reconstructed prior-beta map ('beta':
+    its source is a recon.run step, fix 3.10)."""
+    recon = {s.id for s in steps if s.op == "recon.run"}
+    hits = [s for s in steps if s.op == "grains.calc" and not s.stale and s.params.get("map_id") == map_id
+            and ((s.params.get("source") in recon) == (target == "beta"))]
+    return hits[-1].id if hits else None
+
+
+def layer_deps(steps: list[RecipeStep], map_id: str, lp: LayerParams, overlay: str | None = None) -> list:
+    """The recipe steps a layer (or an overlay) is drawn from, resolved as figure_spec / overlay_segments resolve
+    them. Fix 3.8: the cache key used to contain EVERY data step of the map, so a new grains.calc, KAM or
+    reconstruction recoloured the IPF map, which rebuilt the backend objects (load + cleanup again: 5 s pymtex, ~30 s
+    MATLAB) on the next view."""
+    m = {"map_id": map_id}
+    if overlay is not None:
+        if overlay in ("hagb", "lagb", "interface", "burgers"):
+            return [lp.grains or newest_grains(steps, map_id, "alpha")]
+        if overlay == "beta_gb":
+            return [lp.recon or _newest(steps, ("recon.run",), **m)]
+        return []
+    if lp.kind in RECON_KINDS:
+        return [lp.recon or _newest(steps, ("recon.run",), **m)]
+    deps = [lp.source or _newest(steps, ("ebsd.cleanup", "ebsd.load"), **m)]
+    if lp.kind in ("kam", "grod", "gos", "gnd"):
+        deps.append(lp.values or _newest(steps, ("map.compute",), **m, kind=lp.kind))
+    return deps
+
+
+def _cache_key(project: Project, map_id: str, lp: LayerParams, backend: str, extra: Any = None,
+               overlay: str | None = None) -> str:
+    deps = layer_deps(project.recipe().steps, map_id, lp, overlay)
     style = load_settings().figure.model_dump(mode="json")
-    sheet = project.sample(map_id).model_dump(mode="json")
-    return json_hash([map_id, lp.model_dump(mode="json"), backend, steps, style, sheet, extra])[7:31]
+    # only what colours a map: the file, its input state and the build direction (IPF along "build"); a note, the
+    # position or the 4PB geometry do not recolour it
+    sheet = project.sample(map_id).model_dump(mode="json", include={"map_file", "input_state", "build_direction"})
+    return json_hash([map_id, lp.model_dump(mode="json"), backend, deps, style, sheet, extra])[7:31]
 
 
 def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | None = None) -> Layer:
@@ -206,6 +259,8 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
             return _LAYERS[key]
     f = project.cache_dir / "viewer" / f"layer_{key}.npz"
     if f.is_file():
+        src_op = _op_of(project, lp.source or (layer_deps(project.recipe().steps, map_id, lp) or [None])[0])
+        progress.report("cleanup from cache" if src_op == "ebsd.cleanup" else "reading cached map", 0.5)
         with np.load(f, allow_pickle=False) as z:
             colors = z["colors"]
             info = json.loads(str(z["info"]))
@@ -213,6 +268,7 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
     else:
         ctx = view_context(project, backend)
         spec, _h, meta, src = layer_spec(ctx, map_id, lp)
+        progress.report("colouring map", 0.75)
         colors, cinfo = ctx.backend.measurement_colors(spec)
         info = {"title": spec.title, "colorbar_label": spec.colorbar_label,
                 "clim": list(cinfo["clim"]) if cinfo.get("clim") else None, "cmap": cinfo.get("cmap"),
@@ -227,6 +283,7 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
         _LAYERS[key] = L
         while len(_LAYERS) > 12:                     # ~10 MB each on the full maps
             _LAYERS.pop(next(iter(_LAYERS)))
+    progress.report("drawing", 0.95)                 # the viewer requests its tiles next
     return L
 
 
@@ -240,7 +297,7 @@ def get_overlay(project: Project, map_id: str, name: str, lp: LayerParams, backe
     backend = backend or project.info().backend
     extra = [name, style] + ([a.model_dump(mode="json") for a in load_annotations(project, map_id)
                               if a.type == "crack"] if name == "crack" else [])
-    key = _cache_key(project, map_id, LayerParams(grains=lp.grains, recon=lp.recon), backend, extra)
+    key = _cache_key(project, map_id, LayerParams(grains=lp.grains, recon=lp.recon), backend, extra, overlay=name)
     with _LOCK:
         if key in _OVERLAYS:
             return _OVERLAYS[key]
@@ -287,7 +344,8 @@ def stored_data(project: Project, step_id: str) -> dict[str, bool]:
 
 
 ALPHA_OVERLAYS = ("hagb", "lagb", "interface", "burgers", "crack")       # from the alpha grains (alpha map tab)
-BETA_OVERLAYS = ("beta_gb", "crack")                                     # from the parent grains (prior-beta tab)
+BETA_OVERLAYS = ("beta_gb", "hagb", "lagb", "crack")     # parent grains of the reconstruction; HAGB / LAGB of the
+                                                         # prior-beta grains (grains.calc on the parent map, fix 3.10)
 
 
 def available(project: Project, map_id: str, tab: str | None = None) -> dict:
@@ -310,10 +368,18 @@ def available(project: Project, map_id: str, tab: str | None = None) -> dict:
     if "recon.run" in ops:
         layers += list(RECON_KINDS)
     overlays = []
-    if "grains.calc" in ops:
-        overlays += ["hagb", "lagb", "interface", "burgers"]
-    if "recon.run" in ops:
-        overlays.append("beta_gb")
+    steps = project.recipe().steps
+    g_alpha, g_beta = newest_grains(steps, map_id, "alpha"), newest_grains(steps, map_id, "beta")
+    if tab == "beta":
+        if "recon.run" in ops:
+            overlays.append("beta_gb")
+        if g_beta:
+            overlays += ["hagb", "lagb"]
+    else:
+        if g_alpha:
+            overlays += ["hagb", "lagb", "interface", "burgers"]
+        if "recon.run" in ops and tab is None:
+            overlays.append("beta_gb")
     try:
         if any(a.type == "crack" for a in load_annotations(project, map_id)):
             overlays.append("crack")
@@ -322,13 +388,14 @@ def available(project: Project, map_id: str, tab: str | None = None) -> dict:
     if tab in ("alpha", "beta"):
         overlays = [o for o in overlays if o in (BETA_OVERLAYS if tab == "beta" else ALPHA_OVERLAYS)]
     return {"layers": layers, "overlays": overlays, "loaded": bool(ops & {"ebsd.load"}),
-            "grainsize": any(s.op == "grainsize.run" for s in r), "recon": "recon.run" in ops}
+            "grainsize": any(s.op == "grainsize.run" for s in r), "recon": "recon.run" in ops,
+            "grains_alpha": g_alpha, "grains_beta": g_beta}
 
 
 def key_pngs(project: Project, map_id: str, lp: LayerParams, backend: str | None = None) -> list:
     """IPF colour key PNG(s) of the phases a layer shows (viewer legend), drawn by the backend outside the recipe
     and cached in cache/viewer/: alpha (+ beta when the map has beta) for 'ipf', beta for 'parent_ipf'."""
-    from .ops_ebsd import _ipf_vector, resolve_source  # noqa: PLC0415
+    from .ops_ebsd import _ipf_vector  # noqa: PLC0415
 
     if lp.kind not in ("ipf", "parent_ipf"):
         return []
@@ -344,8 +411,34 @@ def key_pngs(project: Project, map_id: str, lp: LayerParams, backend: str | None
         f = project.cache_dir / "viewer" / f"key_{json_hash([backend, ph, k['key'], vec])[7:23]}.png"
         if not f.is_file():
             ctx = ctx or view_context(project, backend)
-            src = resolve_source(ctx, map_id, None)
             f.parent.mkdir(parents=True, exist_ok=True)
-            ctx.backend.render_key(ctx.use(src), ph, k["key"], vec, f, min(style.dpi, 200))
+            ctx.backend.render_key(_any_map_handle(ctx, map_id), ph, k["key"], vec, f, min(style.dpi, 200))
         out.append(f)
     return out
+
+
+def handle_alive(ctx, step_id: str) -> bool:
+    """The backend object of a step exists in this session (no rebuild needed)."""
+    from .service import SESSION  # noqa: PLC0415
+
+    h = SESSION.get((str(ctx.project.root), step_id, ctx.backend.name))
+    return h is not None and h.id in set(ctx.backend.handles())
+
+
+def _any_map_handle(ctx, map_id: str):
+    """A backend object of the map for things that need only its phases / crystal symmetries (the IPF key): one that
+    is alive already (load or cleanup), else the load step, which is rebuilt much faster than a cleanup (fix 3.8: the
+    key used to rebuild the newest cleanup, i.e. load + cleanup again, just to draw the key)."""
+    from .service import SESSION, latest_step  # noqa: PLC0415
+
+    steps = [s for s in ctx.project.recipe().steps if not s.stale and s.params.get("map_id") == map_id
+             and s.op in ("ebsd.cleanup", "ebsd.load")]
+    alive = set(ctx.backend.handles())
+    for s in reversed(steps):
+        h = SESSION.get((str(ctx.project.root), s.id, ctx.backend.name))
+        if h is not None and h.id in alive:
+            return h
+    load = latest_step(ctx.project, ("ebsd.load",), map_id=map_id)
+    if load is None:
+        raise KeyError(f"map {map_id!r} is not loaded yet: run ebsd.load first")
+    return ctx.use(load.id)

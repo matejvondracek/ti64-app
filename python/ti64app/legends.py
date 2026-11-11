@@ -33,11 +33,21 @@ class LegendItem(BaseModel):
     y: float = Field(0.88, description="top edge, fraction of the map or image height")
     w: float = Field(0.2, gt=0, le=50.0, description="width, fraction of the map or image width")
     frame: Literal["map", "image"] = "image"
+    # snapping (fix 3.12): the viewer places an anchored item in that corner / edge centre of the map at `margin`
+    # (fraction of the map width; None = the view's default) and stores the resulting x / y / w, so exports need
+    # nothing else; auto = width follows the map (AUTO_W), a manual resize switches it off
+    anchor: Literal["tl", "tc", "tr", "bl", "bc", "br"] | None = None
+    margin: float | None = Field(None, ge=0, le=0.25)
+    auto: bool = False
+
+
+AUTO_W = {"scale_bar": 0.22, "colorbar": 0.3, "ipf_key": 0.18}
+DEFAULT_ANCHOR = {"scale_bar": "bl", "colorbar": "br", "ipf_key": "tr"}
 
 
 def default_item(kind: str) -> LegendItem:
     x, y, w = DEFAULTS[kind]
-    return LegendItem(kind=kind, x=x, y=y, w=w, frame="map")
+    return LegendItem(kind=kind, x=x, y=y, w=AUTO_W[kind], frame="map", anchor=DEFAULT_ANCHOR[kind], auto=True)
 
 
 def in_region(items: list[LegendItem] | None, extent: tuple[float, float, float, float],

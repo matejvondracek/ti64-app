@@ -78,7 +78,8 @@ def cmd_stitch(a) -> int:
     params = {"folder": str(Path(folder).absolute()) if folder else None,
               "files": [str(Path(f).absolute()) for f in files] if files else None,
               "detector": a.detector, "se_layout": a.se_layout, "info_strip": a.info_strip, "blend": a.blend,
-              "exclude": a.exclude or [], "strip_px": a.strip_px, "seam": a.seam, "blend_band_px": a.band}
+              "exclude": a.exclude or [], "strip_px": a.strip_px, "seam": a.seam, "blend_band_px": a.band,
+              "use_stage": not a.no_stage}
 
     def show(msg: str, frac: float) -> None:
         print(f"\r{msg:<40} {frac * 100:5.1f} %", end="", file=sys.stderr, flush=True)
@@ -140,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--band", type=int, default=32, help="blending band width around a seam (px)")
     st.add_argument("--exclude", nargs="*", help="file stems or image numbers to leave out")
     st.add_argument("--strip-px", type=int, help="manual data-bar height (px)")
+    st.add_argument("--no-stage", action="store_true",
+                    help="do not use the stage positions: placement only from image matching (e.g. a faulty stage)")
     st.add_argument("--project", help="target project (default: new stitch_<folder>_<time>)")
     st.add_argument("--scan", action="store_true", help="only show the detector counts / data bars, do not stitch")
     st.add_argument("--json", action="store_true")

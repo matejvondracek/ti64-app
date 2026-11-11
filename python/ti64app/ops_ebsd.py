@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from .backends.base import (BURGERS_TYPES, CleanupParams, GrainParams, MapParams, RenderSpec,
                             cleanup_params_for)
+from . import progress
 from .service import OpContext, latest_step, op
 from .settings import IpfKeySetting
 
@@ -50,6 +51,8 @@ def _ebsd_cleanup(ctx: OpContext) -> None:
         raise ValueError(f"unknown cleanup parameters: {sorted(unknown)}")
     cp = cleanup_params_for(sheet.input_state, p.overrides)
     h = ctx.use(src)
+    # materialize (viewer / later step needs the cleaned map object after an app restart): the cleanup runs again
+    progress.report("repeating cleanup" if ctx.need_object else "cleanup", 0.5)
     new, rep = ctx.backend.cleanup(h, cp)
     ctx.remember(new)
     data = ctx.backend.get_ebsd(new)
@@ -116,15 +119,40 @@ def _hex_rgb(c: str) -> tuple[float, float, float]:
 # ---- grains -----------------------------------------------------------------------------------
 class GrainsCalcParams(BaseModel):
     map_id: str
-    source: str | None = None
+    source: str | None = None                 # map step (load / cleanup) or a recon.run step = prior-beta grains
     grains: GrainParams = Field(default_factory=GrainParams)
     boundaries: BoundaryParams = Field(default_factory=BoundaryParams)
 
 
+def grains_target(project, step) -> str:
+    """'beta' for a grains.calc step on the reconstructed parent map (source = a recon.run step), else 'alpha'."""
+    src = step.params.get("source")
+    if not src:
+        return "alpha"
+    try:
+        return "beta" if project.recipe().step(src).op == "recon.run" else "alpha"
+    except KeyError:
+        return "alpha"
+
+
+def resolve_grains(ctx: OpContext, map_id: str, grains: str | None, target: str = "alpha") -> str:
+    """grains.calc step: the given one, else the newest current one of the map on the alpha map ('alpha') or on the
+    prior-beta map ('beta', fix 3.10). Alpha steps (KAM, grain size, alpha overlays) never pick prior-beta grains."""
+    if grains:
+        return grains
+    steps = [s for s in ctx.project.recipe().steps if s.op == "grains.calc" and not s.stale
+             and s.params.get("map_id") == map_id and grains_target(ctx.project, s) == target]
+    if not steps:
+        raise KeyError(f"map {map_id!r} has no {'prior-β ' if target == 'beta' else ''}grains yet: run "
+                       f"'Grains and boundaries'{' on the prior β tab' if target == 'beta' else ''} first")
+    return steps[-1].id
+
+
 @op("grains.calc", GrainsCalcParams, uses_backend=True)
 def _grains_calc(ctx: OpContext) -> None:
-    """Alpha grain segmentation (HAGB 15°, LAGB 2° inside grains by default) and the boundary
-    table with misorientation and nearest Burgers alpha/alpha type per segment."""
+    """Grain segmentation (HAGB 15°, LAGB 2° inside grains by default) and the boundary table with misorientation
+    and nearest Burgers alpha/alpha type per segment: alpha grains of a loaded / cleaned map, or prior-beta grains of
+    the reconstructed parent map when source is a recon.run step (GUI: 'Grains and boundaries' on the prior β tab)."""
     p = GrainsCalcParams.model_validate(ctx.params)
     src = resolve_source(ctx, p.map_id, p.source)
     gh = ctx.backend.calc_grains(ctx.use(src), p.grains)
@@ -160,7 +188,7 @@ class MapComputeParams(MapParams):
 def _map_compute(ctx: OpContext) -> None:
     """KAM (kernel order + cutoff), GROD, GOS or GND per pixel, inside the grains of a grains.calc step."""
     p = MapComputeParams.model_validate(ctx.params)
-    gsrc = resolve_source(ctx, p.map_id, p.grains, ("grains.calc",))
+    gsrc = resolve_grains(ctx, p.map_id, p.grains)
     gh = ctx.use(gsrc, "grains")
     v = ctx.backend.compute_map(gh, MapParams(**{k: getattr(p, k) for k in MapParams.model_fields}))
     ok = ~np.isnan(v)
@@ -236,7 +264,7 @@ def overlay_segments(ctx: OpContext, map_id: str, overlays: list[str], grains: s
     used: dict[str, str] = {}
     gb = cls = None
     if any(o in ("hagb", "lagb", "interface", "burgers") for o in overlays):
-        gsrc = resolve_source(ctx, map_id, grains, ("grains.calc",))
+        gsrc = resolve_grains(ctx, map_id, grains)
         gstep = ctx.project.recipe().step(gsrc)
         gp = GrainParams(**gstep.params["grains"])
         bp = BoundaryParams(**gstep.params["boundaries"])
@@ -335,12 +363,25 @@ def figure_spec(ctx: OpContext, p: FigureParams):
         phases = p.phases or [names[k] for k in sorted(names) if (phase == k).any()]
         rgb = np.full((phase.size, 3), np.nan)
         keys = {}
+        # viewer, source object not alive (app restarted, cache cleared): colour the STORED orientations through any
+        # live object of the map (or its load step) instead of rebuilding the source; a cleaned map would otherwise
+        # be loaded and cleaned again just to colour it (fix 3.8). Same orientations, same key -> same colours.
+        from .layers import _any_map_handle, handle_alive  # noqa: PLC0415
+
+        by_quat = ctx.step.op == "view" and not handle_alive(ctx, src)
+        hq = _any_map_handle(ctx, p.map_id) if by_quat else None
         for ph in phases:
             s = (p.ipf_keys or {}).get(ph) or style.ipf.get(ph) or IpfKeySetting()
             key = p.key or s.key
             vec = _ipf_vector(sheet, p.direction or s.direction, p.custom_vector or s.custom_vector)
             keys[ph] = {"key": key, "direction": p.direction or s.direction, "vector": list(vec)}
-            c = ctx.backend.ipf_colors(handle(), ph, key, vec)
+            if by_quat:
+                k = next(n for n, v in names.items() if v == ph)
+                m = phase == k
+                c = np.full((phase.size, 3), np.nan)
+                c[m] = ctx.backend.ipf_colors_quat(hq, ph, data["quat"][m], key, vec)
+            else:
+                c = ctx.backend.ipf_colors(handle(), ph, key, vec)
             m = ~np.isnan(c[:, 0])
             rgb[m] = c[m]
         meta["keys"] = keys
@@ -430,7 +471,7 @@ def _figure(ctx: OpContext) -> None:
     from .settings import load_settings  # noqa: PLC0415
 
     p = FigureParams.model_validate(ctx.params)
-    out_png = ctx.out_dir / "figure.png"
+    out_png = ctx.out_dir / f"figure{ctx.figure_ext}"          # .png; .svg / .pdf / .fig for "Save" (fix 3.14)
     if p.kind == "ipf_key":
         style = load_settings().figure
         sheet = ctx.project.sample(p.map_id)
