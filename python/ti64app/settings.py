@@ -51,9 +51,9 @@ class FigureStyle(BaseModel):
 
 
 class FeedbackSettings(BaseModel):
-    """Feedback button (fix 3.2): where issues / e-mails go."""
+    """Feedback button (fix 3.2): where GitHub issues go (the e-mail option was removed in fix 4; an 'email' key in
+    old preference files is ignored)."""
     repo_url: str = "https://github.com/matejvondracek/ti64-app"
-    email: str = "vondrm34@cvut.cz"
 
 
 class Settings(BaseModel):

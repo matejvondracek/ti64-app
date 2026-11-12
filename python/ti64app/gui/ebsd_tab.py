@@ -792,7 +792,7 @@ def ebsd_page() -> None:
         if L.info.get("source") == load.id:
             viewer["v"].set(alt_layer_url=tiles.layer_url(tiles.register_layer(L)))
             return
-        k = kind.value if kind.value in ("ipf", "phase", "ci", "iq", "fit") else "ipf"
+        k = kind.value if kind.value in ("ipf", "phase", "ci", "iq", "fit", *lay.PRIAS_KINDS) else "ipf"
         try:
             O = await ng_run.io_bound(lay.get_layer, p, st["map"], layer_params(source=load.id, k=k))
             if viewer["v"] is not None:
@@ -887,6 +887,18 @@ def ebsd_page() -> None:
         if not av["loaded"] and autoload:
             # fix 2: the selected map loads by itself (progress bar under the edit menu); sample and build direction
             # are not needed for loading
+            try:                                   # fix 4: phases the crystal symmetry cannot tell apart
+                from ..phases import for_file  # noqa: PLC0415
+
+                sh = p.sample(m)
+                if sh.map_file.lower().endswith(".ang"):
+                    for_file(sh.map_file, sh.phase_map, m)
+            except Exception as e:  # noqa: BLE001
+                from ..sample import SheetIncomplete  # noqa: PLC0415
+
+                if isinstance(e, SheetIncomplete):
+                    not_ready(str(e), "Open map sheet", lambda: ui.navigate.to(f"/files?sel={m}"))
+                    return
             loading(m)
             step = await run_step("ebsd.load", {}, f"loading {m}", channel=st["pch"])
             if st["map"] != m:                     # the user picked another map meanwhile
@@ -1104,7 +1116,7 @@ def ebsd_page() -> None:
                 async def apply_ipf():
                     await show()
                     fk = kind.value if kind.value in ("ipf", "phase", "ci", "iq", "fit", "kam", "grod", "gos", "gnd",
-                                                      "boundaries", "burgers") else None
+                                                      "boundaries", "burgers", *lay.PRIAS_KINDS) else None
                     if fk:
                         lp = layer_params()
                         step = await run_step("figure", {"kind": fk, "overlays": list(st["ovsel"]),

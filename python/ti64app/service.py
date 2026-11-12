@@ -124,6 +124,9 @@ def _sample_set(ctx: OpContext) -> None:
     ctx.output("sample", "json", sheet.model_dump(mode="json"))
 
 
+LOAD_CACHE_VERSION = 2       # 2: phases renamed by symmetry, MATLAB single-phase numbering fixed (fix 4)
+
+
 class EbsdLoadParams(BaseModel):
     map_id: str
     setting: int = 2
@@ -135,12 +138,21 @@ def _ebsd_load(ctx: OpContext) -> None:
     p = EbsdLoadParams.model_validate(ctx.params)
     sheet = ctx.project.sample(p.map_id)
     ctx.add_input(sheet.map_file)
-    lp = LoadParams(file=Path(sheet.map_file), input_state=sheet.input_state, setting=p.setting)
-    # loaded-map cache per backend (CLAUDE.md): keyed by file fingerprint, input state, setting, backend + versions.
-    # A recorded load whose map is cached takes its data from there; the backend object is made only when a later
-    # step needs it (materialize -> need_object)
+    # phases by crystal symmetry, renamed to 'Ti (alpha)' / 'Ti (beta)' in both backends (ti64app.phases); stops with
+    # a map-sheet message when the symmetry does not decide and the user has not chosen
+    phases = []
+    if Path(sheet.map_file).suffix.lower() == ".ang":
+        from .phases import for_file  # noqa: PLC0415
+
+        phases = for_file(sheet.map_file, sheet.phase_map, p.map_id)
+    lp = LoadParams(file=Path(sheet.map_file), input_state=sheet.input_state, setting=p.setting,
+                    phase_names={ph.id: ph.name for ph in phases})
+    extra = {"input_state": sheet.input_state, "map_id": p.map_id, "phases": [ph.as_dict() for ph in phases]}
+    # loaded-map cache per backend (CLAUDE.md): keyed by file fingerprint, input state, setting, phase names, backend +
+    # versions. A recorded load whose map is cached takes its data from there; the backend object is made only when a
+    # later step needs it (materialize -> need_object)
     key = json_hash([ctx.step.inputs[-1].fingerprint, lp.input_state, lp.setting, ctx.backend.name,
-                     ctx.backend.versions()])[7:31]
+                     ctx.backend.versions(), {str(k): v for k, v in lp.phase_names.items()}, LOAD_CACHE_VERSION])[7:31]
     cdir = ctx.project.cache_dir / "maps"
     cnpz, cmeta = cdir / f"{ctx.backend.name}_{key}.npz", cdir / f"{ctx.backend.name}_{key}.json"
     t0 = time.perf_counter()
@@ -151,7 +163,7 @@ def _ebsd_load(ctx: OpContext) -> None:
             data = EBSDData.from_npz(cnpz, meta)
             ctx.metrics.update(cached=1.0, load_s=round(time.perf_counter() - t0, 2), n_points=data.n)
             ctx.output("ebsd", "npz", data)
-            ctx.output("meta", "json", {**data.meta(), "input_state": sheet.input_state, "map_id": p.map_id})
+            ctx.output("meta", "json", {**data.meta(), **extra})
             return
         except (OSError, ValueError, KeyError):
             pass                                          # damaged cache entry: load again
@@ -163,7 +175,7 @@ def _ebsd_load(ctx: OpContext) -> None:
     ctx.remember(h)
     ctx.metrics.update(load_s=round(t1 - t0, 2), transfer_s=round(t2 - t1, 2), n_points=data.n)
     ctx.output("ebsd", "npz", data)
-    ctx.output("meta", "json", {**data.meta(), "input_state": sheet.input_state, "map_id": p.map_id})
+    ctx.output("meta", "json", {**data.meta(), **extra})
     if not cnpz.is_file():
         try:
             cdir.mkdir(parents=True, exist_ok=True)
@@ -186,7 +198,8 @@ def _up2_header(ctx: OpContext) -> None:
     ctx.add_input(f)
     h = up2_io.read_header(f)
     d = {k: getattr(h, k) for k in h.__dataclass_fields__}
-    d.update(n_patterns=h.n_patterns, expected_size=h.expected_size, size_ok=h.size_ok)
+    d.update(n_patterns=h.n_patterns, n_points=h.n_points, n_padding=h.n_padding, expected_size=h.expected_size,
+             size_ok=h.size_ok)
     ctx.output("header", "json", d)
 
 
@@ -313,6 +326,10 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
     before = history.snapshot(project) if record else None     # undo point (state files only)
     if record:
         _mark_running(project, step)
+    from . import breadcrumbs  # noqa: PLC0415
+
+    what = f"{op_name} {params.get('map_id') or ''}".strip() + ("" if record else " (not recorded)")
+    breadcrumbs.add("step", f"start {what} [{be.name if be else 'no backend'}]")
     t0 = time.perf_counter()
     try:
         try:
@@ -327,7 +344,8 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
             NOTICES.append(f"{e} The step '{op_name}' was run again after the restart.")
         step.params = ctx.params                 # ops record resolved values (e.g. source step, preset)
         step.outputs = {n: _write_output(ctx, n, *o) for n, o in ctx.outputs.items()}
-    except Exception:
+    except Exception as e:
+        breadcrumbs.add("step", f"FAILED {what} after {time.perf_counter() - t0:.1f} s: {type(e).__name__}: {e}")
         shutil.rmtree(ctx.out_dir, ignore_errors=True)
         if before:
             history.discard(project, before)
@@ -335,6 +353,7 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
             project.clear_interrupted()
         raise
     step.metrics = {**step.metrics, **ctx.metrics, "seconds": round(time.perf_counter() - t0, 2), **_memory_GB()}
+    breadcrumbs.add("step", f"done {what} ({step.id}) in {step.metrics['seconds']:g} s")
     if record:
         project.clear_interrupted()
         for i in step.inputs:                    # size + mtime of linked files when used ("changed" warning)

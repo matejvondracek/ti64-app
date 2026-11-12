@@ -88,3 +88,28 @@ def dilation_fill(to_fill: np.ndarray, grain_id: np.ndarray, source_ok: np.ndarr
         todo = todo[~anyok]
         sweeps += 1
     return src, sweeps
+
+
+def component_sizes(mask: np.ndarray, nbr: np.ndarray) -> np.ndarray:
+    """Per pixel: size of its connected region within `mask` (neighbours from neighbour_table), 0 outside the mask.
+    Used for not-indexed regions that the grain reconstruction leaves without a grain (MTEX 7.2 / pymtex 1.0
+    calcGrains with alpha = 0 give large not-indexed regions grain id 0, phase 6.6 fix 4): their real size decides
+    whether they are a small void (filled) or not. matlab/+ti64/cleanup.m does the same with conncomp."""
+    from scipy.sparse import coo_matrix  # noqa: PLC0415
+    from scipy.sparse.csgraph import connected_components  # noqa: PLC0415
+
+    mask = np.asarray(mask, bool).ravel()
+    out = np.zeros(mask.size, np.int64)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return out
+    loc = np.full(mask.size, -1, np.int64)
+    loc[idx] = np.arange(idx.size)
+    nb = nbr[idx]
+    ok = (nb >= 0) & mask[np.where(nb >= 0, nb, 0)]
+    r = np.repeat(np.arange(idx.size), nb.shape[1])[ok.ravel()]
+    c = loc[nb.ravel()[ok.ravel()]]
+    g = coo_matrix((np.ones(r.size, np.int8), (r, c)), shape=(idx.size, idx.size))
+    _, lab = connected_components(g, directed=False)
+    out[idx] = np.bincount(lab)[lab]
+    return out

@@ -88,16 +88,23 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
   - data/reference/: earlier results to reproduce (copy of EBSD_data/JU from my Research Assignment).
   - data/test/stitch/: JEOL SEM tiles for stitching tests: 8 positions x (BSE "BED-C" + SE "SED")
     .bmp + .txt in one folder; filter by $SM_DETECTOR / file name, never mix detectors.
+  - data/JU04, JU05, JU06: SEM images (.bmp + .txt, mixed magnifications), RAW APEX .ang exports
+    (JU04_area1-4; JU06_compression / _tensile / _tensile_mid / _tensile_crack = the 4PB maps),
+    PRIAS text exports, and two hex .up2 files in JU04 paired with JU04_area1/2.ang by scan ID.
 - .ang files are TSL/OIM exports, possibly HEXAGONAL grid. Each map has an input-state toggle
   raw | OIM-cleaned (set by the user, auto-suggested from the file name); it selects the cleanup/CI/KAM
   preset, is part of the cache key, and changing it marks all downstream results stale.
   Load with EDAX setting 2 in both backends (MATLAB: EBSD.load(f,'setting',2); pymtex:
   loadEBSD(f, setting=2)) and use the same plotting convention in both (east = x, out of screen = -z).
   Verify the IPF map against an OIM screenshot before trusting any reference-frame-dependent result.
-- The test .ang files declare PRIAS columns in the header but every data row has only 10 columns:
-  there is no PRIAS data. Fit is constant 180 and SEM is 0, so only CI and IQ are usable. Use the IQ map
-  as the reference image for BSE registration; virtual BSE exists only where patterns exist (.up2).
-  If a future export does contain PRIAS columns, read them from the .ang text (pymtex 1.0 ignores them).
+- .ang exports declare PRIAS columns in the header, but the data rows have only 10 columns (no PRIAS);
+  Fit is constant 180 and SEM 0, so only CI and IQ are usable. PRIAS comes from separate OIM text exports
+  <map>_prias.txt (x y value 0 0, channel name in the header). Use PRIAS (else IQ) as the registration
+  reference for BSE images. If an .ang ever contains PRIAS columns, read them from the text.
+- APEX .ang exports name phases "Ti (Titanium, alpha)" / "Ti (Titanium, beta)": identify phases by
+  crystal symmetry (6/mmm alpha, m-3m beta), never by name.
+- Hex .up2 files with the 'extra patterns' flag hold nrows x ncols_odd patterns (one padding pattern per
+  short row). Header bytes 42-57 = scan GUID = '# SCANID' of the matching .ang.
 - .up2 = EDAX pattern file. Never load fully; stream in chunks (PyEBSDIndex or kikuchipy lazy=True).
   Neither MTEX version reads it.
 - BSE images: JEOL JSM-IT500HR; metadata from the accompanying .txt (stage X/Y/Z/T/R, WD, kV, mag, pixel size).
@@ -142,4 +149,5 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
 - Plan first, then implement; small commits per feature with tests (pytest; matlab.unittest for +ti64).
 - Build each core feature in pymtex first, then in MATLAB, then pass the conformance test.
 - After each feature, run it on the real maps in data/test/ and save a PNG for visual check (in projects/).
+- When I mention a report, first read the newest file(s) in reports/ (git-ignored, written by the app).
 - When unsure about a physical/method choice, ask instead of guessing; list assumptions in docs/decisions.md.

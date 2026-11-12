@@ -50,7 +50,8 @@ async def test_top_bar_memory_and_feedback(fproj):
         user.find(marker="feedback_btn").click()
         await user.should_see(marker="feedback_dialog")
         await user.should_see("Open GitHub issue")
-        await user.should_see("Send e-mail")
+        await user.should_see("Save report for Claude")
+        await user.should_not_see("Send e-mail")
         await user.should_see("shortened to its file name")
 
 

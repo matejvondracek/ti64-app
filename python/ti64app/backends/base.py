@@ -51,6 +51,9 @@ class LoadParams(BaseModel):
     file: Path
     input_state: InputState                # part of the cache key; selects later presets
     setting: Literal[0, 1, 2, 3, 4] = 2    # EDAX setting, docs/decisions.md D1
+    # {file phase id: name}: phases renamed at load (ti64app.phases: by crystal symmetry -> 'Ti (alpha)' /
+    # 'Ti (beta)'); both backends number the phases as in the file header (single-phase file: 1)
+    phase_names: dict[int, str] = {}
 
 
 class CleanupParams(BaseModel):

@@ -90,6 +90,12 @@ TIPS: dict[str, str] = {
     "tension_side": "Which face of the specimen is in tension (+Y or -Y). Used to suggest each map's role.",
     "input_state": "raw = straight from indexing; OIM-cleaned = already cleaned in OIM Analysis. Selects the "
                    "cleanup preset; changing it marks this map's results stale.",
+    "phases": "Which phase of the .ang is α and which is β. Found from the crystal symmetry (hexagonal 6/mmm = α, "
+              "cubic m-3m = β), never from the name (APEX writes 'Ti (Titanium, alpha)', older OIM 'Ti (alpha)'). "
+              "Change a role only when the symmetry does not decide; this marks the map's results stale.",
+    "prias": "PRIAS images exported from OIM as text next to the .ang (<map>_prias.txt: x y value per point). "
+             "Shown as grey maps in the 'Maps' list of the EBSD tab and used as the reference image when BSE / crack "
+             "images are registered to the map (else the IQ map).",
     "bd_map": "Build direction in MAP coordinates (x right, y down): angle from +x toward +y (clockwise on "
               "screen), or a vector. Not needed to load the map; steps that use it ask for it. Never guessed.",
     "position": "Where the map's first pixel sits on the specimen (sample frame, mm) and which specimen axes "

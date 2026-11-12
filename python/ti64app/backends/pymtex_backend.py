@@ -13,7 +13,7 @@ import numpy as np
 from .. import __version__
 from .base import (PHASE_NOT_INDEXED, PROP_NAMES, CleanupParams, CleanupReport, EBSDData, EBSDHandle,
                    LoadParams, file_order)
-from .hexgrid import dilation_fill, neighbour_table
+from .hexgrid import component_sizes, dilation_fill, neighbour_table
 from .pymtex_analysis import PymtexAnalysis
 
 # per-pixel cleanup flags (prop 'ti64_cleanup', same codes in the MATLAB backend)
@@ -55,7 +55,12 @@ class PymtexBackend(PymtexAnalysis):
     def load_ebsd(self, params: LoadParams) -> EBSDHandle:
         from mtex import loadEBSD  # noqa: PLC0415  (heavy import)
 
-        return self._put(loadEBSD(str(params.file), setting=params.setting), params.setting)
+        ebsd = loadEBSD(str(params.file), setting=params.setting)
+        # CSList index = file phase id (0 = notIndexed; a single-phase file's phase 0 rows are CSList 1)
+        for pid, name in params.phase_names.items():
+            if 0 < int(pid) < len(ebsd.CSList):
+                ebsd.CSList[int(pid)].mineral = name
+        return self._put(ebsd, params.setting)
 
     def _get(self, handle: EBSDHandle):
         if handle.backend != self.name or handle.id not in self._store or "ebsd" not in self._store[handle.id]                 or "grains" in self._store[handle.id]:
@@ -180,14 +185,19 @@ class PymtexBackend(PymtexAnalysis):
             n_spike = int(m.sum())
 
         gid, npx, gidx = self._grains_alpha0(w, p.noise_angle_deg)
+        nbr = neighbour_table(_arr(w.x), _arr(w.y), ~pad, hex_grid="hex" in str(w).lower())
         noise = ~pad & gidx[gid] & (npx[gid] <= p.noise_max_indexed_px)
-        void = ~pad & ~gidx[gid] & (npx[gid] <= p.noise_max_void_px)
+        # void size: the not-indexed grain's pixel count; not-indexed pixels left without a grain (grain id 0: large
+        # regions, pymtex 1.0 / MTEX 7.2) get the size of their connected not-indexed region instead of 0 (fix 4: a
+        # raw map with 78 % CI < 0.1 was filled almost entirely as if it were made of 1-px voids)
+        ni = ~pad & (ph == PHASE_NOT_INDEXED)
+        size = np.where(ni & (gid == 0), component_sizes(ni & (gid == 0), nbr), npx[gid])
+        void = ni & ~gidx[gid] & (size <= p.noise_max_void_px)
         unindex(noise, FLAG_NOISE)
         to_fill = noise | void
         n_filled = n_unfilled = 0
         if p.fill and to_fill.any():
             ok = (ph != PHASE_NOT_INDEXED) & ~pad
-            nbr = neighbour_table(_arr(w.x), _arr(w.y), ~pad, hex_grid="hex" in str(w).lower())
             src, _ = dilation_fill(to_fill, gid.copy(), ok, nbr)
             done = to_fill & (src >= 0)
             q[done] = q[src[done]]

@@ -306,7 +306,12 @@ class MatlabBackend:
 
     # -- objects ------------------------------------------------------------------------------
     def load_ebsd(self, params: LoadParams) -> EBSDHandle:
-        hid, n = self.call("ti64.loadEbsd", str(params.file), float(params.setting), nargout=2)
+        import matlab  # noqa: PLC0415
+
+        ids = sorted(params.phase_names)
+        hid, n = self.call("ti64.loadEbsd", str(params.file), float(params.setting),
+                           matlab.double([float(i) for i in ids]), [str(params.phase_names[i]) for i in ids],
+                           nargout=2)
         return EBSDHandle(self.name, str(hid), int(n))
 
     def get_ebsd(self, handle: EBSDHandle) -> EBSDData:

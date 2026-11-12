@@ -560,9 +560,7 @@ def stitch_page() -> None:
                             for q in stage_notes:
                                 ui.label("• " + q[:1].upper() + q[1:]).classes("text-xs")
                     mosaic_view(step, d, side)
-                    with ui.row().classes("gap-2"):
-                        ui.button(f"Export {d}…", icon="ios_share", on_click=lambda d=d: do_export(d)) \
-                            .props("outline").mark(f"st_export_{d}")
+                    with ui.row().classes("gap-2"):         # export: the one 'Export' button next to 'Stitch' (fix 4)
                         ui.button("Open on the View tab", icon="image_search",
                                   on_click=lambda d=d: (gs.set("view_source", f"mosaic:{step.id}:{d}"),
                                                         gs.set("view_file", None), ui.navigate.to("/view"))) \
@@ -739,7 +737,18 @@ def stitch_page() -> None:
         if step is None:
             ui.notify("Stitch first.", type="warning")
             return
-        d = d or next((x for x in ("BSE", "SE") if f"mosaic_{x}" in step.outputs), "BSE")
+        dets = [x for x in ("BSE", "SE") if f"mosaic_{x}" in step.outputs]
+        if d is None and len(dets) > 1:           # one Export button for the whole tab: ask which mosaic
+            with ui.dialog() as pick, ui.card().classes("gap-2").mark("st_export_pick"):
+                ui.label("Export which mosaic of this stitch?").classes("font-semibold")
+                with ui.row().classes("gap-2"):
+                    for x in dets:
+                        ui.button(f"{x} mosaic", on_click=lambda x=x: pick.submit(x)).mark(f"st_export_{x}")
+                    ui.button("Cancel", on_click=lambda: pick.submit(None)).props("flat")
+            d = await pick
+            if d is None:
+                return
+        d = d or (dets[0] if dets else "BSE")
 
         async def run_step(op, prm, label, backend=None, with_map=False):
             n = ui.notification(f"{label}…", spinner=True, timeout=None)

@@ -274,7 +274,7 @@ def stitch_flow(r: Run, page, base: str, folder: Path) -> None:
     r.step("Stitch: one button", run)
 
     def export():
-        mark(page, "st_export_BSE").click()
+        mark(page, "st_export").click()
         mark(page, "export_dialog").wait_for()
         page.wait_for_timeout(800)
         r.shot("mosaic_export_dialog")

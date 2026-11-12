@@ -238,12 +238,16 @@ def set_sample_sheet(
     map_x_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] | None = None,
     map_y_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] | None = None,
     notes: str = "",
+    phase_map: dict[str, Literal["alpha", "beta", "other"]] | None = None,
 ) -> dict[str, Any]:
     """Enter the sample sheet of one map (creates the project if needed). Only map_file and input_state are needed
     to load the map. The build direction (angle in deg from map +x toward +y, or a 3-vector in map coordinates) and
     the specimen must be given by the user, never guessed; leave them out until known (steps that need them say so). 4PB: give all
     four geometry values (mm) or none; load in N. Position: map origin in the sample frame (mm) and the sample
-    axes along map +x / +y. A relative map_file is resolved against the server's working directory."""
+    axes along map +x / +y. A relative map_file is resolved against the server's working directory.
+    Phases are found by crystal symmetry (6/mmm -> 'Ti (alpha)', m-3m -> 'Ti (beta)'), never by name; phase_map
+    ({file phase id: 'alpha' | 'beta' | 'other'}) is only needed when the symmetry does not decide (loading then says
+    so) and must come from the user."""
     bend = None
     geo = (outer_span_mm, inner_span_mm, width_mm, thickness_mm)
     if any(v is not None for v in geo):
@@ -260,7 +264,7 @@ def set_sample_sheet(
           if build_direction_angle_deg is not None or build_direction_vector else None)
     sheet = SampleSheet(map_id=map_id or map_id_from_file(map_file), specimen_id=specimen_id,
                         map_file=map_file, input_state=input_state, build_direction=bd,
-                        bending=bend, position=pos, notes=notes)
+                        bending=bend, position=pos, notes=notes, phase_map=phase_map)
     step = service.run(_project(project, create=True), "sample.set", sheet)
     return {**_step_summary(step), "map_id": sheet.map_id, "build_direction_unit": bd.unit_vector if bd else None}
 
@@ -283,10 +287,16 @@ def load_map(project: str, map_id: str, backend: Backend | None = None) -> dict[
 
 @server.tool()
 def read_up2_header(project: str, file: str) -> dict[str, Any]:
-    """Header of an EDAX .up2 pattern file (patterns are not loaded)."""
+    """Header of an EDAX .up2 pattern file (patterns are not loaded): grid, step, scan points vs patterns in the file
+    (hex files with the 'extra patterns' flag hold one padding pattern per short row, skipped by the app), the scan ID
+    and the paired .ang with the same '# SCANID' (project files first, then the .up2's folder)."""
+    from .modules.up2_pair import paired  # noqa: PLC0415
+
     p = _project(project)
     step = service.run(p, "up2.header", {"file": file})
-    return {**_step_summary(step), "header": _json_out(p, step, "header")}
+    pr = paired(p, file)
+    return {**_step_summary(step), "header": _json_out(p, step, "header"),
+            "paired_ang": ({"file": str(pr.ang), "map_id": pr.map_id} if pr else None)}
 
 
 @server.tool()
@@ -365,7 +375,7 @@ def compute_map(project: str, map_id: str, kind: Literal["kam", "grod", "gos", "
 
 @server.tool()
 def make_figure(project: str, map_id: str,
-                kind: Literal["ipf", "phase", "ci", "iq", "fit", "prias", "kam", "grod", "gos", "gnd",
+                kind: Literal["ipf", "phase", "ci", "iq", "fit", "prias", "prias_top", "prias_center", "prias_bottom", "kam", "grod", "gos", "gnd",
                               "boundaries", "burgers", "ipf_key"],
                 overlays: list[Literal["hagb", "lagb", "interface", "burgers", "beta_gb", "crack"]] | None = None,
                 phases: list[str] | None = None,
@@ -375,7 +385,8 @@ def make_figure(project: str, map_id: str,
                 values: str | None = None, recon: str | None = None) -> dict[str, Any]:
     """Draw a map with the project backend; returns the PNG path. IPF key and direction default to Settings per
     phase ('build' = build direction from the sample sheet). clim in the map's unit (deg, 1/m^2). Step references
-    (source, grains, values, recon) default to the newest. Fit/PRIAS report clearly when the file lacks them."""
+    (source, grains, values, recon) default to the newest. Fit/PRIAS report clearly when the file lacks them; PRIAS
+    comes from the <map>_prias.txt exports next to the .ang (prias = first channel, prias_top / _center / _bottom)."""
     p = _project(project)
     step = service.run(p, "figure", _clean({
         "map_id": map_id, "kind": kind, "overlays": overlays or [], "phases": phases, "direction": direction,

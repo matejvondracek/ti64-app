@@ -39,14 +39,20 @@ if p.spike_removal
 end
 
 [gid, npx, gidx] = grainsAlpha0(w, p.noise_angle_deg);
+nbr = ti64.neighbourTable(w.x(:), w.y(:), valid, isa(w, 'EBSDhex'));
 noise = valid & gidx(gid + 1) & npx(gid + 1) <= p.noise_max_indexed_px;
-void  = valid & ~gidx(gid + 1) & npx(gid + 1) <= p.noise_max_void_px;
+% void size: the not-indexed grain's pixel count; not-indexed pixels left without a grain (grain id 0: large regions
+% in MTEX 7.2 / pymtex 1.0) get the size of their connected not-indexed region instead of 0 (phase 6.6 fix 4)
+ni = valid & pid == 1;
+sz = npx(gid + 1);
+m0 = ni & gid == 0;
+sz(m0) = componentSizes(m0, nbr);
+void  = ni & ~gidx(gid + 1) & sz <= p.noise_max_void_px;
 unindex(noise, 3);
 toFill = noise | void;
 nFilled = 0; nUnfilled = 0;
 if p.fill && any(toFill)
   ok = valid & pid ~= 1 & ~isnan(pid);
-  nbr = ti64.neighbourTable(w.x(:), w.y(:), valid, isa(w, 'EBSDhex'));
   srcIdx = ti64.dilationFill(toFill, gid, ok, nbr);
   done = toFill & srcIdx > 0;
   rot(done) = rot(srcIdx(done));
@@ -93,4 +99,18 @@ n = max([double(g.id(:)); gid]) + 1;
 npx = zeros(n, 1); gidx = false(n, 1);
 npx(g.id + 1) = g.numPixel;
 gidx(g.id + 1) = g.isIndexed;
+end
+
+function sz = componentSizes(mask, nbr)
+% size of the connected region within mask of every mask pixel (same as hexgrid.component_sizes in Python)
+idx = find(mask);
+loc = zeros(numel(mask), 1); loc(idx) = 1:numel(idx);
+nb = nbr(idx, :);
+ok = nb > 0;
+ok(ok) = mask(nb(ok));
+r = repmat((1:numel(idx))', 1, size(nb, 2));
+G = graph(r(ok), loc(nb(ok)), [], numel(idx), 'omitselfloops');
+lab = conncomp(G);
+cnt = accumarray(lab(:), 1);
+sz = cnt(lab(:));
 end

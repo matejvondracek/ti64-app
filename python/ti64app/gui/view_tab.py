@@ -244,10 +244,13 @@ def view_page() -> None:
         exp_btn.enable()
 
     def show_up2(m):
-        """.up2: overview map (pattern quality / virtual BSE from one streaming pass, cached) in the viewer; a click
-        loads only the pattern under the cursor (fix 13)."""
+        """.up2: overview map (pattern quality / virtual BSE from one streaming pass, cached) in the viewer, drawn as
+        hexagonal cells on a hex scan (same tile renderer as the EBSD viewer, fix 4); a click loads only the pattern
+        under the cursor (fix 13). The .ang with the same scan ID (fix 4) is shown as 'paired map': its IQ / CI /
+        PRIAS can be shown on the same cells and its IQ is correlated with the pattern quality."""
         from ..io import up2  # noqa: PLC0415
         from ..modules import up2_overview as uo  # noqa: PLC0415
+        from ..modules import up2_pair as upair  # noqa: PLC0415
 
         bar.set_visibility(True)
         with_bar.set_visibility(False)
@@ -260,10 +263,20 @@ def view_page() -> None:
             error(e, "Could not read the .up2 header")
             return
         title.text = f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}"
+        try:
+            pair = upair.paired(p, m.file)
+        except Exception:  # noqa: BLE001
+            pair = None
+        pair_txt = ("none found (no .ang with the same scan ID in the project or next to the file)" if pair is None
+                    else f"{pair.ang.name}" + (f" (map {pair.map_id} of this project)" if pair.map_id
+                                                else " (next to the file, not linked in the project)"))
         meta_table([("file", Path(m.file).name), ("folder", str(Path(m.file).parent)),
-                    ("format version", h.version), ("patterns", f"{h.n_patterns:,}"),
+                    ("format version", h.version), ("scan points", f"{h.n_points:,}"),
+                    ("patterns in the file", f"{h.n_patterns:,}" + (f" ({h.n_padding:,} padding patterns, one per "
+                                                                     "short hex row, skipped)" if h.n_padding else "")),
                     ("pattern size", f"{h.pattern_width} × {h.pattern_height} px (16 bit)"),
                     ("scan grid", f"{'hexagonal' if h.hex_grid else 'square'}, {h.n_cols} columns × {h.n_rows} rows"),
+                    ("scan ID", h.scan_id or "–"), ("paired map", pair_txt),
                     ("step", f"{h.x_step_um:g} × {h.y_step_um:g} µm"),
                     ("scan size", f"{(h.n_cols - 1) * h.x_step_um:g} × {(h.n_rows - 1) * h.y_step_um:g} µm"),
                     ("file size", f"{h.file_size / 1e9:.2f} GB"
@@ -277,6 +290,14 @@ def view_page() -> None:
         o.setdefault("corrected", True)
         pos = gs.get("up2_pos", m.id, default=[h.n_rows // 2, h.n_cols // 2])
         u = {"job": None, "ov": None, "timer": None, "busy": False}
+        chans = dict(uo.CHANNELS)
+        if pair is not None:
+            from ..io import prias  # noqa: PLC0415
+
+            chans.update({k: v for k, v in upair.ANG_CHANNELS.items()
+                          if k != "ang_prias" or prias.available(pair.ang)})
+        if o["channel"] not in chans:
+            o["channel"] = "iq"
 
         def save_opts():
             gs.set("up2_overview", m.id, dict(o))
@@ -290,10 +311,11 @@ def view_page() -> None:
             with ui.row().classes("w-full h-full no-wrap gap-0 items-stretch").mark("up2_viewer"):
                 with ui.column().classes("grow h-full min-w-0 gap-0"):
                     with ui.row().classes("w-full items-center gap-3 px-3 py-1 bg-white border-b").mark("up2_toolbar"):
-                        chan = ui.select(uo.CHANNELS, value=o["channel"], label="Map").classes("w-56") \
+                        chan = ui.select(chans, value=o["channel"], label="Map").classes("w-56") \
                             .props("dense options-dense").mark("up2_channel") \
                             .tooltip("Pattern quality: Krieger Lassen image quality after static + dynamic background "
-                                     "correction. Virtual BSE: mean intensity of the whole pattern.")
+                                     "correction. Virtual BSE: mean intensity of the whole pattern. '... of the paired "
+                                     ".ang': the map with the same scan ID, at the same points (for comparison).")
                         flat = ui.checkbox("flatten shading", value=o["flatten"]).props("dense").mark("up2_flatten") \
                             .tooltip("Divide by a strongly blurred copy of the map: removes the smooth shading from the "
                                      "detector geometry and keeps the microstructure contrast (display only)")
@@ -309,6 +331,8 @@ def view_page() -> None:
                     with ui.row().classes("w-full items-center gap-3 px-3 py-1 no-wrap bg-white border-b"):
                         prog = ui.linear_progress(value=0, show_value=False).classes("grow").mark("up2_progress")
                         ptext = ui.label("").classes("text-xs ti-muted whitespace-nowrap").mark("up2_progress_text")
+                    cmp_lab = ui.label("").classes("w-full text-xs px-3 py-1 bg-white border-b").mark("up2_compare")
+                    cmp_lab.set_visibility(pair is not None)
                     mapbox = ui.column().classes("w-full grow min-h-0 gap-0")
                 with ui.column().classes("h-full shrink-0 bg-white border-l p-3 gap-2").style("width: 320px"):
                     ui.label("Pattern").classes("font-semibold")
@@ -350,10 +374,9 @@ def view_page() -> None:
 
         def marker(r, c):
             v = st["viewer"]
-            if v is not None:
+            if v is not None:                    # cell centres = scan-point positions (as in the .ang)
                 v.set(shapes=[{"id": "up2_sel", "type": "point", "text": "", "width_pt": 1, "color": "#e53935",
-                               "xy": [[(c + 0.5 + (0.5 if h.hex_grid and r % 2 else 0)) * h.x_step_um,
-                                       (r + 0.5) * h.y_step_um]]}])
+                               "xy": [list(up2.pattern_position(h, r, c))]}])
 
         def draw():
             if u["busy"]:
@@ -379,6 +402,13 @@ def view_page() -> None:
                     txt += f"\npattern quality {ov.iq[orow, ocol]:.3f}" + (
                         f" (of the overview point at row {orow * ov.step}, column {ocol * ov.step})"
                         if ov.step > 1 else "")
+            if pair is not None:
+                try:
+                    d = upair.ang_columns(pair.ang, cache)
+                    k = point_of(r, c)
+                    txt += f"\n{pair.ang.name}: IQ {d['iq'][k]:.0f}, CI {d['ci'][k]:.3f}, phase {int(d['phase'][k])}"
+                except Exception:  # noqa: BLE001
+                    pass
             info.text = txt
             gs.set("up2_pos", m.id, [r, c])
             marker(r, c)
@@ -394,11 +424,28 @@ def view_page() -> None:
             c = min(max(int(col.value or 0) + dc, 0), up2.row_length(h, r) - 1)
             goto(r, c)
 
+        def point_of(r, c) -> int:
+            """.ang data-row index of a scan row / column."""
+            if not h.hex_grid:
+                return r * h.n_cols + c
+            return (r // 2) * (2 * h.n_cols - 1) + (h.n_cols if r % 2 else 0) + c
+
         def scan_at(x, y):
-            r = min(max(int(np.floor(y / h.y_step_um)), 0), h.n_rows - 1)
-            sx = 0.5 if h.hex_grid and r % 2 else 0.0
-            c = min(max(int(np.floor(x / h.x_step_um - sx)), 0), up2.row_length(h, r) - 1)
-            return r, c
+            """Nearest scan point (hex grid: the hexagonal cell under the cursor)."""
+            best = None
+            r0 = int(round(y / h.y_step_um))
+            for r in (r0 - 1, r0, r0 + 1):
+                if not 0 <= r < h.n_rows:
+                    continue
+                sx = 0.5 if h.hex_grid and r % 2 else 0.0
+                c = min(max(int(round(x / h.x_step_um - sx)), 0), up2.row_length(h, r) - 1)
+                px, py = up2.pattern_position(h, r, c)
+                d = (px - x) ** 2 + (py - y) ** 2
+                if best is None or d < best[0]:
+                    best = (d, r, c)
+            if best is None:
+                return min(max(r0, 0), h.n_rows - 1), 0
+            return best[1], best[2]
 
         def on_probe(e):
             x, y = e.args["xy"][0]
@@ -409,25 +456,56 @@ def view_page() -> None:
             x, y = up2.pattern_position(h, r, c)
             status.text = f"row {r}, column {c}  (x {x:g} µm, y {y:g} µm)  · click to load this pattern"
 
+        def channel_grey():
+            ov = u["ov"]
+            if o["channel"] in uo.CHANNELS:
+                return ov.image(o["channel"], flatten=o["flatten"])
+            return uo.to_grey(upair.channel_on_overview(ov, pair, o["channel"], cache), o["flatten"])
+
+        def compare_text():
+            ov = u["ov"]
+            if pair is None or ov is None:
+                return
+            try:
+                c = upair.compare(ov, pair, cache)
+            except Exception as e:  # noqa: BLE001
+                cmp_lab.text = f"Paired map {pair.ang.name}: cannot compare ({e})"
+                return
+            if c["r"] is None:
+                cmp_lab.text = f"Paired map {pair.ang.name} (same scan ID): compute the overview to compare."
+                return
+            cmp_lab.text = (f"Paired map {pair.ang.name} (same scan ID): pattern quality vs its IQ after removing the "
+                            f"smooth shading, r = {c['r']:.2f} over {c['n']:,} points; best match at shift "
+                            f"{c['shift'][0]:+d} rows, {c['shift'][1]:+d} columns (0, 0 = patterns in the right "
+                            "place). 'Map' list: 'IQ of the paired .ang' shows it on the same cells.")
+
         def render():
             ov = u["ov"]
             if ov is None:
                 return
-            psx, _ = ov.pixel_um
-            lay = tiles.ImageLayer(f"up2_{abs(hash((m.file, ov.step, ov.rows_done, o['channel'], o['flatten'])))}",
-                                   ov.image(o["channel"], flatten=o["flatten"]), psx)
-            tok = tiles.register_image(lay)
+            try:
+                g = channel_grey()
+            except Exception as e:  # noqa: BLE001
+                error(e, f"Could not show '{chans.get(o['channel'], o['channel'])}'")
+                o["channel"] = "iq"
+                chan.value = "iq"
+                return
+            L = uo.layer(ov, g, f"up2_{abs(hash((m.file, ov.step, ov.rows_done, o['channel'], o['flatten'])))}")
+            tok = tiles.register_layer(L)
+            ext = list(L.layout.extent)
             mapbox.clear()
             with mapbox:
-                v = MapViewer(psx, lay.extent).classes("w-full h-full").mark("up2_map")
+                v = MapViewer(L.layout.cw, ext).classes("w-full h-full").mark("up2_map")
                 key = f"up2:{m.id}"
                 v._props["initial_view"] = gs.get("view_zoom", key)
                 v.on("view", lambda e: gs.set("view_zoom", key, {k: e.args[k] for k in ("x0", "x1", "y0", "y1")}))
                 v.on("cursor", throttle=0.15, handler=on_cursor)
                 v.on("probe", on_probe)
                 v.on("legends", on_legends)
-            v.set(layer_url=tiles.image_url(tok), tool="probe", legends=legends(), legend_data={})
+            v.set(layer_url=tiles.layer_url(tok), tool="probe", legends=legends(), legend_data={},
+                  hex_grid=bool(L.layout.hex), cell_um=float(L.layout.dx))
             st["viewer"] = v
+            compare_text()
             draw()
 
         def set_running(running: bool):

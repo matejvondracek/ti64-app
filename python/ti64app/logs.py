@@ -27,6 +27,9 @@ def setup_logging(name: str) -> Path:
         root.addHandler(h)
         if root.level > logging.INFO or root.level == logging.NOTSET:
             root.setLevel(logging.INFO)
+    from .breadcrumbs import install  # noqa: PLC0415
+
+    install()
     return f
 
 

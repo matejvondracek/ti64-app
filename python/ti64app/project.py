@@ -385,7 +385,7 @@ class Project:
         else:
             sid = None
             fields = {"input_state": sheet.input_state, "build_direction": sheet.build_direction,
-                      "position": sheet.position, "notes": sheet.notes}
+                      "position": sheet.position, "notes": sheet.notes, "phase_map": sheet.phase_map}
             for k in ("material", "process", "bending"):
                 if m is not None and getattr(m, k) is not None:
                     fields[k] = getattr(sheet, k)

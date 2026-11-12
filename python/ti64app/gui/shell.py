@@ -1,6 +1,7 @@
 """Top bar (home: New / Open Project; project: tabs Files | View | EBSD | Crack | Stitch, project name + menu centred,
-save indicator and Settings gear on the right), the Settings dialog, project dialogs (new, open, save copy) and
-plain-language error notifications with "Open log"."""
+save indicator, memory, Help menu, Feedback and the Settings gear on the right), the Settings dialog, project dialogs
+(new, open, save copy), plain-language error notifications with "Open log", "Save report for Claude" (Help menu,
+Feedback dialog, Ctrl+Shift+R) and the breadcrumb log of clicks / tabs / dialogs it contains."""
 from __future__ import annotations
 
 import os
@@ -70,10 +71,66 @@ def bytes_h(n: int) -> str:
     return f"{n:.1f} GB"
 
 
+# ---- breadcrumbs + shortcut (fix 4) ------------------------------------------------------------------------
+# Every click on a button / tab / menu item / checkbox / select is sent to the server for the breadcrumb log of the
+# report for Claude (label text, test id, page); Ctrl+Shift+R opens "Save report for Claude" (captured before the
+# browser / WebView2 can reload the page).
+_HOOK_JS = """<script>
+if (!window.__ti64hooks) {
+  window.__ti64hooks = true;
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('button, a, .q-tab, .q-item, .q-checkbox, .q-toggle, .q-radio, .q-field, ' +
+                                '.q-expansion-item__container > .q-item, [role=button]');
+    if (!el) return;
+    const holder = el.closest('[data-testid]');
+    const c = el.cloneNode(true);                       // label text without icon ligatures ('arrow_drop_down')
+    c.querySelectorAll('.q-icon, .material-icons, i').forEach((n) => n.remove());
+    c.querySelectorAll('*').forEach((n) => n.append(' '));          // 'Map' + 'pattern quality' apart
+    const txt = (el.getAttribute('aria-label') || c.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
+    emitEvent('ti64_click', {text: txt, id: holder ? holder.getAttribute('data-testid') : '', page: location.pathname});
+  }, true);
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
+      e.preventDefault(); e.stopPropagation(); emitEvent('ti64_report', {});
+    }
+  }, true);
+}
+</script>"""
+
+
+def _global_hooks(active: str | None) -> None:
+    from .. import breadcrumbs as bc  # noqa: PLC0415
+
+    bc.add("tab", f"opened the {active or 'home'} page")
+    ui.add_head_html(_HOOK_JS)
+
+    def clicked(e) -> None:
+        a = e.args or {}
+        bc.add("click", f"{a.get('page', '')}: '{a.get('text') or '?'}'" + (f" [{a['id']}]" if a.get("id") else ""))
+    ui.on("ti64_click", clicked)
+    ui.on("ti64_report", lambda _e: claude_report_dialog())
+
+
+def gui_context() -> dict:
+    """Where the user is, for the report: project tab, selected file, map tab of the EBSD tab."""
+    p = current_project()
+    if p is None:
+        return {"tab": "home"}
+    g = p.gui_state()
+    fid = g.get("selected_file") if g.get("tab") != "/view" else (g.get("view_file") or g.get("view_source"))
+    m = p.file(fid) if isinstance(fid, str) and p.file(fid) else None
+    mt = g.get("mtab", {}).get(fid) if isinstance(g.get("mtab"), dict) and isinstance(fid, str) else None
+    return {"tab": g.get("tab"), "file": (f"{m.id} ({Path(m.file).name}, {m.kind})" if m else fid),
+            "map tab": {"alpha": "α map", "beta": "prior β"}.get(mt, mt) if g.get("tab") == "/ebsd" else None,
+            "map kind shown": (g.get("layer", {}).get(fid) if isinstance(g.get("layer"), dict) and
+                               isinstance(fid, str) else None)}
+
+
 # ---- top bar ---------------------------------------------------------------------------------------------
 def header(active: str | None = None) -> Project | None:
     """Draw the theme + top bar; returns the open project (None on the home page)."""
     apply_theme()
+    _global_hooks(active)
     p = current_project()
     with ui.header().classes("ti-topbar items-center px-3 py-1 gap-2 no-wrap").mark("topbar"):
         if p is None:
@@ -157,18 +214,101 @@ def right_tools() -> None:
                         ("bg-orange-500 text-white font-semibold" if m["warn"] else "text-white/90"))
     upd_mem()
     ui.timer(3.0, upd_mem)
+    with ui.button(icon="help_outline").props("flat round color=white").mark("help_btn") \
+            .props('aria-label="Help"'):           # no tooltip: it would cover the first menu item
+        with ui.menu().props("auto-close").mark("help_menu"):
+            with ui.menu_item(on_click=lambda: claude_report_dialog()).mark("help_report"):
+                with ui.row().classes("items-center no-wrap gap-6 w-full"):
+                    ui.label("Save report for Claude…")
+                    ui.label("Ctrl+Shift+R").classes("text-xs ti-muted ml-auto")
+            ui.menu_item("Feedback / GitHub issue…", on_click=feedback_dialog).mark("help_feedback")
+            ui.separator()
+            ui.menu_item("Open the reports folder", on_click=_open_reports).mark("help_reports_folder")
+            ui.menu_item("Open the log folder", on_click=lambda: _startfile(logs_dir())).mark("help_logs")
     ui.button("Feedback", icon="feedback", on_click=feedback_dialog).props("flat dense no-caps color=white") \
-        .mark("feedback_btn").tooltip("Report a bug, an idea or a question (GitHub issue or e-mail)")
+        .mark("feedback_btn").tooltip("Report a bug, an idea or a question: GitHub issue, or a detailed report for "
+                                      "Claude saved on this PC")
     ui.button(icon="settings", on_click=lambda: settings_dialog(current_project())) \
         .props("flat round color=white").tooltip("Settings").mark("settings_gear") \
         .props('aria-label="Settings"')
 
 
-# ---- feedback (fix 3.2) ------------------------------------------------------------------------------------
+# ---- feedback (fix 3.2, fix 4) ------------------------------------------------------------------------------
+def _open_reports() -> None:
+    from ..report import REPORTS_DIR  # noqa: PLC0415
+
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    _startfile(REPORTS_DIR)
+
+
+async def save_claude_report(description: str, category: str, shot: bytes | None) -> None:
+    """Write reports/<date>_<category>.md + .json (+ .png) and say where (report.py)."""
+    from nicegui import run  # noqa: PLC0415
+
+    from .. import report  # noqa: PLC0415
+
+    try:
+        md, _js = await run.io_bound(report.save_report, description, category, gui_context(), current_project(),
+                                     None, shot)
+    except Exception as e:  # noqa: BLE001
+        error(e, "Could not save the report")
+        return
+    import json as _json  # noqa: PLC0415
+
+    notify_actions(f"Report saved: reports\\{md.name} (+ .json{' + .png' if shot else ''}) in the app folder. "
+                   "Tell Claude: 'read the newest report'.",
+                   [("Show in Explorer", f"() => fetch('/api/ti64/reveal?path=' + encodeURIComponent({_json.dumps(str(md))}),"
+                                         " {method: 'POST'})")],
+                   type="positive", timeout=15, close_button="OK")
+
+
+async def claude_report_dialog(description: str = "", category: str = "bug") -> None:
+    """'Save report for Claude' (Help menu, Ctrl+Shift+R): one Markdown file + JSON twin in <app>/reports/ with the
+    description, versions, system, where the user is, the last 30 UI actions, the recipe, every error since start,
+    the last 200 log lines and the settings (report.py). Local only; paths shortened to file names."""
+    from nicegui import run  # noqa: PLC0415
+
+    from .. import breadcrumbs as bc  # noqa: PLC0415
+    from .. import feedback as fb  # noqa: PLC0415
+
+    bc.add("dialog", "Save report for Claude")
+    shot = await run.io_bound(fb.window_screenshot)
+    with ui.dialog() as dlg, ui.card().classes("w-[40rem] max-w-full gap-2").mark("report_dialog"):
+        with ui.row().classes("w-full items-center"):
+            ui.label("Save report for Claude").classes("text-lg font-semibold")
+            ui.space()
+            ui.button(icon="close", on_click=dlg.close).props("flat round dense").props('aria-label="Close"')
+        cat = ui.toggle({"bug": "Bug", "idea": "Idea", "question": "Question"}, value=category) \
+            .props("no-caps rounded unelevated toggle-color=primary").mark("rep_category")
+        desc = ui.textarea("What happened / what should Claude look at?", value=description) \
+            .classes("w-full").props("autogrow outlined autofocus").mark("rep_text")
+        ui.label("Saved as ONE Markdown file (+ a JSON twin) in the 'reports' folder of the app, named "
+                 "YYYY-MM-DD_HHMM_<category>.md; nothing is uploaded. It holds your text, app version and git commit, "
+                 "backend and versions, OS / RAM / memory use, the open project, tab, file and map tab, your last 30 "
+                 "actions, the recipe steps with timings, every error since the app started with its traceback, the "
+                 "last 200 log lines and the settings. Paths are shortened to file names; no measurement data.") \
+            .classes("text-xs ti-muted").mark("rep_info")
+        with ui.row().classes("items-center gap-1"):
+            shot_cb = ui.checkbox("Save a screenshot of this window next to the report", value=shot is not None) \
+                .mark("rep_screenshot").tooltip("The window as it was when you opened this dialog (the dialog is not "
+                                                "in it). Saved only on this PC.")
+            if shot is None:
+                shot_cb.disable()
+                ui.label("(only in the desktop app window)").classes("text-xs ti-muted")
+
+        async def save():
+            dlg.close()
+            await save_claude_report(desc.value or "", cat.value, shot if shot_cb.value else None)
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Cancel", on_click=dlg.close).props("flat")
+            ui.button("Save report", icon="save", on_click=save).mark("rep_save")
+    dlg.open()
+
+
 async def feedback_dialog() -> None:
     """Description + category; app version, backend, OS and the last 100 log lines are added (paths shortened to
     file names, issues are public). The window screenshot is taken now (before the dialog covers it) but only
-    included when ticked."""
+    included when ticked. 'Save report for Claude' writes the detailed local report instead (report.py)."""
     import webbrowser  # noqa: PLC0415
 
     from nicegui import run  # noqa: PLC0415
@@ -177,6 +317,9 @@ async def feedback_dialog() -> None:
     from .. import feedback as fb  # noqa: PLC0415
     from ..sysinfo import system_summary  # noqa: PLC0415
 
+    from .. import breadcrumbs as bc  # noqa: PLC0415
+
+    bc.add("dialog", "Feedback")
     shot = await run.io_bound(fb.window_screenshot)
     s = load_settings()
     p = current_project()
@@ -205,8 +348,9 @@ async def feedback_dialog() -> None:
             if shot is None:
                 shot_cb.disable()
                 ui.label("(only in the desktop app window)").classes("text-xs ti-muted")
-        ui.label(f"GitHub: {s.feedback.repo_url} · e-mail: {s.feedback.email} (both editable in Settings, section "
-                 "'Feedback')").classes("text-xs ti-muted break-all")
+        ui.label(f"GitHub: {s.feedback.repo_url} (editable in Settings, section 'Feedback'). 'Save report for Claude' "
+                 "writes a detailed report to the app's 'reports' folder on this PC instead (not public).") \
+            .classes("text-xs ti-muted break-all")
 
         def report() -> dict:
             return fb.build_report(desc.value or "", cat.value, backend, lines, sysi)
@@ -232,20 +376,14 @@ async def feedback_dialog() -> None:
                           "'Submit new issue' there.", type="info", multi_line=True)
             dlg.close()
 
-        def email():
-            if not described():
-                return
-            r = report()
-            z = fb.write_zip(logs_dir().parent / "feedback", r, shot if shot_cb.value else None)
-            webbrowser.open(fb.mailto_url(s.feedback.email, cat.value, r, z.name))
-            _reveal(z)
-            ui.notify(f"Your e-mail program opens with the subject '{fb.subject(cat.value)}'. Attach {z.name} "
-                      "(selected in the Explorer window that just opened).", type="info", multi_line=True,
-                      timeout=12000)
+        async def for_claude():
             dlg.close()
+            await save_claude_report(desc.value or "", cat.value, shot if shot_cb.value else None)
         with ui.row().classes("w-full justify-end gap-2"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
-            ui.button("Send e-mail", icon="mail", on_click=email).props("outline").mark("fb_email")
+            ui.button("Save report for Claude", icon="save", on_click=for_claude).props("outline") \
+                .mark("fb_claude").tooltip("Ctrl+Shift+R anywhere in the app. Written to the app's 'reports' folder "
+                                           "on this PC, with the last actions, errors and log (not uploaded)")
             ui.button("Open GitHub issue", icon="open_in_new", on_click=github).mark("fb_github")
     dlg.open()
 
@@ -543,16 +681,14 @@ def _settings_body(s, status, p: Project | None) -> None:
     with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_feedback"):
         ui.label("Feedback").classes("font-semibold")
         repo = ui.input("GitHub repository (issues)", value=s.feedback.repo_url).classes("w-full").mark("fb_repo")
-        mail = ui.input("E-mail address for feedback", value=s.feedback.email).classes("w-full").mark("fb_mail")
 
         def upd_fb(_=None):
             s.feedback.repo_url = (repo.value or "").strip() or "https://github.com/matejvondracek/ti64-app"
-            s.feedback.email = (mail.value or "").strip() or "vondrm34@cvut.cz"
             save()
-        for w in (repo, mail):
-            w.on("blur", upd_fb)
-            w.on("keydown.enter", upd_fb)
-        ui.label("Used by the Feedback button in the top bar.").classes("text-xs ti-muted")
+        repo.on("blur", upd_fb)
+        repo.on("keydown.enter", upd_fb)
+        ui.label("Used by 'Open GitHub issue' in the Feedback dialog (top bar). Reports for Claude go to the app's "
+                 "'reports' folder (Help menu, '?' in the top bar).").classes("text-xs ti-muted")
 
     if p:
         with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_disk"):

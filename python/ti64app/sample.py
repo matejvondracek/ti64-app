@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 InputState = Literal["raw", "oim_cleaned"]
 Axis = Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"]
+PhaseRole = Literal["alpha", "beta", "other"]
 
 _CLEANED = re.compile(r"clean", re.IGNORECASE)
 
@@ -119,6 +120,9 @@ class SampleSheet(BaseModel):
     material: str = "Ti-6Al-4V"
     process: str = "EBM"
     notes: str = ""
+    # {file phase id: role} set by the user when the crystal symmetry does not decide (ti64app.phases); None = by
+    # symmetry. Part of what the load step depends on: changing it marks the map's results stale.
+    phase_map: dict[str, PhaseRole] | None = None
 
     @field_validator("map_id")
     @classmethod
@@ -174,6 +178,7 @@ class MapInfo(BaseModel):
     build_direction: BuildDirection | None = None
     position: MapPosition | None = None
     role: Role | None = None
+    phase_map: dict[str, PhaseRole] | None = None   # {file phase id: role}; None = by crystal symmetry
     notes: str = ""
     material: str | None = None               # per-file overrides of the sample values (INHERITED)
     process: str | None = None
@@ -187,8 +192,14 @@ class MapInfo(BaseModel):
 
 
 def file_kind(path: str | Path) -> FileKind | None:
-    """Kind of a file to link; None for JEOL .txt sidecars (shown with their image, never listed)."""
+    """Kind of a file to link; None for sidecars that are never listed: JEOL .txt (shown with their image) and PRIAS
+    exports <map>_prias.txt next to their .ang (shown in its map sheet, used automatically)."""
     s = Path(path).suffix.lower()
+    if s == ".txt":
+        from .io.prias import ang_of, is_prias_file  # noqa: PLC0415
+
+        if is_prias_file(path) and ang_of(path) is not None:
+            return None
     if s == ".ang":
         return "ang"
     if s in IMAGE_SUFFIXES:
@@ -227,7 +238,7 @@ def effective_sheet(m: MapInfo, s: SampleInfo | None) -> SampleSheet:
                        input_state=m.input_state or suggest_input_state(m.file),
                        build_direction=m.build_direction, bending=effective(m, s, "bending")[0], position=m.position,
                        material=effective(m, s, "material")[0] or "", process=effective(m, s, "process")[0] or "",
-                       notes=m.notes)
+                       notes=m.notes, phase_map=m.phase_map)
 
 
 def require_build_direction(sheet: SampleSheet, needed_for: str) -> BuildDirection:
@@ -237,7 +248,7 @@ def require_build_direction(sheet: SampleSheet, needed_for: str) -> BuildDirecti
     return sheet.build_direction
 
 
-SHEET_RESULT_KEYS = ("map_file", "input_state", "build_direction", "bending", "position")
+SHEET_RESULT_KEYS = ("map_file", "input_state", "phase_map", "build_direction", "bending", "position")
 BD_OPS = ("grainsize.run", "grainsize.figure", "grainsize.compare_oim")   # use the build direction (length / width)
 
 
@@ -249,7 +260,7 @@ def stale_on_sheet_change(map_id: str, old: dict | None, new: dict):
     import json  # noqa: PLC0415
 
     changed = {k for k in SHEET_RESULT_KEYS if (old or {}).get(k) != (new or {}).get(k)}
-    if old is None or changed & {"map_file", "input_state"}:
+    if old is None or changed & {"map_file", "input_state", "phase_map"}:
         return lambda s: s.params.get("map_id") == map_id
     if "build_direction" in changed:
         return lambda s: s.params.get("map_id") == map_id and (s.op in BD_OPS or '"build"' in json.dumps(s.params))
@@ -277,7 +288,7 @@ def split_sheet(sheet: SampleSheet, sample: SampleInfo | None) -> tuple[SampleIn
         sample = SampleInfo(id=sheet.specimen_id, material=sheet.material, process=sheet.process,
                             bending=sheet.bending)
     m = {"input_state": sheet.input_state, "build_direction": sheet.build_direction, "position": sheet.position,
-         "notes": sheet.notes}
+         "notes": sheet.notes, "phase_map": sheet.phase_map}
     for k in ("material", "process", "bending"):
         if getattr(sheet, k) != getattr(sample, k):
             m[k] = getattr(sheet, k)

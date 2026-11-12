@@ -67,7 +67,8 @@ def ju02_loaded():
 
 @pytest.mark.parametrize("state,expect", [
     ("oim_cleaned", dict(n_ci_removed=0, n_noise_indexed_removed=161, n_small_void_px=1, n_filled=162, n_unfilled=0)),
-    ("raw", dict(n_ci_removed=2954, n_noise_indexed_removed=211, n_small_void_px=876, n_filled=1066, n_unfilled=21)),
+    # fix 4: 35 px of not-indexed regions > 4 px that calcGrains leaves without a grain are no longer filled
+    ("raw", dict(n_ci_removed=2954, n_noise_indexed_removed=211, n_small_void_px=841, n_filled=1030, n_unfilled=22)),
 ])
 def test_cleanup_presets_on_ju02(ju02_loaded, state, expect):
     """Reference counts (identical in MATLAB MTEX 7.2, see conformance tests)."""

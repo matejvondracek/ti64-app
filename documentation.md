@@ -259,6 +259,23 @@ Screenshots: `python scripts/gui_screenshots_fix3_stitch.py` → `projects/_scre
 
 Screenshots: `python scripts/gui_screenshots_fix3.py` → `projects/_screens_fix3/main/` (full JU02 map; git-ignored).
 
+### Phase 6.6 fix 4 – APEX phases, PRIAS, hex .up2, reports for Claude (fourth user test, decision D32)
+
+| Change | Where |
+| --- | --- |
+| Phases identified by **crystal symmetry** (6/mmm → α, m-3m → β) and renamed 'Ti (alpha)' / 'Ti (beta)' at load in both backends; original names in the load meta; map sheet section 'Phases' (role per phase, needed only when ambiguous) | `phases.py`, `service._ebsd_load`, `backends/pymtex_backend.load_ebsd`, `matlab/+ti64/loadEbsd.m`, `gui/files_tab._phases_section` |
+| MATLAB: single-phase .ang no longer comes back as "not indexed" (phaseMap = CSList order) | `matlab/+ti64/loadEbsd.m` |
+| Cleanup fill: large not-indexed regions without a grain are no longer filled as 1-px voids (both backends) | `backends/hexgrid.component_sizes`, `pymtex_backend.cleanup`, `matlab/+ti64/cleanup.m` |
+| **PRIAS text exports** next to the .ang: detected (also on Add file), channel from the header, matched by x / y within half a step, clear mismatch messages; 'PRIAS top / centre / bottom strip' in the Maps list; registration reference PRIAS else IQ | `io/prias.py`, `ops_ebsd.figure_spec`, `layers.stored_data`, `gui/files_tab._prias_section`, `modules/registration.py` |
+| **Hex .up2** with the extra-patterns flag: padding pattern at the end of each short row skipped (no diagonal seam); point-order access for PyEBSDIndex / kikuchipy | `io/up2.py`, `modules/up2_overview.py` |
+| **.up2 ↔ .ang by scan ID**; View tab: paired map, its IQ / CI / PRIAS on the same cells, correlation + best shift | `io/up2.find_paired_ang`, `modules/up2_pair.py`, `gui/view_tab.show_up2`, MCP `read_up2_header` |
+| .up2 overview drawn as **hexagonal cells** (EBSD viewer renderer) | `modules/up2_overview.cells / layer`, `gui/tiles.register_layer` |
+| Feedback without e-mail; **Save report for Claude** (Help menu, Feedback dialog, Ctrl+Shift+R) → `reports/<date>_<category>.md` + `.json` (+ `.png`) | `report.py`, `breadcrumbs.py`, `gui/shell.py` |
+| Stitch tab: one Export button | `gui/stitch_page.py` |
+| Tests | `tests/unit/test_fix4.py`, `tests/integration/test_fix4_real.py` (JU04 / JU06, both backends) |
+
+Screenshots: `python scripts/gui_screenshots_fix4.py` → `projects/_screens_fix4/` (git-ignored).
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -292,7 +309,8 @@ Phase 4 open points:
 
 Decisions to make:
 - [ ] Keep retained beta in the noise cleanup? The EBSD_part2 rule removes ~1/3 of indexed beta (D10).
-- [ ] PRIAS: re-export .ang with PRIAS columns, or virtual BSE from the .up2 later.
+- [x] PRIAS: separate OIM text exports <map>_prias.txt (fix 4, D32).
+- [ ] Raw preset CI 0.1 on the fine-step raw APEX maps JU04_area1/2 (78 / 63 % of points removed, D32).
 
 Technical:
 - [ ] Remove the pymtex GND workaround once pymtex fixes `fitDislocationSystems` (D9).

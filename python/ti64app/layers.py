@@ -28,13 +28,16 @@ from .raster import CellLayout, SegmentIndex, cell_layout
 from .recipe import RecipeStep
 from .settings import IpfKeySetting, load_settings
 
-LayerKind = Literal["ipf", "phase", "ci", "iq", "fit", "prias", "kam", "grod", "gos", "gnd",
+LayerKind = Literal["ipf", "phase", "ci", "iq", "fit", "prias", "prias_top", "prias_center", "prias_bottom", "kam", "grod", "gos", "gnd",
                     "parent_ipf", "recon_fit", "variant", "packet"]
-MAP_KINDS = ("ipf", "phase", "ci", "iq", "fit", "prias", "kam", "grod", "gos", "gnd")
+MAP_KINDS = ("ipf", "phase", "ci", "iq", "fit", "prias", "prias_top", "prias_center", "prias_bottom", "kam", "grod", "gos", "gnd")
+PRIAS_KINDS = ("prias_top", "prias_center", "prias_bottom")
 RECON_KINDS = ("parent_ipf", "recon_fit", "variant", "packet")
 DATA_OPS = ("ebsd.load", "ebsd.cleanup", "grains.calc", "map.compute", "recon.run")   # steps a layer depends on
 OVERLAYS = ("hagb", "lagb", "interface", "burgers", "beta_gb", "crack")
 LAYER_LABELS = {"ipf": "IPF (alpha / beta)", "phase": "phase", "ci": "CI", "iq": "IQ", "fit": "Fit", "prias": "PRIAS",
+                "prias_top": "PRIAS top strip", "prias_center": "PRIAS centre square",
+                "prias_bottom": "PRIAS bottom strip",
                 "kam": "KAM", "grod": "GROD", "gos": "GOS", "gnd": "GND", "parent_ipf": "prior β IPF (grain mean)",
                 "recon_fit": "reconstruction fit", "variant": "α variant ID", "packet": "α packet ID"}
 OVERLAY_LABELS = {"hagb": "HAGB", "lagb": "LAGB", "interface": "α/β interface", "burgers": "Burgers types",
@@ -246,7 +249,12 @@ def _cache_key(project: Project, map_id: str, lp: LayerParams, backend: str, ext
     style = load_settings().figure.model_dump(mode="json")
     # only what colours a map: the file, its input state and the build direction (IPF along "build"); a note, the
     # position or the 4PB geometry do not recolour it
-    sheet = project.sample(map_id).model_dump(mode="json", include={"map_file", "input_state", "build_direction"})
+    sheet = project.sample(map_id).model_dump(mode="json", include={"map_file", "input_state", "build_direction",
+                                                                    "phase_map"})
+    if lp.kind.startswith("prias"):                  # the PRIAS export it is read from
+        from .io import prias  # noqa: PLC0415
+
+        extra = [extra, [(str(f), f.stat().st_mtime_ns) for f in prias.find_files(sheet["map_file"])]]
     return json_hash([map_id, lp.model_dump(mode="json"), backend, deps, style, sheet, extra])[7:31]
 
 
@@ -317,11 +325,18 @@ _PROPS: dict[str, dict] = {}
 
 def stored_data(project: Project, step_id: str) -> dict[str, bool]:
     """Which per-pixel data a map step really contains (cached per step): CI / IQ present, Fit present and not
-    constant (the test exports store Fit = 180 everywhere), PRIAS columns in the .ang rows."""
-    k = f"{project.root}|{step_id}"
+    constant (the test exports store Fit = 180 everywhere), PRIAS columns in the .ang rows, PRIAS text exports next
+    to the .ang (prias_top / prias_center / prias_bottom, only when they fit the map)."""
+    s = project.recipe().step(step_id)
+    try:                                         # a PRIAS export added / changed later is noticed
+        from .io import prias  # noqa: PLC0415
+
+        pf = [(f.name, f.stat().st_mtime_ns) for f in prias.find_files(project.sample(s.params["map_id"]).map_file)]
+    except Exception:  # noqa: BLE001
+        pf = []
+    k = f"{project.root}|{step_id}|{pf}"
     if k in _PROPS:
         return _PROPS[k]
-    s = project.recipe().step(step_id)
     out = {"ci": False, "iq": False, "fit": False, "prias": False}
     try:
         with np.load(project.root / s.outputs["ebsd"].path, allow_pickle=False) as z:
@@ -337,6 +352,11 @@ def stored_data(project: Project, step_id: str) -> dict[str, bool]:
 
         f = project.sample(s.params["map_id"]).map_file
         out["prias"] = read_header(f).declares_prias and max(data_column_count(f, 200)) >= 13
+        from .io import prias  # noqa: PLC0415
+
+        for k, pf in prias.available(f).items():
+            if k in prias.CHANNEL_ORDER and prias.check(pf, f)["ok"]:
+                out[f"prias_{k}"] = True
     except Exception:  # noqa: BLE001  (file moved, not an .ang)
         pass
     _PROPS[k] = out
@@ -363,7 +383,7 @@ def available(project: Project, map_id: str, tab: str | None = None) -> dict:
     src = latest_step(project, ("ebsd.cleanup", "ebsd.load"), map_id=map_id)
     if src is not None:
         have = stored_data(project, src.id)
-        layers += ["ipf", "phase"] + [k for k in ("ci", "iq", "fit", "prias") if have.get(k)]
+        layers += ["ipf", "phase"] + [k for k in ("ci", "iq", "fit", "prias", *PRIAS_KINDS) if have.get(k)]
         layers += [k for k in ("kam", "grod", "gos", "gnd") if k in kinds_done]
     if "recon.run" in ops:
         layers += list(RECON_KINDS)

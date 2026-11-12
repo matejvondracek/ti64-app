@@ -114,12 +114,7 @@ def test_feedback_report_paths_and_urls(tmp_path):
                         {"os": "Windows 11", "python": "3.12", "ram": "16 GB"})
     assert r["title"] == "[Bug] Crash when loading" and "Users" not in r["body"] and "JU02_99.ang" in r["body"]
     assert "backend: pymtex" in r["body"] and "app version" in r["body"]
-    for cat, subj in (("bug", "[Ti64] Bug"), ("idea", "[Ti64] Idea"), ("question", "[Ti64] Question")):
-        assert fb.subject(cat) == subj
-        u = fb.mailto_url("vondrm34@cvut.cz", cat, r, "x.zip")
-        assert u.startswith("mailto:vondrm34@cvut.cz?subject=" + subj.replace("[", "%5B").replace("]", "%5D")
-                            .replace(" ", "%20"))
-        assert len(u) <= fb.MAX_URL
+    assert not hasattr(fb, "mailto_url")                 # e-mail feedback removed (fix 4)
     g = fb.github_issue_url("https://github.com/o/r.git", r)
     assert g.startswith("https://github.com/o/r/issues/new?title=") and len(g) <= fb.MAX_URL
     z = fb.write_zip(tmp_path, r, b"\x89PNG fake")
@@ -133,10 +128,10 @@ def test_feedback_settings_defaults_and_save():
     from ti64app.settings import load_settings, save_preferences
 
     s = load_settings()
-    assert s.feedback.email == "vondrm34@cvut.cz" and "github.com" in s.feedback.repo_url
-    s.feedback.email = "x@y.cz"
+    assert "github.com" in s.feedback.repo_url and not hasattr(s.feedback, "email")    # e-mail removed (fix 4)
+    s.feedback.repo_url = "https://github.com/o/r"
     save_preferences(s)
-    assert load_settings().feedback.email == "x@y.cz"
+    assert load_settings().feedback.repo_url == "https://github.com/o/r"
 
 
 def test_memory_status_and_pictures():

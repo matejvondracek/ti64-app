@@ -778,3 +778,67 @@
   outside; statistics, log-normal fit and area fractions remain those of all grains.
 - **Viewer**: re-fits only when the extent really changes (each `set()` sent a new extent array and threw the user out
   of a zoomed view, found while testing the zoomable stitch result).
+
+## D32 (2026-11-12) Fourth user test: APEX phases, PRIAS exports, hex .up2, reports for Claude (fix 4)
+- **Phases by crystal symmetry, never by name** (`phases.py`): APEX exports call the phases "Ti (Titanium, alpha)" /
+  "Ti (Titanium, beta)". The `# Symmetry` code of each header phase gives its Laue group (TSL codes: 62 = 6/mmm -> α,
+  43 = m-3m -> β); both backends rename the phase at load to the canonical 'Ti (alpha)' / 'Ti (beta)' (pymtex
+  `CSList[i].mineral`, MATLAB `ti64.loadEbsd` phaseItem array), so every later step finds the phases the same way.
+  The original names stay in the load metadata (`phases`: id, original, Laue group, role, source). Two phases of the
+  same role (e.g. α + Ti3Al, both 6/mmm) stop the load with a map-sheet message (`PhaseMappingAmbiguous`, a
+  `SheetIncomplete`) until the user sets the role in the map sheet (Files tab, section 'Phases'; `MapInfo.phase_map`,
+  MCP `set_sample_sheet(phase_map=...)`); changing it marks the map's results stale. Figures take the phase ids from
+  the load metadata instead of assuming 1 = α, 2 = β.
+- **MATLAB single-phase numbering**: MTEX 7.2 numbers the phase of a single-phase .ang 0 (notIndexed -1), pymtex 1;
+  every alpha pixel of JU04_area3/4 and JU06_* came back from MATLAB as phase 0 = "not indexed". `loadEbsd` now sets
+  `phaseMap = 0:numel(CSList)-1`, so both backends report the header phase numbers (identical per-pixel phases on all
+  8 new maps).
+- **Void fill bug (both backends)**: `calcGrains(..., alpha = 0)` in MTEX 7.2 and pymtex 1.0 leaves large
+  not-indexed regions WITHOUT a grain (grain id 0); the cleanup looked up their size as 0 and filled them as if they
+  were <= 4 px voids. On JU04_area1 (raw, 78 % CI < 0.1) 191 543 px were "small voids" and the whole map was
+  extrapolated from 22 % of the points. Not-indexed pixels without a grain now get the size of their connected
+  not-indexed region (`hexgrid.component_sizes`, MATLAB `conncomp`); only regions <= noise_max_void_px are filled.
+  Maps with few not-indexed pixels (the OIM-cleaned test maps) are not affected.
+- **Raw preset on the new raw maps** (CI < 0.1 removed, then EBSD_part2 noise cleanup), both backends identical:
+
+  | map | step | CI < 0.1 | indexed after cleanup |
+  | --- | --- | --- | --- |
+  | JU04_area1 | 0.08 µm | 78 % | 20.5 % |
+  | JU04_area2 | 0.15 µm | 63 % | 36.2 % |
+  | JU04_area3 | 0.30 µm | 43 % | 58.4 % |
+  | JU04_area4 | 0.20 µm | 17 % | 86.8 % |
+  | JU06_compression / tensile / tensile_mid / tensile_crack | 0.30 µm | 20 / 18 / 11 / 21 % | 85.8 / 88.8 / 95.3 / 83.8 % |
+
+  OPEN (user decision): whether CI 0.1 suits the fine-step raw APEX maps JU04_area1/2 (median CI 0.018 / 0.036).
+- **PRIAS text exports** (`io/prias.py`): `<map>_prias.txt` (also `.txt.txt`) next to the .ang, channel from
+  "Column 3: Grayscale value - PRIAS Top Strip" (top / center / bottom). Points are matched to the .ang grid rebuilt
+  from its header (row from y, column from x with the hex half-step; origin = first data row) within half a step (the
+  export rounds y to 3 decimals); a point off the grid, two points on one map point or a different point count give a
+  plain-language PriasMismatch. All 8 exports match (0.1-1.6 s, cached in `cache/prias/`). Layers / figures
+  `prias_top`, `prias_center`, `prias_bottom` ('prias' = first channel); PRIAS exports are sidecars of their .ang on
+  Add file; `modules/registration.reference_values` = PRIAS (top, centre, bottom) else IQ, for phase 8.
+- **Hex .up2 with padding** (`io/up2.py`): header byte 16 = 'extra patterns' flag; with it a hex file holds
+  n_rows x n_cols patterns, one padding pattern per short row, at the END of the row (full-resolution test in the
+  module doc: odd rows r 0.564 vs 0.367 with the padding assumed at the start, JU04 Area 2; 0.552 vs 0.412 Area 1).
+  The old reader counted n_cols - 1 per short row: r ~ 0.0, the diagonal seam. Point-order access for PyEBSDIndex
+  (`iter_point_chunks`) and kikuchipy (`point_array`, lazy dask, 1-D navigation).
+- **Scan-ID pairing**: bytes 42-57 = scan GUID (little-endian GUID layout) = `# SCANID` of the .ang
+  (`find_paired_ang`: project files first, then the .up2's folder). View tab: 'paired map' in the metadata, IQ / CI /
+  PRIAS of the paired .ang on the same cells, the comparison line (high-passed pattern quality vs IQ on points with
+  CI >= 0.1, r and best shift; JU04 Area 1 / 2 at step 2: best shift (0, 0)). Note: band-free regions (pores, the
+  non-diffracting area) score HIGH in the frequency-inertia pattern quality but low in OIM's IQ.
+- **Hexagonal cells in the View tab**: the .up2 overview is a `layers.Layer` on a hex `CellLayout` (same tile
+  renderer as the EBSD viewer: brick when zoomed out, hexagons at >= 8 px per cell). Subsampling keeps a hex grid:
+  every other kept row starts step/2 points later (overview cache version 3).
+- **Feedback**: e-mail removed (button, setting; old `email` keys are ignored). **Save report for Claude**
+  (`report.py`, Help menu '?', Feedback dialog, Ctrl+Shift+R captured before WebView2 reloads the page):
+  `reports/YYYY-MM-DD_HHMM_<category>.md` + `.json` (+ `.png`), sections in the order requested; breadcrumbs
+  (`breadcrumbs.py`: clicks via a capture-phase JS listener, tabs, dialogs, recipe steps from `service.run`, errors
+  from a root-logger handler with full tracebacks), paths shortened to file names.
+- **Stitch**: one Export button (next to 'Stitch'); with BSE and SE mosaics it asks which one.
+- **Tests adjusted**: JU02 crop raw-preset reference counts (35 px of larger voids no longer filled: small voids 841,
+  filled 1030, unfilled 22; identical in MATLAB); phase-2 conformance boundary lengths allow 1 % of a step per
+  not-indexed pixel (RI02 crop now keeps 224 more not-indexed px; calcGrains' alpha fill next to them differs, D7);
+  cross-backend replay expects `other_backend` (fix 3 behaviour, the test was stale).
+- **Data note**: the JU06_tensile PRIAS export has a step in its own values at row ~429 (row means 757 -> 744), visible
+  as a band at the bottom of the PRIAS map; it is in the exported text, not from the matching.

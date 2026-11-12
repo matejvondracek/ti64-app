@@ -1,9 +1,10 @@
 """Feedback button (fix 3.2): a report with the description, category, app version, backend, OS and the last 100 log
-lines (paths shortened to file names, because GitHub issues are public), as a pre-filled GitHub issue or e-mail, and
-as a .zip (report + log tail + optional window screenshot) to attach.
+lines (paths shortened to file names, because GitHub issues are public), as a pre-filled GitHub issue and as a .zip
+(report + log tail + optional window screenshot) to attach. The e-mail option was removed in fix 4; the detailed local
+report for Claude is report.py.
 
-GitHub's "new issue" URL and mailto: links have length limits (browsers / mail clients cut at ~2-8 kB), so the URL
-bodies carry the report with a shortened log; the .zip always has the full 100 lines.
+GitHub's "new issue" URL has a length limit (browsers cut at ~2-8 kB), so the URL body carries the report with a
+shortened log; the .zip always has the full 100 lines.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import re
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 from . import __version__
 from .settings import logs_dir
@@ -41,11 +42,6 @@ def log_tail(n: int = 100, log_file: Path | None = None) -> list[str]:
     except OSError:
         return []
     return [shorten_paths(ln) for ln in lines]
-
-
-def subject(category: str) -> str:
-    """E-mail subject: exactly "[Ti64] Bug", "[Ti64] Idea" or "[Ti64] Question"."""
-    return f"[Ti64] {CATEGORIES[category]}"
 
 
 def build_report(description: str, category: str, backend: str, log_lines: list[str] | None = None,
@@ -81,20 +77,6 @@ def github_issue_url(repo_url: str, report: dict) -> str:
     while len(url) > MAX_URL and len(body) > 200:
         body = body[: int(len(body) * 0.8)] + "\n…(cut; see the attached .zip)"
         url = f"{base}/issues/new?" + urlencode({"title": report["title"], "body": body})
-    return url
-
-
-def mailto_url(email: str, category: str, report: dict, zip_name: str = "") -> str:
-    body = report["body_short"]
-    if zip_name:
-        body = f"(Please attach {zip_name}: it holds the full report.)\n\n" + body
-
-    def make(b):
-        return f"mailto:{email}?subject={quote(subject(category))}&body={quote(b)}"
-    url = make(body)
-    while len(url) > MAX_URL and len(body) > 200:
-        body = body[: int(len(body) * 0.8)] + "\n…(cut; see the attached .zip)"
-        url = make(body)
     return url
 
 

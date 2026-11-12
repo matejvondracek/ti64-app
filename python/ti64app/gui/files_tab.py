@@ -85,9 +85,16 @@ def files_page(sel: str | None = None) -> None:
             error(e, "Could not add the files")
             return
         gs.set("last_folder", str(Path(paths[0]).parent))
-        skipped = len(paths) - len(added)
+        from ..io import prias  # noqa: PLC0415
+
+        n_prias = sum(1 for x in paths if prias.is_prias_file(x) and prias.ang_of(x) is not None)
+        skipped = len(paths) - len(added) - n_prias
+        with_prias = [m for m in added if m.kind == "ang" and prias.find_files(m.file)]
         ui.notify(f"{len(added)} file(s) linked" + (f" to {target}" if target else "")
-                  + (f"; {skipped} JEOL .txt sidecar(s) shown with their images" if skipped else ""), type="positive")
+                  + (f"; {skipped} JEOL .txt sidecar(s) shown with their images" if skipped > 0 else "")
+                  + (f"; {n_prias} PRIAS export(s) used with their .ang" if n_prias else "")
+                  + (f"; PRIAS found next to {len(with_prias)} .ang map(s) (map sheet, section 'PRIAS')"
+                     if with_prias else ""), type="positive", multi_line=True)
         if added:
             select("file", added[-1].id)
         unassigned = [m for m in p.files() if m.sample_id is None and suggest_sample_id(m.file)]
@@ -612,6 +619,8 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
                             "click to confirm").classes("text-xs text-amber-800")
             hint.set_visibility(m.input_state is None)
             ist.on_value_change(lambda e: save(input_state=e.value) and hint.set_visibility(False))
+        _phases_section(m, save)
+        _prias_section(m)
         # build direction in map coordinates (+ prefill from the sample's other maps)
         bd = m.build_direction
         ui.label("Build direction in map coordinates (x right, y down)").classes("text-sm mt-1").tooltip(tip("bd_map"))
@@ -696,6 +705,72 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
             ui.label(why if not sug else f"suggested: {sug} ({why})").classes("text-xs ti-muted")
 
 
+def _phases_section(m: MapInfo, save) -> None:
+    """Phases of the .ang: found by crystal symmetry (6/mmm -> α, m-3m -> β), never by name; the user can change the
+    mapping here (needed when the symmetry does not decide). Changing it marks the map's results stale."""
+    from ..io.ang import read_header  # noqa: PLC0415
+    from ..phases import ROLE_LABEL, resolve  # noqa: PLC0415
+
+    try:
+        hp = read_header(m.file).phases
+    except OSError:
+        return
+    phases, problems = resolve(hp, m.phase_map)
+    box = ui.column().classes("w-full gap-1 mt-1").mark("ms_phases")
+    with box:
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Phases").classes("text-sm").tooltip(tip("phases"))
+            ui.label("found by crystal symmetry (6/mmm → α, m-3m → β), never by name").classes("text-xs ti-muted")
+        if problems:
+            with ui.column().classes("w-full gap-0 p-2 rounded bg-amber-50 border border-amber-300")                     .mark("ms_phases_ambiguous"):
+                ui.label("The crystal symmetry does not tell the phases apart: choose the role of each phase in the "
+                         "'role' lists below before loading.").classes("text-xs text-amber-900")
+                for q in problems:
+                    ui.label("• " + q).classes("text-xs text-amber-900")
+
+        def changed(pid: int, role: str) -> None:
+            cur = dict(m.phase_map or {})
+            cur[str(pid)] = role
+            sug = {str(ph.id): ph.suggested for ph in phases}
+            new = {k: v for k, v in cur.items() if sug.get(k) != v}
+            if save(phase_map=new or None):
+                ui.notify("Phase mapping saved. Results of this map that used the old mapping are stale and "
+                          "are computed again on the EBSD tab.", type="info")
+        for ph in phases:
+            with ui.row().classes("items-center no-wrap gap-2"):
+                ui.label(f"{ph.id}").classes("text-sm w-4 ti-muted")
+                ui.label(ph.original).classes("text-sm w-48 truncate").tooltip(f"name in the file: {ph.original}")
+                ui.label(ph.laue or "unknown symmetry").classes("text-sm w-20")
+                ui.select(ROLE_LABEL, value=ph.role, label="role",
+                          on_change=lambda e, pid=ph.id: changed(pid, e.value))                     .props("dense options-dense").classes("w-48").mark(f"ms_phase_{ph.id}")
+                ui.label("set here" if ph.source == "map sheet" else "by symmetry").classes("text-xs ti-muted")
+        if m.phase_map:
+            ui.button("Use the crystal symmetry again", icon="undo", on_click=lambda: save(phase_map=None))                 .props("dense flat no-caps size=sm").mark("ms_phases_reset")
+
+
+def _prias_section(m: MapInfo) -> None:
+    """PRIAS text exports found next to the .ang (<map>_prias.txt): channel, point check."""
+    from ..io import prias  # noqa: PLC0415
+
+    files = prias.find_files(m.file)
+    with ui.column().classes("w-full gap-1 mt-1").mark("ms_prias"):
+        with ui.row().classes("items-center gap-2"):
+            ui.label("PRIAS (virtual BSE)").classes("text-sm").tooltip(tip("prias"))
+            if not files:
+                ui.label(f"no PRIAS export found next to the .ang (expected {Path(m.file).stem}_prias.txt in the "
+                         "same folder); the IQ map is used as the registration reference").classes("text-xs ti-muted")
+        for f in files:
+            try:
+                c = prias.check(f, m.file)
+            except Exception as e:  # noqa: BLE001
+                c = {"ok": False, "channel": "?", "message": f"cannot read it: {e}"}
+            with ui.row().classes("items-center no-wrap gap-2"):
+                ui.icon("check_circle" if c["ok"] else "error", size="18px")                     .classes("text-green-700" if c["ok"] else "text-red-700")
+                ui.label(f"{c['channel']}").classes("text-sm w-36")
+                ui.label(f.name).classes("text-xs ti-muted truncate").tooltip(str(f))
+            ui.label(c["message"]).classes("text-xs " + ("ti-muted" if c["ok"] else "text-red-800"))                 .mark("ms_prias_msg")
+
+
 def _inherited_fields(m: MapInfo, s: SampleInfo | None, save, msg) -> None:
     """Material / process / heat treatment / 4PB: greyed 'from sample' unless overridden for this file."""
     ui.label("From the sample sheet" + ("" if s else " (assign the file to a sample)")).classes("font-semibold mt-1")
@@ -759,7 +834,8 @@ def _metadata(p: Project, m: MapInfo) -> None:
             h = read_header(f)
             rows += [("grid", "hexagonal" if h.is_hex else "square"), ("step", f"{h.step_um:g} µm"),
                      ("points (header)", f"{h.n_points:,}"),
-                     ("phases", ", ".join(ph.get("name", "?") for ph in h.phases) or "–"),
+                     ("phases", ", ".join(f"{ph.get('id')} {ph.get('MaterialName', '?')}" for ph in h.phases) or "–"),
+                     ("scan ID", h.fields.get("SCANID", "–")),
                      ("PRIAS columns declared", "yes" if h.declares_prias else "no")]
         elif m.kind == "image" and f.is_file():
             from ..io import bse  # noqa: PLC0415
@@ -779,10 +855,18 @@ def _metadata(p: Project, m: MapInfo) -> None:
         elif m.kind == "up2" and f.is_file():
             from ..io.up2 import read_header  # noqa: PLC0415
 
+            from ..modules.up2_pair import paired  # noqa: PLC0415
+
             h = read_header(f)
-            rows += [("patterns", f"{h.n_patterns:,} of {h.pattern_width} × {h.pattern_height} px"),
+            pr = paired(p, f)
+            rows += [("scan points", f"{h.n_points:,}"),
+                     ("patterns in the file", f"{h.n_patterns:,} of {h.pattern_width} × {h.pattern_height} px"
+                      + (f" ({h.n_padding:,} padding patterns, one per short hex row, skipped)" if h.n_padding else "")),
                      ("grid", f"{'hexagonal' if h.hex_grid else 'square'}, {h.n_cols} × {h.n_rows}"),
                      ("step", f"{h.x_step_um:g} × {h.y_step_um:g} µm"),
+                     ("scan ID", h.scan_id or "–"),
+                     ("paired map", (f"{pr.ang.name}" + (f" (map {pr.map_id})" if pr.map_id else " (not linked)"))
+                      if pr else "no .ang with the same scan ID"),
                      ("file size check", "ok" if h.size_ok else "size does not match the header"),
                      ("note", "streamed in chunks for indexing; never loaded fully")]
     except Exception as e:  # noqa: BLE001

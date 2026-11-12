@@ -71,4 +71,5 @@ def test_replay_with_other_backend(matlab, project, crop300_ju02):
     other = service.replay(project, backend="matlab")
     assert other.ok, other
     st = {c.output: c.status for c in other.checks if c.op == "ebsd.load"}
-    assert st["ebsd"] == "within_tolerance"            # float rounding / quaternion sign differ
+    # fix 3: outputs of another backend are not compared value by value (conformance tests do that)
+    assert st["ebsd"] == "other_backend"

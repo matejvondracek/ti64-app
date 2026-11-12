@@ -38,6 +38,9 @@ def setup_logging() -> Path:
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         root.addHandler(h)
         root.setLevel(logging.INFO)
+    from ..breadcrumbs import install  # noqa: PLC0415  (errors since start, for the report for Claude)
+
+    install()
     return f
 
 
