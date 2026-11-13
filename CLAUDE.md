@@ -151,3 +151,7 @@ Used by a human through a GUI and by Claude through MCP tools. Same core functio
 - After each feature, run it on the real maps in data/test/ and save a PNG for visual check (in projects/).
 - When I mention a report, first read the newest file(s) in reports/ (git-ignored, written by the app).
 - When unsure about a physical/method choice, ask instead of guessing; list assumptions in docs/decisions.md.
+- If a file named in my prompt is not where I said: search data/, docs/ and reports/ for the same base
+  name with any extension (.png/.jpg/.jpeg/.bmp/.tif) and close variants of the name. One clear match ->
+  use it and tell me the real path; none or several -> stop and ask me before doing that part.
+  Never skip a check or invent a substitute because a file is missing.
