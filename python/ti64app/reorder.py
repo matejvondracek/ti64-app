@@ -30,13 +30,16 @@ REQUIRES: dict[str, tuple[tuple[str, ...], str]] = {
     "grainsize.run": (("grains.calc",), "grains (Grains and boundaries)"),
     "grainsize.figure": (("grainsize.run",), "a grain-size analysis"),
     "grainsize.compare_oim": (("grainsize.run",), "a grain-size analysis"),
+    "texture.run": (MAP_OPS, "a loaded or cleaned map"),
+    "elastic.run": (MAP_OPS, "a loaded or cleaned map"),
 }
 REF_KEYS = ("source", "grains", "recon", "values", "grainsize")
 NAMES = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "ebsd.clean": "Cleanup operation", "grains.calc": "Grains and boundaries",
          "map.compute": "KAM / GROD / GOS / GND map", "figure": "Figure", "compare.oim": "Compare with OIM",
          "recon.run": "Prior-β reconstruction", "recon.sweep": "Parameter sweep", "recon.figure": "Reconstruction figure",
          "grainsize.run": "Grain size", "grainsize.figure": "Grain-size figure",
-         "grainsize.compare_oim": "Grain size vs OIM", "annotations.set": "Annotations"}
+         "grainsize.compare_oim": "Grain size vs OIM", "annotations.set": "Annotations", "texture.run": "Texture",
+         "elastic.run": "Elastic properties"}
 FIXED_OPS = ("sample.set", "ebsd.crop", "compare.backends")          # never moved by a reorder
 
 

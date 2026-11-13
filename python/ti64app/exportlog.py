@@ -20,7 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-EXPORT_OPS = ("export.map", "sem.export")
+EXPORT_OPS = ("export.map", "sem.export", "texture.export_odf")
 LOG_NAME = "export_log.json"
 
 

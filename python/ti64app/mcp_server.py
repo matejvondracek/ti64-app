@@ -133,7 +133,8 @@ TOOL_FOR_OP = {
     "grainsize.run": "grain_size", "grainsize.figure": "grain_size_figure",
     "grainsize.compare_oim": "compare_oim_grain_size", "annotations.set": "set_annotations",
     "ebsd.crop": "crop_map", "export.map": "export_map", "compare.backends": "compare_backends",
-    "sem.stitch": "stitch_images", "sem.export": "export_mosaic",
+    "sem.stitch": "stitch_images", "sem.export": "export_mosaic", "texture.run": "texture",
+    "texture.export_odf": "export_odf", "elastic.run": "elastic_properties",
 }
 
 
@@ -409,6 +410,73 @@ def add_default_cleanup(project: str, map_id: str, backend: Backend | None = Non
     p = _project(project)
     steps = service.add_default_cleanup(p, map_id, backend)
     return {"steps": [{**_step_summary(s), "report": _json_out(p, s, "report")} for s in steps]}
+
+
+@server.tool()
+def texture(project: str, map_id: str, phase: Literal["alpha", "beta"] = "alpha",
+            region: Literal["map", "roi", "sample"] = "map", roi_id: str | None = None,
+            weighting: Literal["pixel", "grain"] = "pixel", halfwidth_deg: float = 5.0,
+            poles: list[str] | None = None, ipf_dirs: list[str] | None = None,
+            custom_vector: tuple[float, float, float] | None = None,
+            plot: Literal["density", "scatter", "both"] = "density", backend: Backend | None = None) -> dict[str, Any]:
+    """Texture (phase 6.7) of alpha or reconstructed prior-beta ('beta') orientations of a map, an ROI or all maps of
+    its sample, in the specimen frame (X beam axis, Y thickness, Z width, from the map sheet position; BD from the
+    sample sheet): kernel-density ODF (halfwidth deg), max MRD, texture index, grains used (warns when few), pole
+    figures (alpha {0001} {10-10} {11-20} {10-11}; beta {100} {110} {111}) and inverse pole figures (BD, beam axis,
+    width, custom) drawn by the backend. weighting: per pixel (area) or one point per grain."""
+    p = _project(project)
+    step = service.apply(p, "texture.run", _clean({
+        "map_id": map_id, "phase": phase, "region": region, "roi_id": roi_id, "weighting": weighting,
+        "halfwidth_deg": halfwidth_deg, "poles": poles, "ipf_dirs": ipf_dirs, "custom_vector": custom_vector,
+        "plot": plot}), backend=backend)
+    return {**_step_summary(step), "summary": _json_out(p, step, "summary"), "pole_figures": _path(p, step, "pf"),
+            "inverse_pole_figures": _path(p, step, "ipf")}
+
+
+@server.tool()
+def export_odf(project: str, texture_step: str, file: str | None = None) -> dict[str, Any]:
+    """Export the ODF of a texture step in MTEX's text format (loadODF), with a JSON sidecar; logged in the export
+    log. file = target path (default: only inside the project's exports folder)."""
+    p = _project(project)
+    step, e = service.export(p, "texture.export_odf", {"texture": texture_step}, target=file)
+    return {"export_id": e.id, "file": e.file or str(p.root / step.outputs["export"].path)}
+
+
+@server.tool()
+def elastic_properties(project: str, map_id: str, region: Literal["map", "roi", "sample"] = "map",
+                       roi_id: str | None = None, weighting: Literal["pixel", "grain"] = "pixel",
+                       preset_alpha: str | None = None, preset_beta: str | None = None, include_beta: bool = True,
+                       directions: list[str] | None = None, custom_vector: tuple[float, float, float] | None = None,
+                       bootstrap_runs: int = 200, backend: Backend | None = None) -> dict[str, Any]:
+    """Young's modulus from texture (phase 6.7): single-crystal constants (Settings presets, GPa; list them with
+    elastic_presets) rotated into the specimen frame and averaged: Voigt / Reuss / Hill 6x6 matrices, E along BD /
+    beam axis / width / custom with +- SD from a bootstrap over grains, Emax / Emin, stereographic + 3D plot. Alpha +
+    retained beta mixed by area fraction; porosity ignored."""
+    p = _project(project)
+    step = service.apply(p, "elastic.run", _clean({
+        "map_id": map_id, "region": region, "roi_id": roi_id, "weighting": weighting, "preset_alpha": preset_alpha,
+        "preset_beta": preset_beta, "include_beta": include_beta, "directions": directions,
+        "custom_vector": custom_vector, "bootstrap_runs": bootstrap_runs}), backend=backend)
+    return {**_step_summary(step), "summary": _json_out(p, step, "summary"), "figure": _path(p, step, "figure")}
+
+
+@server.tool()
+def sample_youngs_modulus(project: str, sample_id: str, direction: str = "beam axis") -> dict[str, Any]:
+    """E along one direction (default the beam axis) for every EBSD map of a sample, from each map's newest elastic
+    result (input for the 4PB stress maps of phase 7). Maps without a result have E null."""
+    from .ops_texture import sample_E_table  # noqa: PLC0415
+
+    return {"sample": sample_id, "direction": direction, "maps": sample_E_table(_project(project), sample_id, direction)}
+
+
+@server.tool()
+def elastic_presets() -> dict[str, Any]:
+    """Single-crystal elastic-constant presets (GPa) stored in Settings, with source and DOI, and the defaults."""
+    from .settings import load_settings  # noqa: PLC0415
+
+    es = load_settings().elastic
+    return {"default_alpha": es.default_alpha, "default_beta": es.default_beta,
+            "presets": {k: v.model_dump(mode="json") for k, v in es.presets.items()}}
 
 
 @server.tool()

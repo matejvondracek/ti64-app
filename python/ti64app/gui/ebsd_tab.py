@@ -21,6 +21,7 @@ from .. import progress, service
 from ..annotations import ROI_TYPES, Annotation, load_annotations, roi_box
 from ..backends import backend_status
 from ..backends.base import CLEAN_LABELS
+from ..texture import PF_ALPHA, PF_BETA
 from ..project import Project
 from ..settings import IpfKeySetting, load_settings, save_preferences
 from . import dialogs, tiles
@@ -40,6 +41,9 @@ DEFAULT_OV_COLOR = {"hagb": "#000000", "lagb": "#a6a6a6", "interface": "#d91a1a"
                     "crack": "#e00000"}
 ON_DEMAND = ("kam", "grod", "gos", "gnd")             # listed in the map selector, computed on first use (fix 3.9)
 IPF_KINDS = ("ipf", "parent_ipf")
+PANEL_TABS = ("results", "pf", "ipf", "elastic")
+REGION_LABELS = {"map": "whole map", "roi": "ROI", "sample": "all maps of the sample"}
+IPF_DIR_OPTIONS = ["BD", "beam axis", "width", "thickness", "map x", "map y", "map z", "custom"]      # map tabs without the map viewer (phase 6.7: texture, elastic)
 # cleanup sub-panels (fix 5): operation, icon, fields (name, num | check, label, default, number options)
 CLEAN_UI = [
     ("ci_threshold", "filter_alt", [("ci_threshold", "num", "CI threshold (points below → not indexed)", 0.1,
@@ -257,6 +261,8 @@ def ebsd_page() -> None:
       .ti64-scalebar { background: rgba(255,255,255,.85); padding: 3px 6px 2px; border-radius: 4px; }
       .ti64-scalebar .bar { height: 5px; background: #000; }
       .ti64-scalebar .lab { font: 11px sans-serif; text-align: center; }
+      /* the edit menu never grows wider than its 360 px column (a row of two selects with long labels did) */
+      [data-testid="edit_menu"] .q-scrollarea__content { width: 100%; max-width: 100%; }
       .ti-ovgrid { display: grid; grid-auto-flow: column; grid-template-rows: repeat(4, auto); gap: 4px 18px;
                    padding: 10px 12px; }
     """)
@@ -334,6 +340,9 @@ def ebsd_page() -> None:
             t_beta = ui.tab("beta", label="prior β", icon="hub").mark("mtab_beta")
             t_beta.set_visibility(False)                # shown once the map has a reconstruction
             ui.tab("results", label="Results", icon="insights").mark("rtab_results")
+            ui.tab("pf", label="Pole figures", icon="radio_button_checked").mark("rtab_pf")
+            ui.tab("ipf", label="Inverse pole figures", icon="change_history").mark("rtab_ipf")
+            ui.tab("elastic", label="Elastic", icon="compress").mark("rtab_elastic")
         with ui.row().classes("w-full grow no-wrap gap-0 items-stretch min-h-0"):
             with ui.column().classes("grow gap-0 min-w-0 h-full") as map_col:
                 holder = ui.column().classes("w-full grow gap-0 min-h-0").mark("map_holder")
@@ -346,6 +355,9 @@ def ebsd_page() -> None:
                 with results:
                     ui.label("Figures and tables of Apply / Draw appear here.").classes("text-sm ti-muted")
             res_col.set_visibility(False)
+            with ui.scroll_area().classes("grow h-full") as tex_col:        # phase 6.7: PF / IPF / Elastic tabs
+                tex_box = ui.column().classes("w-full gap-3 p-3").mark("texture_panel")
+            tex_col.set_visibility(False)
             hist_col = ui.column().classes("h-full shrink-0 bg-white border-l gap-0").style("width: 290px") \
                 .mark("history_panel")
             with hist_col:
@@ -422,8 +434,11 @@ def ebsd_page() -> None:
                                      "and run the step again.")
 
     def set_tab(t: str) -> None:
-        map_col.set_visibility(t != "results")
+        map_col.set_visibility(t not in PANEL_TABS)
         res_col.set_visibility(t == "results")
+        tex_col.set_visibility(t in ("pf", "ipf", "elastic"))
+        if t in ("pf", "ipf", "elastic"):
+            texture_panel(t)
         st["switching"] = True
         mtabs.value = t
         st["switching"] = False
@@ -505,7 +520,7 @@ def ebsd_page() -> None:
         finally:
             n.dismiss()
 
-    def export_result(step, title: str) -> None:
+    def export_result(step, title: str, variant: str | None = None) -> None:
         folder = gs.get("export_folder") or str(_pictures())
         with ui.dialog() as dlg, ui.card().classes("w-[34rem] max-w-full gap-3").mark("result_export_dialog"):
             ui.label(f"Export {title}").classes("text-lg font-semibold")
@@ -533,7 +548,7 @@ def ebsd_page() -> None:
                 gs.set("result_fmt", fmt.value)
                 n = ui.notification(f"Exporting {t.name} …", spinner=True, timeout=None)
                 try:
-                    await ng_run.io_bound(service.export_result, p, step.id, fmt.value, t)
+                    await ng_run.io_bound(service.export_result, p, step.id, fmt.value, t, variant)
                     ui.notify(f"Exported {t.name} to {t.parent}", type="positive")
                 except Exception as e:  # noqa: BLE001
                     error(e, "Export failed")
@@ -1119,6 +1134,13 @@ def ebsd_page() -> None:
     lr, ls = lastp("recon.run").get("params") or {}, lastp("grainsize.run")
     hooks: dict = {"history": None}
 
+    def roi_options() -> dict:
+        """ROIs drawn on this map (annotations), for the texture / elastic region."""
+        try:
+            return {a.id: f"ROI {a.text or a.id}" for a in load_annotations(p, st["map"]) if a.type in ROI_TYPES}
+        except Exception:  # noqa: BLE001
+            return {}
+
     with menu:
         with ui.column().classes("w-full gap-0"):
             with ui.row().classes("w-full items-center no-wrap gap-1 px-4 pt-2 min-w-0"):
@@ -1565,6 +1587,126 @@ def ebsd_page() -> None:
                     .props("flat").tooltip(tip("gs_oim"))
                 tab_vis.append((oim_btn, "alpha"))                   # compares α grains only
 
+            # 6b texture (phase 6.7): ODF, pole figures, inverse pole figures in the specimen frame
+            lt = lastp("texture.run")
+            with Section(gs, "texture", "Texture", "radio_button_checked") as stx:
+                ui.label("ODF of α or reconstructed prior-β orientations in the specimen frame (beam axis / "
+                         "thickness / width, from the map sheet's position; BD from the sample sheet). Results: the "
+                         "'Pole figures' and 'Inverse pole figures' tabs above the map.").classes("text-xs ti-muted")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    tph = stx.select("phase", {"alpha": "α", "beta": "prior β (reconstruction)"},
+                                     g(lt, "phase", default="alpha"), "phase", "tex_phase")
+                    tph.classes("min-w-0 flex-1")
+                    stx.select("weighting", {"pixel": "per pixel (area)", "grain": "one point per grain"},
+                               g(lt, "weighting", default="pixel"), "weighting", "tex_weighting") \
+                        .classes("min-w-0 flex-1")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    treg = stx.select("region", REGION_LABELS, g(lt, "region", default="map"), "region", "tex_region")
+                    troi = stx.select("roi_id", roi_options(), _in(g(lt, "roi_id"), roi_options()), "ROI", "tex_roi")
+                troi.bind_visibility_from(treg, "value", backward=lambda v: v == "roi")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    stx.num("halfwidth_deg", "kernel halfwidth [°]", g(lt, "halfwidth_deg", default=5.0),
+                            "tex_halfwidth", step=0.5, min=1, max=30)
+                    stx.select("plot", {"density": "density (MRD)", "scatter": "scatter", "both": "both"},
+                               g(lt, "plot", default="density"), "plot", "tex_plot")
+                tpoles = stx.select("poles", list(PF_ALPHA), g(lt, "poles") or list(PF_ALPHA), "pole figures",
+                                    "tex_poles", multiple=True).props("use-chips")
+                tdirs = stx.select("ipf_dirs", IPF_DIR_OPTIONS, g(lt, "ipf_dirs", default=["BD", "beam axis", "width"]),
+                                   "inverse pole figures along", "tex_ipf_dirs", multiple=True).props("use-chips")
+                tcv = ui.row().classes("w-full no-wrap gap-2")
+                with tcv:
+                    tex_cv = [stx.num(f"cv_{c}", f"custom {c}", v, "tex_custom", step=0.1)
+                              for c, v in zip("xyz", g(lt, "custom_vector") or (0.0, 0.0, 1.0))]
+                tcv.bind_visibility_from(tdirs, "value", backward=lambda v: "custom" in (v or []))
+
+                def tex_phase_changed(e):
+                    opts = list(PF_ALPHA) if e.value == "alpha" else list(PF_BETA)
+                    tpoles.options = opts
+                    tpoles.value = [o for o in (tpoles.value or []) if o in opts] or opts
+                    tpoles.update()
+                tph.on_value_change(tex_phase_changed)
+                if tph.value == "beta":
+                    tpoles.options = list(PF_BETA)
+                    tpoles.update()
+
+                def tex_params() -> dict:
+                    d = {"phase": stx.v("phase"), "weighting": stx.v("weighting"), "region": stx.v("region"),
+                         "halfwidth_deg": float(stx.v("halfwidth_deg") or 5), "plot": stx.v("plot"),
+                         "poles": list(stx.v("poles") or []) or None, "ipf_dirs": list(stx.v("ipf_dirs") or [])}
+                    if d["region"] == "roi":
+                        d["roi_id"] = stx.v("roi_id")
+                    if "custom" in d["ipf_dirs"]:
+                        d["custom_vector"] = [float(c.value or 0) for c in tex_cv]
+                    return d
+
+                async def apply_texture():
+                    if stx.v("region") == "roi" and not stx.v("roi_id"):
+                        ui.notify("Choose the ROI (draw one with an ROI tool of the 'tool' list first).",
+                                  type="warning")
+                        return
+                    step = await run_step("texture.run", tex_params(), "texture")
+                    if step:
+                        stx.applied()
+                        set_tab("pf")
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Apply", icon="check", on_click=apply_texture).mark("run_texture")
+                    ui.button("Export ODF…", icon="ios_share", on_click=lambda: export_odf()).props("outline") \
+                        .mark("export_odf").tooltip("The ODF of the newest texture result in MTEX's text format "
+                                                    "(loadODF), with a JSON sidecar; listed under 'Earlier exports'")
+
+            # 6c elastic properties (phase 6.7): Young's modulus from texture
+            le = lastp("elastic.run")
+            es_ = load_settings().elastic
+            with Section(gs, "elastic", "Elastic properties", "compress") as sel_:
+                ui.label("Young's modulus from the α (+ retained β) texture: single-crystal constants rotated into the "
+                         "specimen frame and averaged (Voigt, Reuss, Hill), ± SD from a bootstrap over grains. "
+                         "Constants: Settings, section 'Elastic constants'. Porosity is ignored. Result: the "
+                         "'Elastic' tab.").classes("text-xs ti-muted")
+                _pa = [k for k, v in es_.presets.items() if v.phase == "alpha"]
+                _pb = [k for k, v in es_.presets.items() if v.phase == "beta"]
+                sel_.select("preset_alpha", _pa, _in(g(le, "preset_alpha"), _pa) or _in(es_.default_alpha, _pa),
+                            "α constants", "el_preset")
+                sel_.select("preset_beta", _pb, _in(g(le, "preset_beta"), _pb) or _in(es_.default_beta, _pb),
+                            "retained β constants", "el_preset")
+                sel_.check("include_beta", "include retained β (by its area fraction)",
+                           g(le, "include_beta", default=True), "el_include_beta")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    ereg = sel_.select("region", REGION_LABELS, g(le, "region", default="map"), "region", "tex_region")
+                    eroi = sel_.select("roi_id", roi_options(), _in(g(le, "roi_id"), roi_options()), "ROI", "tex_roi")
+                eroi.bind_visibility_from(ereg, "value", backward=lambda v: v == "roi")
+                with ui.row().classes("w-full no-wrap gap-2"):
+                    sel_.select("weighting", {"pixel": "per pixel (area)", "grain": "one point per grain"},
+                                g(le, "weighting", default="pixel"), "weighting", "tex_weighting") \
+                        .classes("min-w-0 flex-1")
+                    sel_.num("bootstrap_runs", "bootstrap runs", g(le, "bootstrap_runs", default=200), "el_bootstrap",
+                             step=50, min=0, max=5000).classes("min-w-0 flex-1")
+                edirs = sel_.select("directions", IPF_DIR_OPTIONS, g(le, "directions",
+                                                                     default=["BD", "beam axis", "width"]),
+                                    "E along", "el_directions", multiple=True).props("use-chips")
+                ecv = ui.row().classes("w-full no-wrap gap-2")
+                with ecv:
+                    el_cv = [sel_.num(f"cv_{c}", f"custom {c}", v, "tex_custom", step=0.1)
+                             for c, v in zip("xyz", g(le, "custom_vector") or (1.0, 0.0, 0.0))]
+                ecv.bind_visibility_from(edirs, "value", backward=lambda v: "custom" in (v or []))
+
+                def el_params() -> dict:
+                    d = {"preset_alpha": sel_.v("preset_alpha"), "preset_beta": sel_.v("preset_beta"),
+                         "include_beta": bool(sel_.v("include_beta")), "region": sel_.v("region"),
+                         "weighting": sel_.v("weighting"), "bootstrap_runs": int(sel_.v("bootstrap_runs") or 0),
+                         "directions": list(sel_.v("directions") or [])}
+                    if d["region"] == "roi":
+                        d["roi_id"] = sel_.v("roi_id")
+                    if "custom" in d["directions"]:
+                        d["custom_vector"] = [float(c.value or 0) for c in el_cv]
+                    return d
+
+                async def apply_elastic():
+                    step = await run_step("elastic.run", el_params(), "elastic properties")
+                    if step:
+                        sel_.applied()
+                        set_tab("elastic")
+                ui.button("Apply", icon="check", on_click=apply_elastic).mark("run_elastic")
+
             # 7 annotations
             with Section(gs, "annotations", "Annotations and ROIs", "edit"):
                 ui.label("Pick a drawing tool in the 'tool' list of the map toolbar. 2-point tools: click start and end; polylines / crack / "
@@ -1598,6 +1740,139 @@ def ebsd_page() -> None:
             with ui.expansion("Compare backends", icon="compare_arrows", group="ebsd").classes("w-full ti-section") \
                     .mark("sec_compare"):
                 compare_section(p, lambda: st["map"], show_block, run_step, backend_status())
+
+    # ---- phase 6.7: texture / elastic result tabs ---------------------------------------------------------------------
+    def newest(op_: str):
+        steps_ = [s_ for s_ in p.recipe().steps if s_.op == op_ and not s_.stale and s_.params.get("map_id") == st["map"]]
+        return steps_[-1] if steps_ else None
+
+    def _json_of(step, name="summary") -> dict:
+        try:
+            return json.loads((p.root / step.outputs[name].path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, KeyError):
+            return {}
+
+    def texture_panel(t: str) -> None:
+        """'Pole figures' / 'Inverse pole figures': the newest texture result of the map; 'Elastic': the newest
+        elastic result and the per-sample table of E along the beam axis."""
+        tex_box.clear()
+        with tex_box:
+            if t in ("pf", "ipf"):
+                s_ = newest("texture.run")
+                if s_ is None:
+                    ui.label("No texture yet: section 'Texture' (left), Apply.").classes("text-sm ti-muted") \
+                        .mark("texture_placeholder")
+                    return
+                d = _json_of(s_)
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.label(f"{'Pole figures' if t == 'pf' else 'Inverse pole figures'} · "
+                             f"{'α' if d.get('phase') == 'alpha' else 'prior β'} · {s_.id} ({s_.backend})") \
+                        .classes("font-semibold grow")
+                    ui.button("Export figure…", icon="ios_share",
+                              on_click=lambda: export_result(s_, "pole figures" if t == "pf" else "inverse pole figures",
+                                                             variant=t)).props("outline dense no-caps") \
+                        .mark(f"export_{t}")
+                    if t == "pf":
+                        ui.button("Export ODF…", icon="data_object", on_click=lambda: export_odf()) \
+                            .props("outline dense no-caps").mark("export_odf_tab")
+                ui.image(str(p.root / s_.outputs[t].path)).classes("w-full max-w-5xl").props("fit=contain") \
+                    .mark(f"{t}_image")
+                for w_ in d.get("warnings", []):
+                    ui.label("⚠ " + w_).classes("text-sm text-amber-800")
+                fr = d.get("frame", {})
+                rows = [("ODF", f"kernel density, halfwidth {d.get('halfwidth_deg')}°, {d.get('weighting')} weighting, "
+                                f"{REGION_LABELS.get(d.get('region'), d.get('region'))}"),
+                        ("max MRD", _fmt(d.get("max_mrd"))), ("texture index", _fmt(d.get("texture_index"))),
+                        ("grains used", f"{d.get('n_grains')} ({d.get('n_grains_ecd_ge_5um')} with ECD ≥ 5 µm)"),
+                        ("orientations", f"{d.get('n_orientations'):,}" + (f" (subsampled from {d.get('n_points'):,})"
+                                                                         if d.get("subsampled_to") else "")),
+                        ("maps", ", ".join(d.get("maps", []))), ("frame", fr.get("text", "")),
+                        ("axes", " · ".join(f"{k}: {v}" for k, v in fr.get("labels", {}).items()))]
+                if t == "pf":
+                    rows += [(f"max MRD {k}", _fmt(v)) for k, v in d.get("pf_max_mrd", {}).items()]
+                _table(rows, "texture_stats")
+                return
+            s_ = newest("elastic.run")
+            if s_ is None:
+                ui.label("No elastic result yet: section 'Elastic properties' (left), Apply.") \
+                    .classes("text-sm ti-muted").mark("elastic_placeholder")
+            else:
+                d = _json_of(s_)
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.label(f"Young's modulus from texture · {s_.id} ({s_.backend})").classes("font-semibold grow")
+                    ui.button("Export figure…", icon="ios_share", on_click=lambda: export_result(s_, "E(direction)")) \
+                        .props("outline dense no-caps").mark("export_elastic")
+                ui.image(str(p.root / s_.outputs["figure"].path)).classes("w-full max-w-4xl").props("fit=contain") \
+                    .mark("elastic_image")
+                cols = ["direction", "E Hill [GPa]", "± SD", "E Voigt", "E Reuss"]
+                ui.table(columns=[{"name": c, "label": c, "field": c, "align": "left"} for c in cols],
+                         rows=[{"direction": r["direction"], "E Hill [GPa]": f"{r['E_hill']:.1f}",
+                                "± SD": f"{r['sd_hill']:.1f}" if "sd_hill" in r else "–",
+                                "E Voigt": f"{r['E_voigt']:.1f}", "E Reuss": f"{r['E_reuss']:.1f}"}
+                               for r in d.get("E_table", [])]).props("dense flat").mark("elastic_table")
+                an = d.get("anisotropy", {}).get("hill", {})
+                rows = [("anisotropy (Hill)", f"Emax / Emin = {_fmt(an.get('ratio'), 3)} ({_fmt(an.get('E_max'), 1)} / "
+                                              f"{_fmt(an.get('E_min'), 1)} GPa)"),
+                        ("grains", f"{d.get('n_grains')} ({d.get('n_grains_ecd_ge_5um')} with ECD ≥ 5 µm); "
+                                   f"bootstrap {d.get('bootstrap_runs')} runs over grains")]
+                rows += [(f"{k} ({100 * v['area_fraction']:.2f} % of the area)", f"{v['preset']} doi:{v['doi']}")
+                         for k, v in d.get("phases", {}).items()]
+                rows += [("note", n_) for n_ in d.get("notes", [])]
+                _table(rows, "elastic_stats")
+                with ui.expansion("Stiffness matrices (Voigt notation, specimen frame, GPa)").classes("w-full") \
+                        .mark("elastic_matrices"):
+                    for m_ in ("hill", "voigt", "reuss"):
+                        M = d.get("matrices_GPa", {}).get(m_)
+                        if M:
+                            ui.label(m_.capitalize()).classes("text-sm font-semibold")
+                            ui.html("<pre style='font-size:11px;margin:0'>" + "\n".join(
+                                " ".join(f"{v:8.2f}" for v in row) for row in M) + "</pre>")
+            sid = p.sample_of(st["map"])
+            if sid:
+                from ..ops_texture import sample_E_table  # noqa: PLC0415
+
+                ui.label(f"Sample {sid}: E along the beam axis of every map (Hill, from each map's newest result)") \
+                    .classes("font-semibold mt-2")
+                rows_ = sample_E_table(p, sid)
+                ui.table(columns=[{"name": c, "label": c, "field": c, "align": "left"}
+                                  for c in ("map", "role", "E Hill [GPa]", "± SD", "grains")],
+                         rows=[{"map": r["map"], "role": r["role"] or "–",
+                                "E Hill [GPa]": _fmt(r["E_hill"], 1), "± SD": _fmt(r["sd"], 1),
+                                "grains": r["n_grains"] if r["n_grains"] is not None else "–"} for r in rows_]) \
+                    .props("dense flat").mark("sample_E_table")
+                missing = [r["map"] for r in rows_ if r["E_hill"] is None]
+                if missing:
+                    ui.button(f"Compute for the {len(missing)} map(s) without a result", icon="playlist_play",
+                              on_click=lambda: run_all_maps(missing)).props("outline dense no-caps") \
+                        .mark("elastic_all_maps").tooltip("Runs 'Elastic properties' with the section's values on "
+                                                          "each of these maps (each loads first if needed)")
+
+    async def run_all_maps(maps: list[str]) -> None:
+        prm = el_params()
+        for m_ in maps:
+            if not lay.available(p, m_)["loaded"]:
+                if not await run_step("ebsd.load", {"map_id": m_}, f"loading {m_}", with_map=False):
+                    return
+            if not await run_step("elastic.run", {**prm, "map_id": m_}, f"elastic properties {m_}", with_map=False):
+                return
+        texture_panel("elastic")
+
+    async def export_odf() -> None:
+        s_ = newest("texture.run")
+        if s_ is None:
+            ui.notify("No texture result yet (section 'Texture', Apply).", type="warning")
+            return
+        folder = gs.get("export_folder") or str(_pictures())
+        f_ = await dialogs.save_file("Export ODF (MTEX text)", f"{st['map']}_odf_{s_.id}.txt", folder,
+                                     [("MTEX ODF text", "*.txt")])
+        if not f_:
+            return
+        gs.set("export_folder", str(Path(f_).parent))
+        try:
+            await ng_run.io_bound(service.export, p, "texture.export_odf", {"texture": s_.id}, s_.backend, f_)
+            ui.notify(f"ODF exported to {f_} (+ .json sidecar)", type="positive")
+        except Exception as e:  # noqa: BLE001
+            error(e, "ODF export failed")
 
     # ---- status badges (fix 5): which step each section compares its fields with ------------------------------
     def _step(sid):
@@ -1650,7 +1925,13 @@ def ebsd_page() -> None:
             d_["beta_line_spacing_um"] = s_.params.get("beta_line_spacing_um")
         return {k: v for k, v in d_.items() if v is not None}
     sz.track(p, gs_step, gs_rec)
-    all_secs = [sl, sc, *clean_secs.values(), sg, sk, sr, sz]
+    stx.track(p, lambda: newest("texture.run"),
+              lambda s_: {k: s_.params.get(k) for k in ("phase", "weighting", "region", "halfwidth_deg", "plot")})
+    sel_.track(p, lambda: newest("elastic.run"), lambda s_: {
+        "preset_alpha": s_.params.get("preset_alpha") or load_settings().elastic.default_alpha,
+        "preset_beta": s_.params.get("preset_beta") or load_settings().elastic.default_beta,
+        **{k: s_.params.get(k) for k in ("include_beta", "region", "weighting", "bootstrap_runs")}})
+    all_secs = [sl, sc, *clean_secs.values(), sg, sk, sr, sz, stx, sel_]
 
     def sheet_info():
         from ..sample import missing_fields  # noqa: PLC0415
@@ -1758,8 +2039,8 @@ def ebsd_page() -> None:
     async def on_mtab(e):
         if st.get("switching"):
             return
-        if e.value == "results":
-            set_tab("results")
+        if e.value in PANEL_TABS:
+            set_tab(e.value)
         elif e.value != st["mtab"] or not map_col.visible:
             await select_map(st["map"], tab=e.value)
     mtabs.on_value_change(on_mtab)
@@ -1860,6 +2141,11 @@ def sweep_table(p: Project, step) -> None:
     with ui.grid(columns=3).classes("w-full"):
         for k in sorted(o for o in step.outputs if o.startswith("thumb_")):
             ui.image(str(p.root / step.outputs[k].path))
+
+
+def _in(v, options):
+    """v if it is one of the options (a select's value must be), else None."""
+    return v if v is not None and v in options else None
 
 
 def _fmt(v, nd=2) -> str:

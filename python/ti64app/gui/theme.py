@@ -26,6 +26,9 @@ body {{ background: {PAGE}; color: {TEXT}; font-family: "Segoe UI", system-ui, s
 .ti-muted {{ color: {MUTED}; }}
 .ti-section .q-expansion-item__container > .q-item {{ font-weight: 600; min-height: 44px; }}
 .ti-section {{ border-bottom: 1px solid {BORDER}; }}
+/* fields of the edit sections never widen the 360 px menu (phase 6.7: long option labels, chips) */
+.ti-section .q-field, .ti-subsection .q-field {{ min-width: 0; max-width: 100%; }}
+.ti-section .q-field__native, .ti-section .q-field__control-container {{ min-width: 0; }}
 .ti-draft {{ font-size: 11px; color: {WARN}; border: 1px solid {WARN}; border-radius: 9999px; padding: 0 8px;
              white-space: nowrap; }}
 .ti-stale {{ font-size: 11px; color: #9a3412; background: #fff1e6; border: 1px solid #f0b48a; border-radius: 9999px;

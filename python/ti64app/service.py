@@ -282,6 +282,11 @@ def _write_output(ctx: OpContext, name: str, kind: str, value: Any, stem: str | 
         if Path(value) != path:
             shutil.move(str(value), path)
         h = bytes_hash(path)
+    elif kind == "file":                      # any file written by the op (e.g. an MTEX ODF text): bytes
+        path = ctx.out_dir / f"{name}{Path(value).suffix}"
+        if Path(value) != path:
+            shutil.move(str(value), path)
+        h = bytes_hash(path)
     elif kind in ("svg", "pdf"):              # vector exports: bytes (renderers write fixed metadata if they can)
         path = ctx.out_dir / f"{name}{EXTENSIONS[kind]}"
         if Path(value) != path:
@@ -425,6 +430,8 @@ def tune_key(project: Project, op_name: str, params: dict) -> tuple | None:
         return (op_name, params.get("operation"))
     if op_name in ("map.compute", "figure", "recon.figure", "grainsize.figure"):
         return (op_name, params.get("kind"))
+    if op_name == "texture.run":
+        return (op_name, params.get("phase") or "alpha")
     if op_name == "grainsize.run":
         return (op_name, params.get("target") or "alpha")
     if op_name == "grains.calc":
@@ -511,23 +518,30 @@ def export_again(project: Project, entry_id: str, target: str | Path | None = No
     if e.op == RESULT_EXPORT:
         if t is None:
             raise ValueError("this export has no file to write again; choose one")
-        return None, export_result(project, e.params["step"], e.params["format"], t)
+        return None, export_result(project, e.params["step"], e.params["format"], t, e.params.get("variant"))
     return export(project, e.op, e.params, backend or e.backend, t)
 
 
 # ---- results: save the figure in the backend's editable format, export as an image (fix 3.14) ---------------
-FIGURE_OPS = ("figure", "recon.figure", "grainsize.figure")
+FIGURE_OPS = ("figure", "recon.figure", "grainsize.figure", "texture.run", "elastic.run")
+# figure ops with several figures: the one to draw again ('only' param of texture.run)
+FIGURE_VARIANTS = {"texture.run": ("pf", "ipf")}
 RESULT_EXPORT = "result.export"
 EDITABLE_FORMATS = {"matlab": ("fig", "svg", "pdf"), "pymtex": ("svg", "pdf")}
 EXPORT_FORMATS = ("png", "jpg", "tif", "svg", "pdf")
 
 
-def render_figure_as(project: Project, step_id: str, fmt: str) -> Path:
+def render_figure_as(project: Project, step_id: str, fmt: str, variant: str | None = None) -> Path:
     """Draw a recorded figure step again (same op, parameters and backend, not recorded) as `fmt`: png, tif, svg,
-    pdf, fig (MATLAB only); jpg is converted from the PNG. Returns the file (in cache/save/)."""
+    pdf, fig (MATLAB only); jpg is converted from the PNG. variant = which figure of a step with several (texture.run:
+    'pf' / 'ipf'). Returns the file (in cache/save/)."""
     import uuid  # noqa: PLC0415
 
     s = project.recipe().step(step_id)
+    if s.op in FIGURE_VARIANTS:
+        if variant not in FIGURE_VARIANTS[s.op]:
+            raise ValueError(f"{s.op}: choose the figure: {FIGURE_VARIANTS[s.op]}")
+        s = s.model_copy(update={"params": {**s.params, "only": variant}})
     if s.op not in FIGURE_OPS:
         raise ValueError(f"step {step_id} ({s.op}) is not a figure")
     be = get_backend(s.backend or project.info().backend)
@@ -554,21 +568,23 @@ def render_figure_as(project: Project, step_id: str, fmt: str) -> Path:
     return f
 
 
-def save_figure(project: Project, step_id: str, fmt: str, target: str | Path) -> Path:
+def save_figure(project: Project, step_id: str, fmt: str, target: str | Path, variant: str | None = None) -> Path:
     """'Save' of a figure result: the backend's editable format (MATLAB .fig; pymtex / MATLAB .svg or .pdf vector)."""
     t = Path(target)
     t.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(render_figure_as(project, step_id, fmt), t)
+    shutil.copy2(render_figure_as(project, step_id, fmt, variant), t)
     return t
 
 
-def export_result(project: Project, step_id: str, fmt: str, target: str | Path) -> ExportEntry:
+def export_result(project: Project, step_id: str, fmt: str, target: str | Path,
+                  variant: str | None = None) -> ExportEntry:
     """'Export' of a figure result as png / jpg / tif / svg / pdf, logged in the export log (not a recipe step)."""
     if fmt not in EXPORT_FORMATS:
         raise ValueError(f"format {fmt!r}; choose one of {EXPORT_FORMATS}")
-    t = save_figure(project, step_id, fmt, target)
+    t = save_figure(project, step_id, fmt, target, variant)
     s = project.recipe().step(step_id)
     return exportlog.append(project.root, ExportEntry(op=RESULT_EXPORT, params={"step": step_id, "format": fmt,
+                                                                                 **({"variant": variant} if variant else {}),
                                                                                  "figure_op": s.op, **{k: v for k, v in s.params.items() if k in ("map_id", "kind")}},
                                                       backend=s.backend, versions=s.versions, file=str(t),
                                                       sample_id=s.sample_id, map_id=s.params.get("map_id")))
@@ -1021,3 +1037,4 @@ from . import ops_grainsize  # noqa: E402,F401  (registers the grain-size operat
 from . import ops_export  # noqa: E402,F401  (registers annotations, crop and export, phase 5)
 from . import ops_compare  # noqa: E402,F401  (registers compare.backends, phase 6)
 from . import ops_stitch  # noqa: E402,F401  (registers sem.stitch, phase 6.5)
+from . import ops_texture  # noqa: E402,F401  (registers texture.run, texture.export_odf, elastic.run, phase 6.7)

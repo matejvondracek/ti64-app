@@ -76,7 +76,8 @@ OP_LABEL = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "
             "recon.run": "Prior-β reconstruction", "recon.figure": "Reconstruction figure", "recon.sweep": "Parameter sweep",
             "grainsize.run": "Grain size", "grainsize.figure": "Grain-size figure",
             "grainsize.compare_oim": "Grain size vs OIM", "compare.oim": "Compare with OIM", "sample.set": "Map sheet",
-            "ebsd.crop": "Crop", "compare.backends": "Compare backends"}
+            "ebsd.crop": "Crop", "compare.backends": "Compare backends", "texture.run": "Texture",
+            "elastic.run": "Elastic properties (E from texture)"}
 RECON_OPS = ("recon.run", "recon.figure", "recon.sweep")
 
 

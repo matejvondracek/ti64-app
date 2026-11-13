@@ -387,6 +387,58 @@ class AnalysisBackend(Protocol):
         ...
 
 
+# ---- texture and elastic properties (phase 6.7) ------------------------------------------------------------------
+# Both backends build the ODF (kernel density, de la Vallee Poussin kernel of the given halfwidth, MTEX calcDensity),
+# evaluate pole / inverse pole figure densities in multiples of a random distribution (MRD), export the ODF in MTEX's
+# text format, draw PF / IPF figures (equal-area, upper hemisphere, antipodal, one shared colour range, turbo;
+# XRD_part2.m style) and rotate / average the single-crystal stiffness (MTEX tensors, Mainprice 2011,
+# doi:10.1144/SP360.10). Orientations arrive ALREADY in the specimen frame (ti64app.texture), with weights.
+#   odf_build(handle, phase, quat (n,4), weights (n,), halfwidth_deg) -> (OdfHandle, {max_mrd, texture_index, n})
+#       handle: any map object of the map (gives the phase's crystal symmetry)
+#   odf_pf(odfh, hkl, dirs (m,3)) -> (m,) MRD     odf_ipf(odfh, r (3,), crystal dirs (m,3) cartesian) -> (m,)
+#   odf_export(odfh, path)                       render_texture(odfh, spec: TextureFigureSpec, out) -> Path
+#   stiffness_rotate(handle, phase, quat, C66, weights=None) -> (C, S): weighted means (6,6) with weights,
+#       per orientation (n,6,6) without; Voigt notation, GPa / 1/GPa, specimen frame
+#   render_elastic(spec: ElasticFigureSpec, out) -> Path
+@dataclass(frozen=True)
+class OdfHandle:
+    backend: str
+    id: str
+    phase: str
+
+
+@dataclass
+class TextureFigureSpec:
+    """A pole-figure or inverse-pole-figure figure (one panel per pole / specimen direction)."""
+    kind: Literal["pf", "ipf"]
+    panels: list[dict]                       # pf: {"label", "hkl": tuple}; ipf: {"label", "vector": (x, y, z)}
+    mode: Literal["density", "scatter", "both"] = "density"
+    scatter_quat: np.ndarray | None = None   # (n, 4) orientations in the frame (scatter mode, subsampled)
+    axis_labels: dict[str, str] = field(default_factory=lambda: {"x": "x", "y": "y", "z": "z"})
+    clim: tuple[float, float] | None = None  # shared colour range (MRD); None = 0 .. max over all panels
+    title: str = ""
+    colormap: str = "turbo"
+    width_cm: float = 16.0
+    dpi: int = 300
+    marker_size: float = 2.0
+
+
+@dataclass
+class ElasticFigureSpec:
+    """E(direction) of a stiffness matrix as a stereographic (equal-area, upper hemisphere) plot in the style of
+    stereograph_settings.m and a 3D surface. E on direction_grid(); directions = labelled markers."""
+    E: np.ndarray                            # (n_rho, n_phi) GPa on elastic.direction_grid
+    rho_phi: np.ndarray                      # (2, n_rho, n_phi) rad
+    E_surface: np.ndarray                    # (n_theta, n_phi) GPa over the full sphere (3D surface)
+    theta_phi: np.ndarray                    # (2, n_theta, n_phi)
+    axis_labels: dict[str, str] = field(default_factory=lambda: {"x": "x", "y": "y", "z": "z"})
+    markers: list[tuple[str, tuple[float, float, float], float]] = field(default_factory=list)
+    title: str = ""
+    colormap: str = "turbo"
+    width_cm: float = 18.0
+    dpi: int = 300
+
+
 # per-pixel reconstruction state (prop 'recon_state' of the parent map, same codes in both backends)
 RECON_NOT_INDEXED, RECON_REMOVED, RECON_TRANSFORMED, RECON_UNTRANSFORMED, RECON_RETAINED_BETA = 0, 1, 2, 3, 4
 

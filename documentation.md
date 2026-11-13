@@ -294,10 +294,26 @@ Screenshots: `python scripts/gui_screenshots_fix4.py` → `projects/_screens_fix
 
 Screenshots: `python scripts/gui_screenshots_fix5.py` → `projects/_screens_fix5/` (git-ignored).
 
+### Phase 6.7 – texture and Young's modulus from texture (decision D35)
+
+| Change | Where |
+| --- | --- |
+| Orientation sets in the specimen frame (map sheet position, BD from the sample sheet): α or reconstructed prior β; whole map, ROI or all maps of a sample; per pixel (area) or one point per grain; grain counts and 'few grains' warnings | `texture.py` |
+| ODF (kernel density, halfwidth), max MRD, texture index, PF (α {0001} {10-10} {11-20} {10-11}; β {100} {110} {111}) and IPF (BD, beam axis, width, custom) as density and / or scatter, equal-area, upper hemisphere, antipodal, shared colour range; ODF export in MTEX text format | op `texture.run`, export op `texture.export_odf` (`ops_texture.py`); pymtex `backends/pymtex_texture.py`; MATLAB `+ti64/odfBuild.m`, `odfEval.m`, `odfExport.m`, `renderTexture.m` |
+| Single-crystal elastic-constant presets with source and DOI (Settings, 'Elastic constants'); Voigt / Reuss / Hill stiffness of the polycrystal (α + retained β by area fraction), E along BD / beam axis / width / custom ± bootstrap SD over grains, Emax / Emin, stereographic + 3D E plot; per-sample E along the beam axis | `elastic.py`, op `elastic.run`, `sample_E_table`; pymtex `stiffness_rotate`, MATLAB `+ti64/stiffnessRotate.m`, `renderElastic.m` |
+| EBSD tab: sections 'Texture' and 'Elastic properties', result tabs 'Pole figures', 'Inverse pole figures', 'Elastic' (figures, statistics, matrices, per-sample table, Export figure / Export ODF) | `gui/ebsd_tab.py`, `gui/shell.py` (Settings) |
+| MCP tools `texture`, `export_odf`, `elastic_properties`, `sample_youngs_modulus`, `elastic_presets` | `mcp_server.py` |
+| Tests | `tests/unit/test_phase67.py` (isotropic averages, single orientation, Reuss ≤ Hill ≤ Voigt, frame, ODF export, replay), `test_gui_phase67.py`, `tests/conformance/test_phase67.py` (both backends on the JU02 crop and the full map) |
+
+Screenshots: `python scripts/gui_screenshots_phase67.py` → `projects/_screens_phase67/` (git-ignored).
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
 ## TODO / open points
+
+- [ ] Elastic constants of the V-rich retained β of Ti64 (β preset is a Ti15Mo stand-in, D35).
+- [ ] Hashin–Shtrikman bounds: point to the intended reference (Kovarik2023_HSfit.pdf is about crack growth).
 
 Data and inputs needed from the user:
 - [ ] **OIM images** (IPF and CI exports of the test maps) in `data/reference/`, then run `compare.oim`

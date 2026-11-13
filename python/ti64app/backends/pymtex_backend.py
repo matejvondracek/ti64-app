@@ -15,6 +15,7 @@ from .base import (PHASE_NOT_INDEXED, PROP_NAMES, CleanupParams, CleanupReport, 
                    LoadParams, file_order)
 from .hexgrid import component_sizes, dilation_fill, neighbour_table
 from .pymtex_analysis import PymtexAnalysis
+from .pymtex_texture import PymtexTexture
 
 # per-pixel cleanup flags (prop 'ti64_cleanup', same codes in the MATLAB backend)
 FLAG_KEPT, FLAG_CI, FLAG_SPIKE, FLAG_NOISE, FLAG_FILLED, FLAG_UNFILLED, FLAG_DILATED = 0, 1, 2, 3, 4, 5, 6
@@ -39,7 +40,7 @@ def _n_regions(mask: np.ndarray, nbr: np.ndarray) -> int:
     return int(np.sum(1.0 / sizes[m]).round()) if m.any() else 0
 
 
-class PymtexBackend(PymtexAnalysis):
+class PymtexBackend(PymtexTexture, PymtexAnalysis):
     name = "pymtex"
 
     def __init__(self) -> None:

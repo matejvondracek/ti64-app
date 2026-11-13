@@ -894,3 +894,54 @@
     (`indexing`) and MCP `get_sample_sheet` / `set_indexing_label`.
 - **Tooltips**: 400 ms delay, hidden on mouse-down, key press and window blur, and before the report screenshot
   (the Feedback tooltip was in every screenshot because it was the hovered button).
+
+## D35 (2026-11-13) Phase 6.7: texture and Young's modulus from texture
+
+- **Elastic constants (user decision 2026-11-13).** Values were read from C:/Claude/literature; presets are
+  editable in Settings (`ti64app/elastic.py`), and every elastic step records the constants it used.
+  - α default: Fisher & Renken 1964, pure α-Ti at 298 K, doi:10.1103/PhysRev.135.A482: 162.4 / 180.7 / 92.0 /
+    69.0 / 46.7 / 35.2 GPa (C11 C33 C12 C13 C44 C66; C12 = C11 − 2 C66).
+  - Other α presets:
+    - Rossin 2023 (EBM Ti64, RUS, standard beam energy), doi:10.1016/j.ndteint.2023.102803.
+    - Wielewski 2017 (Ti64, lattice-strain PF), doi:10.1016/j.actamat.2016.12.026, from Table 1 'Optimized' of
+      the paper: C11 169, C12 89, C13 62, C44 43 GPa; C33 = 196 from their constraint C11 + C12 = C13 + C33,
+      C66 = (C11 − C12)/2 = 40. Rossin 2023 (ref. 36) quotes C12 and C13 swapped; the original was used.
+  - β default: Ti15Mo solution-treated single crystal (Olejňák 2023, doi:10.1016/j.matdes.2023.112474), a stand-in;
+    the literature folder has no constants for the V-rich β of Ti64. Other β preset: LCB from the same table.
+  - Kovarik 2022b has only polycrystal E of cold-sprayed Ti64 (80–101 GPa).
+  - Kovarik2023_HSfit.pdf is about fatigue crack growth, not Hashin–Shtrikman bounds; HS bounds are skipped for now.
+- **Frame.** Orientations are rotated from the map frame into the specimen frame by the map sheet position
+  (map +x / +y = specimen axes), g_specimen = R g_map; BD comes from the sample sheet (specimen frame) or the map
+  sheet. Without a position, the map frame is kept (axes x / y / z) and the result says so (`ti64app/texture.py`).
+  'All maps of a sample' needs every map's position.
+- **ODF.**
+  - Both backends: calcDensity, de la Vallée Poussin kernel, halfwidth 5° by default, area weights. Per pixel uses
+    at most 400 000 random points (fixed seed); per grain uses mean orientations with grain-area weights.
+  - Texture index = ‖f‖² (MATLAB: norm(odf)², since textureindex is deprecated in MTEX 7.2; pymtex: textureIndex).
+  - PF / IPF densities are antipodal (mean of ±direction).
+  - pymtex 1.0's radon broadcasts wrongly over many crystal directions, so IPFs use odf.inv().radon(r, h).
+  - On JU02 (crop and full map) both backends agree: max MRD and texture index within 1 %, PF / IPF grids within
+    2 % of the maximum (tests/conformance/test_phase67.py).
+- **Figures.**
+  - XRD_part2.m style: equal-area, upper hemisphere, one colour range per figure, turbo, specimen-direction labels
+    (white background).
+  - MATLAB writes a .fig next to every PNG.
+  - E(direction): stereographic plot in the stereograph_settings.m style (dotted cross, decimal commas on the colour
+    bar) and a 3D surface.
+- **Elastic averages.**
+  - The single-crystal stiffness and compliance are rotated per orientation by MTEX tensors in each backend and
+    averaged with area weights.
+  - Voigt = mean C, Reuss = (mean S)⁻¹, Hill = (Voigt + Reuss) / 2 (Hill 1952).
+  - E(n) = 1 / (n n n n : S) of the averaged matrix. α and retained β are mixed by area fraction.
+  - The elastic step refuses the prior-β map: room-temperature stiffness comes from α + retained β.
+  - Porosity is ignored.
+  - Bootstrap: grains resampled with replacement (default 200 runs, seed 0) on the backend's per-grain rotated
+    tensors, giving the SD per direction.
+  - Tests: random orientations reproduce the isotropic Voigt / Reuss / Hill moduli within 0.4 %; a single
+    orientation reproduces the single-crystal directional modulus; Reuss ≤ Hill ≤ Voigt on a 31 × 121 direction
+    grid.
+- **Recipe.**
+  - texture.run and elastic.run are recipe steps; Save / Export of their figures uses the result menu (texture.run:
+    variant pf | ipf).
+  - texture.export_odf goes to the export log (MTEX text + JSON sidecar), so it is listed under 'Earlier exports' and
+    can be exported again.

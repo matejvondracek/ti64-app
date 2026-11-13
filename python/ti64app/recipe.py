@@ -30,7 +30,7 @@ class FileInput(BaseModel):
 
 class OutputRef(BaseModel):
     path: str                        # relative to the project root
-    kind: Literal["npz", "json", "png", "csv", "xlsx", "tiff", "svg", "pdf", "mosaic", "other"]
+    kind: Literal["npz", "json", "png", "csv", "xlsx", "tiff", "svg", "pdf", "mosaic", "file", "other"]
     content_hash: str
 
 

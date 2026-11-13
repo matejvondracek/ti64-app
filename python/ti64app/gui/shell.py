@@ -594,6 +594,52 @@ IPF_KEYS = ["ipfHKLKey", "ipfTSLKey", "ipfHSVKey", "ipfSpotKey"]
 DIRECTIONS = ["X", "Y", "Z", "build", "custom"]
 
 
+def _elastic_settings(s, save) -> None:
+    """Single-crystal elastic constants (phase 6.7): default preset per phase, every preset's constants editable (GPa),
+    source and DOI shown; 'Reset' brings back the literature values."""
+    from ..elastic import DEFAULT_PRESETS, ElasticSettings  # noqa: PLC0415
+
+    with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_elastic"):
+        ui.label("Elastic constants (single crystal, GPa)").classes("font-semibold")
+        ui.label("Used by 'Elastic properties' (EBSD tab): Young's modulus from texture. The defaults are used unless "
+                 "a step chooses another preset; every result records the constants it used.") \
+            .classes("text-xs ti-muted")
+        es = s.elastic
+        for ph in ("alpha", "beta"):
+            names = [k for k, v in es.presets.items() if v.phase == ph]
+            sel = ui.select(names, value=getattr(es, f"default_{ph}"), label=f"default for {'α' if ph == 'alpha' else 'β'}") \
+                .classes("w-full").props("dense options-dense").mark(f"elastic_default_{ph}")
+
+            def set_default(e, ph=ph):
+                setattr(s.elastic, f"default_{ph}", e.value)
+                save()
+            sel.on_value_change(set_default)
+        for name, pr in es.presets.items():
+            with ui.expansion(name).classes("w-full").props("dense").mark("elastic_preset"):
+                fields = ["C11", "C12", "C44"] + (["C33", "C13", "C66"] if pr.symmetry == "hexagonal" else [])
+                with ui.row().classes("w-full gap-2"):
+                    for fld in fields:
+                        n = ui.number(fld, value=getattr(pr, fld), step=0.1, format="%.1f").props("dense") \
+                            .classes("w-24").mark(f"elastic_{fld}")
+
+                        def upd(e, name=name, fld=fld):
+                            if e.value is None:
+                                return
+                            setattr(s.elastic.presets[name], fld, float(e.value))
+                            save()
+                        n.on_value_change(upd)
+                ui.label(f"{pr.source}" + (f" — doi:{pr.doi}" if pr.doi else "")).classes("text-xs break-all")
+                if pr.note:
+                    ui.label(pr.note).classes("text-xs ti-muted")
+
+        def reset():
+            s.elastic = ElasticSettings()
+            save("Elastic constants reset to the literature values (reopen Settings to see them).")
+        ui.button("Reset to the literature values", icon="restart_alt", on_click=reset).props("flat dense no-caps") \
+            .mark("elastic_reset").tooltip(f"{len(DEFAULT_PRESETS)} presets: Fisher & Renken 1964 (default α), "
+                                           "Rossin 2023, Wielewski 2017; Ti15Mo (default β) and LCB (Olejňák 2023)")
+
+
 def settings_dialog(p: Project | None) -> None:
     """Every change is saved immediately (preferences file; backend switch per project, undoable)."""
     s = load_settings()
@@ -722,6 +768,8 @@ def _settings_body(s, status, p: Project | None) -> None:
         for w in pw.values():
             w.on("blur", upd_paths)
             w.on("keydown.enter", upd_paths)
+
+    _elastic_settings(s, save)
 
     with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_feedback"):
         ui.label("Feedback").classes("font-semibold")

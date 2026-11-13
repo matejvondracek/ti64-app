@@ -424,6 +424,13 @@ class MatlabBackend:
 
         return matlab.double([float(c) for c in values])
 
+    @staticmethod
+    def _mat(a) -> object:
+        """2-D array -> MATLAB numeric matrix."""
+        import matlab  # noqa: PLC0415
+
+        return matlab.double(np.atleast_2d(np.asarray(a, float)).tolist())
+
     def ipf_colors(self, handle, phase: str, key: str, vec) -> np.ndarray:
         v = self._num(vec)
         return self._h5("ti64.ipfColors", handle.id, phase, key, v)["rgb"].astype(float).reshape(-1, 3)
@@ -588,6 +595,100 @@ class MatlabBackend:
             o["curve_labels"] = [lab for _, _, lab in spec.curves]
         self.call("ti64.renderChart", self._num(spec.centers), self._num(spec.heights), o, str(out_png), nargout=0)
         return out_png
+
+    # -- texture and elastic properties (phase 6.7; matlab/+ti64/odf*.m, stiffnessRotate.m, render*.m) -----------
+    def _h5_arrays(self, **arrays) -> str:
+        import h5py  # noqa: PLC0415
+
+        fd, tmp = tempfile.mkstemp(suffix=".h5", prefix="ti64_in_")
+        os.close(fd)
+        with h5py.File(tmp, "w") as f:
+            for k, v in arrays.items():
+                f[k] = np.asarray(v, float)
+        return tmp
+
+    def odf_build(self, handle, phase: str, quat, weights, halfwidth_deg: float = 5.0):
+        from .base import OdfHandle  # noqa: PLC0415
+
+        tmp = self._h5_arrays(quat=np.asarray(quat, float).reshape(-1, 4), weights=np.asarray(weights, float))
+        try:
+            oid, mx, ti = self.call("ti64.odfBuild", handle.id, phase, tmp, float(halfwidth_deg), nargout=3)
+        finally:
+            os.remove(tmp)
+        return OdfHandle(self.name, str(oid), phase), {"max_mrd": float(mx), "texture_index": float(ti),
+                                                       "n": int(len(np.asarray(weights)))}
+
+    def _odf_eval(self, odfh, mode: str, hkl, r, dirs) -> np.ndarray:
+        tmp = self._h5_arrays(dirs=np.asarray(dirs, float).reshape(-1, 3))
+        try:
+            v = self._h5("ti64.odfEval", odfh.id, mode, self._num(list(hkl)), self._num(list(r)), tmp)["v"]
+        finally:
+            os.remove(tmp)
+        return np.asarray(v, float).ravel()
+
+    def odf_pf(self, odfh, hkl, dirs) -> np.ndarray:
+        return self._odf_eval(odfh, "pf", hkl, (0.0, 0.0, 1.0), dirs)
+
+    def odf_ipf(self, odfh, r, crystal_dirs) -> np.ndarray:
+        return self._odf_eval(odfh, "ipf", (0.0, 0.0, 1.0), r, crystal_dirs)
+
+    def odf_export(self, odfh, path):
+        self.call("ti64.odfExport", odfh.id, str(path), nargout=0)
+        return Path(path)
+
+    def stiffness_rotate(self, handle, phase: str, quat, C66, weights=None):
+        from ..elastic import tensor_to_voigt  # noqa: PLC0415
+
+        q = np.asarray(quat, float).reshape(-1, 4)
+        arr = {"quat": q}
+        if weights is not None:
+            arr["weights"] = np.asarray(weights, float)
+        tmp = self._h5_arrays(**arr)
+        try:
+            d = self._h5("ti64.stiffnessRotate", handle.id, phase, self._mat(C66), tmp,
+                         weights is not None)
+        finally:
+            os.remove(tmp)
+        C = np.asarray(d["C"], float).reshape(-1, 3, 3, 3, 3)
+        S = np.asarray(d["S"], float).reshape(-1, 3, 3, 3, 3)
+        if weights is not None:
+            return tensor_to_voigt(C[0]), tensor_to_voigt(S[0], compliance=True)
+        return (np.stack([tensor_to_voigt(t) for t in C]),
+                np.stack([tensor_to_voigt(t, compliance=True) for t in S]))
+
+    def render_texture(self, odfh, spec, out):
+        sc = ""
+        if spec.mode in ("scatter", "both") and spec.scatter_quat is not None:
+            sc = self._h5_arrays(quat=np.asarray(spec.scatter_quat, float).reshape(-1, 4))
+        st = {"kind": spec.kind, "labels": [p["label"] for p in spec.panels], "mode": spec.mode,
+              "axisLabels": [spec.axis_labels.get(k, k) for k in ("x", "y", "z")],
+              "clim": self._num(list(spec.clim)) if spec.clim else self._num([]), "title": spec.title,
+              "widthCm": float(spec.width_cm), "dpi": float(spec.dpi)}
+        if spec.kind == "pf":
+            st["hkl"] = [self._num([float(v) for v in p["hkl"]]) for p in spec.panels]
+        else:
+            st["vectors"] = self._mat([p["vector"] for p in spec.panels])
+        try:
+            self.call("ti64.renderTexture", odfh.id, st, sc, str(out), nargout=0)
+        finally:
+            if sc:
+                os.remove(sc)
+        return Path(out)
+
+    def render_elastic(self, spec, out):
+        th, ph = spec.theta_phi
+        tmp = self._h5_arrays(E=spec.E, rho=spec.rho_phi[0], phi=spec.rho_phi[1], E3=spec.E_surface, theta3=th,
+                              phi3=ph)
+        st = {"axisLabels": [spec.axis_labels.get(k, k) for k in ("x", "y", "z")],
+              "markerLabels": [m[0] for m in spec.markers],
+              "markerVectors": self._mat([m[1] for m in spec.markers] or [[0, 0, 1]]),
+              "markerE": self._num([float(m[2]) for m in spec.markers] or [0.0]),
+              "title": spec.title, "widthCm": float(spec.width_cm), "dpi": float(spec.dpi)}
+        try:
+            self.call("ti64.renderElastic", tmp, st, str(out), nargout=0)
+        finally:
+            os.remove(tmp)
+        return Path(out)
 
     def release(self, handle: EBSDHandle) -> None:
         if self.running:
