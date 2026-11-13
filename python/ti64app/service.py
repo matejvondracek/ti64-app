@@ -124,7 +124,8 @@ def _sample_set(ctx: OpContext) -> None:
     ctx.output("sample", "json", sheet.model_dump(mode="json"))
 
 
-LOAD_CACHE_VERSION = 2       # 2: phases renamed by symmetry, MATLAB single-phase numbering fixed (fix 4)
+LOAD_CACHE_VERSION = 3       # 2: phases renamed by symmetry, MATLAB single-phase numbering fixed (fix 4); 3: + frame
+                             # sidecar (crystal reference frame per phase, fix 5)
 
 
 class EbsdLoadParams(BaseModel):
@@ -164,6 +165,10 @@ def _ebsd_load(ctx: OpContext) -> None:
             ctx.metrics.update(cached=1.0, load_s=round(time.perf_counter() - t0, 2), n_points=data.n)
             ctx.output("ebsd", "npz", data)
             ctx.output("meta", "json", {**data.meta(), **extra})
+            fside = cdir / f"{ctx.backend.name}_{key}.frame.json"
+            data.alignment = ({int(k): v for k, v in json.loads(fside.read_text(encoding="utf-8")).items()}
+                              if fside.is_file() else {})
+            ctx.output("frame", "json", load_frame(sheet.map_file, data, ctx.backend.name))
             return
         except (OSError, ValueError, KeyError):
             pass                                          # damaged cache entry: load again
@@ -176,6 +181,7 @@ def _ebsd_load(ctx: OpContext) -> None:
     ctx.metrics.update(load_s=round(t1 - t0, 2), transfer_s=round(t2 - t1, 2), n_points=data.n)
     ctx.output("ebsd", "npz", data)
     ctx.output("meta", "json", {**data.meta(), **extra})
+    ctx.output("frame", "json", load_frame(sheet.map_file, data, ctx.backend.name))
     if not cnpz.is_file():
         try:
             cdir.mkdir(parents=True, exist_ok=True)
@@ -183,8 +189,30 @@ def _ebsd_load(ctx: OpContext) -> None:
             data.save_npz(tmp)
             tmp.replace(cnpz)
             write_json(cmeta, data.meta())
+            write_json(cdir / f"{ctx.backend.name}_{key}.frame.json", {str(k): v for k, v in data.alignment.items()})
         except OSError:
             pass
+
+
+def load_frame(map_file: str, data: EBSDData, backend: str) -> dict:
+    """The 'frame' output of a load (fix 5, docs/orientation_check.md): the .ang's CartesianAlignment line, the
+    crystal frame per phase as the backend loaded it, a warning when they disagree, the EDAX setting and which OIM
+    sample axis each app axis is."""
+    from . import frame  # noqa: PLC0415
+
+    header = None
+    if str(map_file).lower().endswith(".ang"):
+        from .io.ang import read_header  # noqa: PLC0415
+
+        header = read_header(map_file).fields.get("CartesianAlignment")
+    warn = frame.check_alignment(header)
+    al = {str(k): v for k, v in data.alignment.items()}
+    if not warn and any("x||a*" in v.replace(" ", "").lower() for v in al.values()):
+        warn = f"{backend} loaded a hexagonal phase with X||a* although the .ang says '{header}' (X||a expected)"
+    if warn:
+        log.warning("%s: %s", map_file, warn)
+    return {"cartesian_alignment": header, "crystal_frame": al or "not checked (map read from the load cache)",
+            "backend": backend, "setting": data.setting, "oim_axes": frame.axis_text(data.setting), "warning": warn}
 
 
 class Up2HeaderParams(BaseModel):
@@ -303,10 +331,11 @@ def _backend(project: Project, spec: OpSpec, backend: str | None):
 
 def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
         backend: str | None = None, record: bool = True, step_id: str | None = None,
-        out_dir: Path | None = None) -> RecipeStep:
+        out_dir: Path | None = None, replace: str | None = None) -> RecipeStep:
     """Execute one operation, write its outputs and (by default) append it to the recipe.
     `step_id` is only given by replay, so references between steps stay valid. Exports are not recipe steps: an
-    export op called with record=True is run through export() (export log) instead."""
+    export op called with record=True is run through export() (export log) instead. `replace` = id of a step the new
+    one takes the place of in the recipe (tuning, see apply()); undo brings the old one back."""
     if op_name in EXPORT_OPS and record:
         return export(project, op_name, params, backend)[0]
     if op_name not in OPS:
@@ -367,12 +396,78 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
             prev = [s for s in r.steps if s.op == "sample.set" and s.params.get("map_id") == mid and not s.stale]
             pred = stale_on_sheet_change(mid, prev[-1].params if prev else None, params)
             r.mark_stale(lambda s: (s.op == "sample.set" and s.params.get("map_id") == mid) or pred(s))
-        r.add(step)
+        old = next((k for k, s in enumerate(r.steps) if s.id == replace), None) if replace else None
+        if old is None:
+            r.add(step)
+        else:
+            r.steps[old] = step
         project.save_recipe(r)
-        history.commit(project, f"{op_name} {step.params.get('map_id', '')} ({step.id})".replace("  ", " "), before)
+        history.commit(project, f"{op_name} {step.params.get('map_id', '')} ({step.id})".replace("  ", " ")
+                       + (f", replaces {replace}" if old is not None else ""), before)
+        if old is not None:
+            _release_steps(project, [replace])
         if step_id is None:
             release_stale(project)
     return step
+
+
+# ---- tuning replaces, not appends (phase 6.6 fix 5) -------------------------------------------------------------
+NOT_TUNED = ("sample.set", "annotations.set", "ebsd.crop", "compare.backends", "compare.oim")
+
+
+def tune_key(project: Project, op_name: str, params: dict) -> tuple | None:
+    """What makes two steps 'the same operation' for tuning: the op plus the cleanup operation (ebsd.clean), the map
+    kind (map.compute: KAM vs GND; figures), the grain-size target and whether grains are alpha or prior-beta grains.
+    None = never replaced (sheet records, annotations, crops, comparisons)."""
+    if op_name in NOT_TUNED or op_name in EXPORT_OPS:
+        return None
+    if op_name == "ebsd.clean":
+        return (op_name, params.get("operation"))
+    if op_name in ("map.compute", "figure", "recon.figure", "grainsize.figure"):
+        return (op_name, params.get("kind"))
+    if op_name == "grainsize.run":
+        return (op_name, params.get("target") or "alpha")
+    if op_name == "grains.calc":
+        src = params.get("source")
+        try:
+            beta = bool(src) and project.recipe().step(src).op == "recon.run"
+        except KeyError:
+            beta = False
+        return (op_name, beta)
+    return (op_name,)
+
+
+def tuning_target(project: Project, op_name: str, params: dict) -> RecipeStep | None:
+    """The step a new step would replace: the NEWEST current step of the same map (sheet records aside) when it is the
+    same operation (tune_key) and no other step uses it; None = append."""
+    from .recipe import references  # noqa: PLC0415
+
+    mid = params.get("map_id")
+    key = tune_key(project, op_name, params)
+    if not mid or key is None:
+        return None
+    steps = project.recipe().steps
+    mine = [s for s in steps if not s.stale and s.params.get("map_id") == mid and s.op != "sample.set"]
+    if not mine or tune_key(project, mine[-1].op, mine[-1].params) != key:
+        return None
+    last = mine[-1]
+    known = {s.id for s in steps}
+    if any(last.id in references(s, known) for s in steps if s.id != last.id):
+        return None
+    return last
+
+
+def apply(project: Project, op_name: str, params: dict[str, Any] | BaseModel, backend: str | None = None,
+          tune: bool = True) -> RecipeStep:
+    """Run a step from the GUI / MCP: like run(), but when the newest step of the map is the same operation (the
+    user is tuning its parameters), the new step REPLACES it instead of being appended (undo restores the previous
+    parameters). A replaced cleanup / load keeps the source map of the step it replaces. Recorded recipes are never
+    rewritten this way: replay and run_recipe use run()."""
+    params = params.model_dump(mode="json") if isinstance(params, BaseModel) else dict(params)
+    old = tuning_target(project, op_name, params) if tune else None
+    if old is not None and op_name in ("ebsd.clean",) and not params.get("source") and old.params.get("source"):
+        params["source"] = old.params["source"]
+    return run(project, op_name, params, backend, replace=old.id if old is not None else None)
 
 
 from .sample import SHEET_RESULT_KEYS  # noqa: E402  (kept importable from here)
@@ -601,6 +696,19 @@ def delete_step(project: Project, step_id: str, dependents: str = "delete") -> d
     history.commit(project, f"delete step {step_id} ({len(deps)} later step(s) stale)", before)
     _release_steps(project, {step_id} | deps)
     return {"delete": [step_id], "dependents": [], "kept": [], "stale": [i for i in plan["dependents"]]}
+
+
+def add_default_cleanup(project: Project, map_id: str, backend: str | None = None) -> list[RecipeStep]:
+    """'Add default cleanup': the preset of the map's input state (raw / OIM-cleaned) as separate ebsd.clean steps in
+    the default order (base.DEFAULT_CLEANUP), each on the output of the previous one; ONE undo entry."""
+    from .backends.base import DEFAULT_CLEANUP  # noqa: PLC0415
+
+    state = project.sample(map_id).input_state
+    out = []
+    with history.group(project, f"default cleanup {map_id} ({state})"):
+        for operation, prm in DEFAULT_CLEANUP[state]:
+            out.append(run(project, "ebsd.clean", {"map_id": map_id, "operation": operation, "params": prm}, backend))
+    return out
 
 
 def undo(project: Project) -> str | None:

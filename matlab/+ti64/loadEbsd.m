@@ -16,7 +16,17 @@ arguments
   phaseIds double = []
   phaseNames = {}
 end
+ws = warning('off', 'all');                   % MTEX's 'do not form a grid' warning, handled below
 ebsd = EBSD.load(char(fname), 'setting', setting);
+warning(ws);
+if ~isfield(ebsd.prop, 'oldId')
+  % fix 5: MTEX 7.2's automatic grid detection gives up on short, very wide maps (e.g. 120 x 1501 points: "the
+  % measurements span 2433600 lattice cells") and keeps a list; an explicit gridify finds the hex / square grid
+  ebsd = gridify(ebsd);
+  if ~isfield(ebsd.prop, 'oldId')
+    error('ti64:loadEbsd', '%s: the points do not form a regular (hex or square) grid', fname);
+  end
+end
 ebsd.phaseMap = (0:numel(ebsd.CSList) - 1)';
 if ischar(phaseNames) || isstring(phaseNames), phaseNames = cellstr(phaseNames); end
 csl = ebsd.CSList;                          % MTEX 7.2: an array of phaseItem (crystalSymmetry / notIndexed)

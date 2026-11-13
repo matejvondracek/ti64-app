@@ -194,6 +194,7 @@ def view_page() -> None:
             st["setting"] = False
 
     async def show():
+        status.set_visibility(True)
         key = st["key"]
         gs.set("view_source", key)
         o = view_opts(key) if key else None
@@ -244,6 +245,7 @@ def view_page() -> None:
         exp_btn.enable()
 
     def show_up2(m):
+        status.set_visibility(False)              # the .up2 view has its own status line under the map (fix 5)
         """.up2: overview map (pattern quality / virtual BSE from one streaming pass, cached) in the viewer, drawn as
         hexagonal cells on a hex scan (same tile renderer as the EBSD viewer, fix 4); a click loads only the pattern
         under the cursor (fix 13). The .ang with the same scan ID (fix 4) is shown as 'paired map': its IQ / CI /
@@ -334,6 +336,9 @@ def view_page() -> None:
                     cmp_lab = ui.label("").classes("w-full text-xs px-3 py-1 bg-white border-b").mark("up2_compare")
                     cmp_lab.set_visibility(pair is not None)
                     mapbox = ui.column().classes("w-full grow min-h-0 gap-0")
+                    # fix 5: the status line belongs to the map area and ends at the Pattern panel, which runs to
+                    # the bottom of the window
+                    ustatus = ui.label("").classes("text-xs ti-muted px-3 py-1 bg-white border-t w-full truncate")                         .mark("view_status_up2")
                 with ui.column().classes("h-full shrink-0 bg-white border-l p-3 gap-2").style("width: 320px"):
                     ui.label("Pattern").classes("font-semibold")
                     img = ui.image().classes("border").style("width: 260px; height: 260px; "
@@ -454,7 +459,7 @@ def view_page() -> None:
         def on_cursor(e):
             r, c = scan_at(e.args["x"], e.args["y"])
             x, y = up2.pattern_position(h, r, c)
-            status.text = f"row {r}, column {c}  (x {x:g} µm, y {y:g} µm)  · click to load this pattern"
+            ustatus.text = f"row {r}, column {c}  (x {x:g} µm, y {y:g} µm)  · click to load this pattern"
 
         def channel_grey():
             ov = u["ov"]
@@ -604,7 +609,7 @@ def view_page() -> None:
         row.on_value_change(lambda _: draw())
         col.on_value_change(lambda _: draw())
         corr.on_value_change(lambda e: (o.update(corrected=bool(e.value)), save_opts(), draw()))
-        status.text = f"{h.n_patterns:,} patterns of {h.pattern_width} × {h.pattern_height} px"
+        ustatus.text = f"{h.n_patterns:,} patterns of {h.pattern_width} × {h.pattern_height} px"
         load_or_start()
         draw()
 

@@ -171,6 +171,9 @@ async def test_files_tab_new_sample_for_file_fold_and_add_filter(tmp_path, crop3
 
 @pytest.mark.anyio
 async def test_ebsd_tab_load_cleanup_drafts_undo(tmp_path, crop300_ju02):
+    """Fix 5: Load and Cleanup are separate sections; each cleanup operation is its own step; applying it again right
+    after itself replaces the step (undo restores it); badges: none until a section is used, 'changed, not
+    applied' only against the last applied step."""
     p = Project.create("ge", base=tmp_path)
     service.run(p, "sample.set", sample_params(crop300_ju02))
     async with user_simulation(main_file=MAIN) as user:
@@ -180,30 +183,38 @@ async def test_ebsd_tab_load_cleanup_drafts_undo(tmp_path, crop300_ju02):
         # fix 2: the selected map loads by itself when the tab opens (no 'Load map' click)
         await user.should_see("loading JU02_c300 done", retries=300)
         await user.should_see(marker="map_viewer", retries=200)
-        user.find(marker="cleanup_noise_max_void_px").elements.pop().set_value(6)
-        await user.should_see("not applied")
-        user.find(marker="run_cleanup").click()
-        await user.should_see("cleanup done", retries=300)
+        await user.should_not_see("changed, not applied")
+        user.find(marker="clean_noise_removal_noise_max_indexed_px").elements.pop().set_value(3)
+        await user.should_not_see("changed, not applied")          # never used: no badge
+        user.find(marker="run_clean_noise_removal").click()
+        await user.should_see("Noise-grain removal done", retries=300)
+        user.find(marker="clean_noise_removal_noise_max_indexed_px").elements.pop().set_value(5)
+        await user.should_see("changed, not applied")
+        user.find(marker="run_clean_noise_removal").click()
+        await user.should_see("replaced the previous step", retries=300)
     steps = Project.open(p.root).recipe().steps
-    assert [s.op for s in steps] == ["sample.set", "ebsd.load", "ebsd.cleanup"]
-    assert steps[-1].params["overrides"]["noise_max_void_px"] == 6 and steps[-1].sample_id == "EBMX-1"
+    assert [s.op for s in steps] == ["sample.set", "ebsd.load", "ebsd.clean"]
+    assert steps[-1].params["params"]["noise_max_indexed_px"] == 5 and steps[-1].sample_id == "EBMX-1"
+    assert steps[-1].params["source"] == steps[1].id
     assert (Project.open(p.root).find_step_dir(steps[-1].id)).name.startswith("EBMX-1_")
-    assert Project.open(p.root).gui_state().get("drafts", {}).get("cleanup") is None
-    # a draft that was typed but not applied survives reopening
+    assert Project.open(p.root).gui_state().get("drafts", {}).get("clean_noise_removal") is None
+    # a draft that was typed but not applied survives reopening and shows the badge against the applied step
     async with user_simulation(main_file=MAIN) as user:
         _open(p.root)
         await user.open("/ebsd")
-        user.find(marker="grains_hagb_deg").elements.pop().set_value(12)
-    assert Project.open(p.root).gui_state()["drafts"]["grains"]["hagb_deg"] == 12
+        user.find(marker="clean_noise_removal_noise_max_indexed_px").elements.pop().set_value(7)
+    assert Project.open(p.root).gui_state()["drafts"]["clean_noise_removal"]["noise_max_indexed_px"] == 7
     async with user_simulation(main_file=MAIN) as user:
         _open(p.root)
         await user.open("/ebsd")
-        await user.should_see("● not applied")
+        await user.should_see("● changed, not applied")
         await user.should_see(marker="history_panel")             # History: the panel right of the map
         await user.should_see(marker="recipe_table")
         user.find(marker="undo").click()
-        await user.should_see("undone: ebsd.cleanup", retries=100)
-    assert [s.op for s in Project.open(p.root).recipe().steps] == ["sample.set", "ebsd.load"]
+        await user.should_see("undone: ebsd.clean", retries=100)
+    steps = Project.open(p.root).recipe().steps
+    assert [s.op for s in steps] == ["sample.set", "ebsd.load", "ebsd.clean"]
+    assert steps[-1].params["params"]["noise_max_indexed_px"] == 3        # the replaced step is back
 
 
 @pytest.mark.anyio

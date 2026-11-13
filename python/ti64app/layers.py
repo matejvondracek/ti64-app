@@ -33,7 +33,7 @@ LayerKind = Literal["ipf", "phase", "ci", "iq", "fit", "prias", "prias_top", "pr
 MAP_KINDS = ("ipf", "phase", "ci", "iq", "fit", "prias", "prias_top", "prias_center", "prias_bottom", "kam", "grod", "gos", "gnd")
 PRIAS_KINDS = ("prias_top", "prias_center", "prias_bottom")
 RECON_KINDS = ("parent_ipf", "recon_fit", "variant", "packet")
-DATA_OPS = ("ebsd.load", "ebsd.cleanup", "grains.calc", "map.compute", "recon.run")   # steps a layer depends on
+DATA_OPS = ("ebsd.load", "ebsd.cleanup", "ebsd.clean", "grains.calc", "map.compute", "recon.run")   # steps a layer depends on
 OVERLAYS = ("hagb", "lagb", "interface", "burgers", "beta_gb", "crack")
 LAYER_LABELS = {"ipf": "IPF (alpha / beta)", "phase": "phase", "ci": "CI", "iq": "IQ", "fit": "Fit", "prias": "PRIAS",
                 "prias_top": "PRIAS top strip", "prias_center": "PRIAS centre square",
@@ -56,6 +56,21 @@ class LayerParams(BaseModel):
     custom_vector: tuple[float, float, float] | None = None
     ipf_keys: dict[str, IpfKeySetting] | None = None   # per phase (viewer); key / direction above override all
     clim: tuple[float, float] | None = None
+    highlight_ni: bool = False                # not-indexed points drawn magenta (cleanup panel toggle, fix 5)
+
+
+NI_RGBA = (255, 0, 255, 255)
+
+
+def _highlight(project: Project, src: str, colors: np.ndarray) -> np.ndarray:
+    """Not-indexed measurements (phase 0) of the source map coloured NI_RGBA."""
+    s = project.recipe().step(src)
+    with np.load(project.root / s.outputs["ebsd"].path, allow_pickle=False) as z:
+        ni = z["phase"] == 0
+    out = np.array(colors, copy=True)
+    if ni.size == out.shape[0]:
+        out[ni] = NI_RGBA
+    return out
 
 
 def view_context(project: Project, backend: str | None = None):
@@ -237,7 +252,10 @@ def layer_deps(steps: list[RecipeStep], map_id: str, lp: LayerParams, overlay: s
         return []
     if lp.kind in RECON_KINDS:
         return [lp.recon or _newest(steps, ("recon.run",), **m)]
-    deps = [lp.source or _newest(steps, ("ebsd.cleanup", "ebsd.load"), **m)]
+    from .recipe import current_map_step  # noqa: PLC0415
+
+    cur = current_map_step(steps, map_id)
+    deps = [lp.source or (cur.id if cur else None)]
     if lp.kind in ("kam", "grod", "gos", "gnd"):
         deps.append(lp.values or _newest(steps, ("map.compute",), **m, kind=lp.kind))
     return deps
@@ -268,7 +286,8 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
     f = project.cache_dir / "viewer" / f"layer_{key}.npz"
     if f.is_file():
         src_op = _op_of(project, lp.source or (layer_deps(project.recipe().steps, map_id, lp) or [None])[0])
-        progress.report("cleanup from cache" if src_op == "ebsd.cleanup" else "reading cached map", 0.5)
+        progress.report("cleanup from cache" if src_op in ("ebsd.cleanup", "ebsd.clean") else "reading cached map",
+                        0.5)
         with np.load(f, allow_pickle=False) as z:
             colors = z["colors"]
             info = json.loads(str(z["info"]))
@@ -278,6 +297,9 @@ def get_layer(project: Project, map_id: str, lp: LayerParams, backend: str | Non
         spec, _h, meta, src = layer_spec(ctx, map_id, lp)
         progress.report("colouring map", 0.75)
         colors, cinfo = ctx.backend.measurement_colors(spec)
+        if lp.highlight_ni and lp.kind not in RECON_KINDS:
+            colors = _highlight(project, src, colors)
+            spec.legend = list(spec.legend) + [("not indexed", (1.0, 0.0, 1.0))]
         info = {"title": spec.title, "colorbar_label": spec.colorbar_label,
                 "clim": list(cinfo["clim"]) if cinfo.get("clim") else None, "cmap": cinfo.get("cmap"),
                 "colorbar": [_hex(c / 255.0) for c in cinfo["colorbar"]] if cinfo.get("colorbar") is not None else None,
@@ -380,7 +402,9 @@ def available(project: Project, map_id: str, tab: str | None = None) -> dict:
     ops = {s.op for s in r}
     kinds_done = {s.params.get("kind") for s in r if s.op == "map.compute"}
     layers = []
-    src = latest_step(project, ("ebsd.cleanup", "ebsd.load"), map_id=map_id)
+    from .recipe import current_map_step  # noqa: PLC0415
+
+    src = current_map_step(project.recipe().steps, map_id)
     if src is not None:
         have = stored_data(project, src.id)
         layers += ["ipf", "phase"] + [k for k in ("ci", "iq", "fit", "prias", *PRIAS_KINDS) if have.get(k)]
@@ -452,7 +476,7 @@ def _any_map_handle(ctx, map_id: str):
     from .service import SESSION, latest_step  # noqa: PLC0415
 
     steps = [s for s in ctx.project.recipe().steps if not s.stale and s.params.get("map_id") == map_id
-             and s.op in ("ebsd.cleanup", "ebsd.load")]
+             and s.op in ("ebsd.clean", "ebsd.cleanup", "ebsd.load")]
     alive = set(ctx.backend.handles())
     for s in reversed(steps):
         h = SESSION.get((str(ctx.project.root), s.id, ctx.backend.name))

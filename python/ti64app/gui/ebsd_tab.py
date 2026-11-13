@@ -20,6 +20,7 @@ from .. import layers as lay
 from .. import progress, service
 from ..annotations import ROI_TYPES, Annotation, load_annotations, roi_box
 from ..backends import backend_status
+from ..backends.base import CLEAN_LABELS
 from ..project import Project
 from ..settings import IpfKeySetting, load_settings, save_preferences
 from . import dialogs, tiles
@@ -39,6 +40,26 @@ DEFAULT_OV_COLOR = {"hagb": "#000000", "lagb": "#a6a6a6", "interface": "#d91a1a"
                     "crack": "#e00000"}
 ON_DEMAND = ("kam", "grod", "gos", "gnd")             # listed in the map selector, computed on first use (fix 3.9)
 IPF_KINDS = ("ipf", "parent_ipf")
+# cleanup sub-panels (fix 5): operation, icon, fields (name, num | check, label, default, number options)
+CLEAN_UI = [
+    ("ci_threshold", "filter_alt", [("ci_threshold", "num", "CI threshold (points below → not indexed)", 0.1,
+                                     {"step": 0.05, "min": 0, "max": 1})]),
+    ("spike_removal", "flash_off", [("spike_angle_deg", "num", "spike angle [°]", 5.0, {"step": 0.5, "min": 0})]),
+    ("noise_removal", "grain", [("noise_angle_deg", "num", "grain angle [°]", 3.0, {"step": 0.5, "min": 0}),
+                                ("noise_max_indexed_px", "num", "max noise grain [px]", 2, {"step": 1, "min": 0}),
+                                ("fill", "check", "fill removed points from neighbours", True, {})]),
+    ("void_fill", "format_color_fill", [("max_void_px", "num", "max void size [px]", 4, {"step": 1, "min": 0}),
+                                        ("angle_deg", "num", "grain angle of the neighbour vote [°]", 3.0,
+                                         {"step": 0.5, "min": 0})]),
+    ("grain_dilation", "open_in_full", [("tolerance_deg", "num", "grain tolerance angle [°]", 5.0,
+                                         {"step": 0.5, "min": 0}),
+                                        ("min_grain_px", "num", "minimum grain size [px]", 2, {"step": 1, "min": 1}),
+                                        ("multi_row", "check", "grain must span multiple rows", False, {}),
+                                        ("single_iteration", "check", "single iteration", False, {})]),
+    ("smoothing", "blur_linear", [("hq_alpha", "num", "filter strength", 0.5, {"step": 0.1, "min": 0}),
+                                  ("hq_threshold_deg", "num", "filter limit [°]", 15.0, {"step": 1, "min": 0})]),
+]
+INT_FIELDS = {"noise_max_indexed_px", "max_void_px", "min_grain_px"}
 # rough share of the whole load (click -> first image) per stage, for the progress bar when a stage gives no fraction
 STAGE_FRAC = {"starting": 0.02, "reading file": 0.1, "transferring data": 0.4, "cleanup from cache": 0.45,
               "building grid": 0.6, "colouring map": 0.75, "drawing": 0.92}
@@ -78,20 +99,35 @@ def map_options(p: Project, kinds=("ang",)) -> dict[str, str]:
     return {m.id: f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}" for m in files}
 
 
-class Section:
-    """One accordion section: registers its inputs, keeps unapplied values as drafts (gui_state.json)."""
+BADGE_TEXT = {"changed": "● changed, not applied", "stale": "● stale", "applied": "✓ applied"}
+BADGE_CLASS = {"changed": "ti-draft", "stale": "ti-stale", "applied": "ti-applied"}
 
-    def __init__(self, gs: GuiState, key: str, title: str, icon: str, opened: bool = False) -> None:
+
+class Section:
+    """One accordion section: registers its inputs, keeps unapplied values as drafts (gui_state.json) and shows a
+    status badge (fix 5, ti64app.badges): none while the section was never used for this map; 'changed, not applied'
+    when the fields differ from the last applied step of the section; 'applied <time>' when that step is current;
+    'stale' when an upstream step changed after it. track() tells the section which step is its last applied one."""
+
+    def __init__(self, gs: GuiState, key: str, title: str, icon: str, opened: bool = False,
+                 group: str | None = "ebsd", sub: bool = False) -> None:
         self.gs, self.key, self.title = gs, key, title
         self.fields: dict[str, ui.element] = {}
         self.defaults: dict = {}
-        self.exp = ui.expansion(group="ebsd", value=opened).classes("w-full ti-section").mark(f"sec_{key}")
+        self.project = None
+        self.step_fn = None                          # () -> last applied step of this section (or None)
+        self.recorded_fn = None                      # step -> {field name: recorded value} to compare with
+        self.children: list[Section] = []
+        self.exp = ui.expansion(group=group, value=opened).classes("w-full " + ("ti-subsection" if sub else
+                                                                                "ti-section")).mark(f"sec_{key}")
         with self.exp.add_slot("header"):
             with ui.row().classes("w-full items-center no-wrap gap-3"):
-                ui.icon(icon, size="22px").classes("text-primary")
-                self.title_label = ui.label(title).classes("font-semibold grow")
-                self.chip = ui.label("● not applied").classes("ti-draft").tooltip(
-                    "Values were changed but not applied yet (kept when the app closes).")
+                ui.icon(icon, size="18px" if sub else "22px").classes("text-primary")
+                self.title_label = ui.label(title).classes(("text-sm " if sub else "") + "font-semibold grow")
+                self.chip = ui.label("").classes("ti-draft").mark(f"badge_{key}")
+                with self.chip:
+                    self.chip_tip = ui.tooltip("")
+        self.chip.set_visibility(False)
         self.drafts = dict(gs.get("drafts", key, default={}) or {})
 
     def __enter__(self):
@@ -102,8 +138,52 @@ class Section:
         self.exp.__exit__(*a)
         self._caption()
 
+    def track(self, project, step_fn, recorded_fn=None) -> "Section":
+        self.project, self.step_fn, self.recorded_fn = project, step_fn, recorded_fn or (lambda s: {})
+        self._caption()
+        return self
+
+    def status(self) -> tuple[str, str, object]:
+        """(kind, tooltip, step) of this section; a container section takes the most urgent of its children."""
+        from .. import badges  # noqa: PLC0415
+
+        if self.children:
+            sts = [c.status() for c in self.children]
+            for kind in ("changed", "stale"):
+                hits = [s for s in sts if s[0] == kind]
+                if hits:
+                    return kind, " ".join(h[1] for h in hits[:3]), hits[0][2]
+            done = [s for s in sts if s[0] == "applied"]
+            if done:
+                newest = max(done, key=lambda s: s[2].timestamp)
+                return "applied", (f"All {len(done)} applied operation(s) of this section are current (newest "
+                                   f"applied {badges.when(newest[2])})."), newest[2]
+            return "", "", None
+        if self.step_fn is None:
+            return "", "", None
+        try:
+            step = self.step_fn()
+            if step is None:
+                return "", "", None
+            rec = self.recorded_fn(step) or {}
+            kind, tip_ = badges.state(self.project, step, {k: self.fields[k].value for k in rec if k in self.fields},
+                                      rec)
+        except Exception:  # noqa: BLE001  (a badge never breaks the page)
+            return "", "", None
+        return kind, tip_, step
+
     def _caption(self) -> None:
-        self.chip.set_visibility(bool(self.drafts))
+        from .. import badges  # noqa: PLC0415
+
+        kind, tip_, step = self.status()
+        self.chip.set_visibility(bool(kind))
+        if kind:
+            self.chip.text = BADGE_TEXT[kind] + (f" {badges.when(step)}" if kind == "applied" and step else "")
+            self.chip.classes(replace=BADGE_CLASS[kind])
+            self.chip_tip.text = tip_
+        parent = getattr(self, "parent", None)
+        if parent is not None:
+            parent._caption()
 
     def _reg(self, name: str, w, default):
         self.fields[name] = w
@@ -303,16 +383,20 @@ def ebsd_page() -> None:
         busy_row.set_visibility(channel is None)       # with a channel the map area shows the progress
         try:
             prm = {"map_id": st["map"], **params} if with_map else params
+            # service.apply: re-applying the newest step of the map with new parameters replaces it (fix 5)
+            replaced = service.tuning_target(p, op, prm) is not None
             if channel:                     # stage names of the work go to the map area's progress bar (fix 3.7)
-                step = await ng_run.io_bound(progress.run_in, channel, service.run, p, op, prm, backend)
+                step = await ng_run.io_bound(progress.run_in, channel, service.apply, p, op, prm, backend)
             else:
-                step = await ng_run.io_bound(service.run, p, op, prm, backend)
-            ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)", type="positive")
+                step = await ng_run.io_bound(service.apply, p, op, prm, backend)
+            ui.notify(f"{label} done ({step.id}, {step.metrics.get('seconds')} s)" + (" — replaced the previous "
+                      "step of the same operation" if replaced else ""), type="positive")
             for n in service.pop_notices():
                 ui.notify(n, type="warning", multi_line=True, timeout=20000, close_button="OK")
             needs_hint(step)
             if hooks.get("history"):
                 hooks["history"]()
+            refresh_badges()
             return step
         except Exception as e:  # noqa: BLE001
             error(e, f"{label} failed")
@@ -477,6 +561,8 @@ def ebsd_page() -> None:
             d["clim"] = (float(vs["cmin"].value), float(vs["cmax"].value))
         if source:
             d["source"] = source
+        if gs.get("highlight_ni") and not source:
+            d["highlight_ni"] = True                  # cleanup section toggle (fix 5)
         return lay.LayerParams(**d)
 
     def tabkey() -> str:
@@ -724,17 +810,17 @@ def ebsd_page() -> None:
         if i < 0:
             status.text = f"x {x:.2f} µm, y {y:.2f} µm: no measurement"
             return
-        s_ = p.recipe().step(st["layer"].info["source"])
-        with np.load(p.root / s_.outputs["ebsd"].path, allow_pickle=False) as z:
-            ph = int(z["phase"][i])
-            q = z["quat"][i]
-            props = {k[5:]: float(z[k][i]) for k in z.files
-                     if k.startswith("prop_") and k[5:] in ("ci", "iq", "recon_fit", "parent_grain")}
+        # fix 5: like the OIM status bar: file Euler angles in degrees (as in the .ang / OIM), the app-frame Euler
+        # angles after the EDAX load setting (labelled), scan row / column, IQ, CI
+        from ..probe import probe, probe_text  # noqa: PLC0415
+
+        try:
+            d_ = probe(p, st["map"], st["layer"].info["source"], i)
+        except Exception as ex:  # noqa: BLE001
+            status.text = f"x {x:.2f} µm, y {y:.2f} µm | point {i} (probe failed: {ex})"
+            return
         c = st["layer"].colors[i]
-        names = {0: "not indexed", 1: "α", 2: "β"}
-        status.text = (f"x {x:.2f} µm, y {y:.2f} µm | point {i} | {names.get(ph, ph)} | "
-                       + " ".join(f"{k} {v:.3g}" for k, v in props.items())
-                       + f" | q ({', '.join(f'{v:.4f}' for v in q)}) | colour #{c[0]:02x}{c[1]:02x}{c[2]:02x}")
+        status.text = probe_text(d_) + f" | colour #{c[0]:02x}{c[1]:02x}{c[2]:02x}"
 
     def on_measure(e):
         (x0, y0), (x1, y1) = e.args["xy"]
@@ -860,6 +946,7 @@ def ebsd_page() -> None:
             viewer["v"].set(legend_data=await legend_data(L))
         status.text = (f"{st['map']}: {L.layout.lut.shape[0]} rows, {'hex' if L.layout.hex else 'square'} grid, "
                        f"step {L.layout.dx:.3g} µm; {L.info.get('title', '')}")
+        sk._caption()                                  # the KAM section compares with the kind shown (fix 5)
         await prepare_original(L)
 
     def not_ready(text: str, button: str | None = None, action=None):
@@ -899,8 +986,13 @@ def ebsd_page() -> None:
                 if isinstance(e, SheetIncomplete):
                     not_ready(str(e), "Open map sheet", lambda: ui.navigate.to(f"/files?sel={m}"))
                     return
+            from . import indexing  # noqa: PLC0415
+
+            indexing.ask_pending(p, on_done=sheet_info, only=[m])      # fix 5: re-indexed with spherical indexing?
             loading(m)
             step = await run_step("ebsd.load", {}, f"loading {m}", channel=st["pch"])
+            if step is not None:
+                frame_notice(step)
             if st["map"] != m:                     # the user picked another map meanwhile
                 return
             if step is None:
@@ -946,6 +1038,7 @@ def ebsd_page() -> None:
         hist_title.text = f"History · {'prior β map' if t == 'beta' else 'α map'}"
         if hooks.get("history"):
             hooks["history"]()
+        refresh_badges()
         if not av["loaded"]:
             not_ready(f"{m} is not loaded yet.", "Load map", lambda: load_section_apply())
             return
@@ -1014,7 +1107,6 @@ def ebsd_page() -> None:
             d = d[k]
         return d
     # the edit menu starts from the values of the last applied step of this map (else the defaults)
-    lc = lastp("ebsd.cleanup").get("overrides") or {}
     lg = lastp("grains.calc")
 
     def last_kind(*kinds):
@@ -1038,51 +1130,117 @@ def ebsd_page() -> None:
                     .tooltip("Open this map's sheet on the Files tab: sample or build direction not entered yet (the "
                              "map loads without them; steps that need a value ask for it)")
 
-            # 1 load + cleanup
-            with Section(gs, "cleanup", "Load and cleanup", "cleaning_services", opened=True) as sc:
-                ui.label("Cleanup preset follows the input state (raw: CI < 0.1 removed; OIM-cleaned: no CI filter); "
-                         "noise at 3°, indexed grains ≤ 2 px removed, voids ≤ 4 px filled.").classes("text-xs ti-muted")
-                sc.num("ci_threshold", "CI threshold (empty = preset)", g(lc, "ci_threshold"), step=0.05, min=0, max=1)
-                sc.num("noise_angle_deg", "noise angle [°]", g(lc, "noise_angle_deg", default=3.0), step=0.5, min=0)
-                with ui.row().classes("w-full no-wrap gap-2"):
-                    sc.num("noise_max_indexed_px", "max noise grain [px]", g(lc, "noise_max_indexed_px", default=2),
-                           step=1, min=0)
-                    sc.num("noise_max_void_px", "max void filled [px]", g(lc, "noise_max_void_px", default=4),
-                           step=1, min=0)
-                sc.check("fill", "fill removed points from neighbours", g(lc, "fill", default=True))
-                sp = sc.check("spike_removal", "wild-spike removal", g(lc, "spike_removal", default=False))
-                sc.num("spike_angle_deg", "spike angle [°]", g(lc, "spike_angle_deg", default=5.0), step=0.5, min=0) \
-                    .bind_visibility_from(sp, "value")
-                hq = sc.check("hq_filter", "smoothing filter (halfQuadraticFilter)", g(lc, "hq_filter", default=False))
-                with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(hq, "value"):
-                    sc.num("hq_alpha", "filter strength", g(lc, "hq_alpha", default=0.5), step=0.1, min=0)
-                    sc.num("hq_threshold_deg", "filter limit [°]", g(lc, "hq_threshold_deg", default=15.0), step=1,
-                           min=0)
+            # 1 load (fix 5: Load only loads; cleanup is its own section below)
+            with Section(gs, "load", "Load", "download", opened=True) as sl:
+                load_info = ui.label("").classes("text-xs ti-muted").style("overflow-wrap: anywhere") \
+                    .mark("load_info")
 
                 async def load_section_apply():
                     step = await run_step("ebsd.load", {}, "load map")
                     if step:
+                        frame_notice(step)
                         await select_map(st["map"])
+                ui.button("Load again", icon="download", on_click=load_section_apply).props("outline") \
+                    .mark("run_load").tooltip("The selected map loads by itself when it is opened; this loads it again "
+                                              "(e.g. after the input state was changed). Pressed right after a load, "
+                                              "it replaces that load step instead of adding one.")
+            sl.track(p, lambda: service.latest_step(p, ("ebsd.load",), map_id=st["map"]))
 
-                async def apply_cleanup():
+            # 2 cleanup: one sub-panel per operation, each its own recipe step on the previous cleanup step's output
+            with Section(gs, "cleanup", "Cleanup", "cleaning_services") as sc:
+                ui.label("Each operation is its own step on the output of the previous cleanup step of this map, so "
+                         "you decide the order (History shows it; drag a step there to change the order, the chain "
+                         "is replayed). Applying the same operation again right after itself replaces that step.") \
+                    .classes("text-xs ti-muted")
+                with ui.row().classes("w-full items-center no-wrap gap-2"):
+                    ui.button("Add default cleanup", icon="playlist_add", on_click=lambda: add_default_cleanup()) \
+                        .props("outline no-caps").mark("add_default_cleanup") \
+                        .tooltip("Adds the preset of the input state as separate steps in the default order: raw = "
+                                 "CI threshold 0.1, noise-grain removal (3°, ≤ 2 px, filled), void fill (≤ 4 px); "
+                                 "OIM-cleaned = noise-grain removal, void fill. Ctrl+Z takes all of them back at once.")
+                hl = ui.checkbox("highlight not-indexed points", value=bool(gs.get("highlight_ni"))) \
+                    .props("dense").mark("highlight_ni") \
+                    .tooltip("Draw the not-indexed points magenta on the map (IPF, phase, CI, IQ …), e.g. to see "
+                             "which voids a fill left (voids larger than the maximum void size stay not indexed)")
+
+                async def on_hl(e):
+                    gs.set("highlight_ni", bool(e.value))
+                    await show()
+                hl.on_value_change(on_hl)
+                clean_secs: dict[str, Section] = {}
+                clean_sum: dict[str, ui.label] = {}
+                for op_, icon_, flds in CLEAN_UI:
+                    last_ = service.latest_step(p, ("ebsd.clean",), map_id=st["map"], operation=op_)
+                    lp_ = (last_.params.get("params") if last_ else None) or {}
+                    with Section(gs, f"clean_{op_}", CLEAN_LABELS[op_], icon_, group=None, sub=True) as ss:
+                        for name_, kind_, label_, default_, kw_ in flds:
+                            v_ = lp_.get(name_, default_)
+                            if kind_ == "num":
+                                ss.num(name_, label_, v_, f"clean_{name_}", **kw_)
+                            else:
+                                ss.check(name_, label_, bool(v_), f"clean_{name_}")
+                        clean_sum[op_] = ui.label("").classes("text-xs").style("overflow-wrap: anywhere") \
+                            .mark(f"clean_summary_{op_}")
+                        ui.button("Apply", icon="check", on_click=lambda op_=op_: apply_clean(op_)) \
+                            .props("dense").mark(f"run_clean_{op_}")
+                    ss.track(p, lambda op_=op_: service.latest_step(p, ("ebsd.clean",), map_id=st["map"],
+                                                                    operation=op_),
+                             lambda s_: dict(s_.params.get("params") or {}))
+                    ss.parent = sc
+                    sc.children.append(ss)
+                    clean_secs[op_] = ss
+
+                async def apply_clean(op_: str):
+                    ss = clean_secs[op_]
                     if not lay.available(p, st["map"])["loaded"]:
                         await load_section_apply()
-                    ov = {k: sc.v(k) for k in ("noise_angle_deg", "noise_max_indexed_px", "noise_max_void_px", "fill",
-                                               "spike_removal", "spike_angle_deg", "hq_filter", "hq_alpha",
-                                               "hq_threshold_deg")}
-                    for k in ("noise_max_indexed_px", "noise_max_void_px"):
-                        ov[k] = int(ov[k] or 0)
-                    if sc.v("ci_threshold") is not None:
-                        ov["ci_threshold"] = float(sc.v("ci_threshold"))
-                    step = await run_step("ebsd.cleanup", {"overrides": ov}, "cleanup")
+                    prm = {k: ss.v(k) for k in ss.fields}
+                    for k in INT_FIELDS & set(prm):
+                        prm[k] = int(prm[k] or 0)
+                    step = await run_step("ebsd.clean", {"operation": op_, "params": prm}, CLEAN_LABELS[op_])
                     if step:
-                        sc.applied()
+                        ss.applied()
+                        summ = clean_summaries()
+                        if summ.get(op_):
+                            ui.notify(f"{CLEAN_LABELS[op_]}: {summ[op_]}", type="info", multi_line=True,
+                                      timeout=12000)
                         await select_map(st["map"])
-                with ui.row().classes("w-full gap-2"):
-                    ui.button("Load again", icon="download", on_click=load_section_apply).props("outline") \
-                        .mark("run_load").tooltip("The selected map loads by itself when it is opened; this loads it "
-                                                  "again (e.g. after the input state was changed)")
-                    ui.button("Apply", icon="check", on_click=apply_cleanup).mark("run_cleanup")
+
+                async def add_default_cleanup():
+                    if st["busy"]:
+                        ui.notify("Another step is still running.", type="warning")
+                        return
+                    if not lay.available(p, st["map"])["loaded"]:
+                        await load_section_apply()
+                    st["busy"] = True
+                    busy_lab.text = "default cleanup …"
+                    busy_row.set_visibility(True)
+                    try:
+                        steps_ = await ng_run.io_bound(service.add_default_cleanup, p, st["map"])
+                        ui.notify(f"Default cleanup added: {len(steps_)} steps "
+                                  f"({', '.join(CLEAN_LABELS[s_.params['operation']] for s_ in steps_)})",
+                                  type="positive")
+                    except Exception as e:  # noqa: BLE001
+                        error(e, "Default cleanup failed")
+                    finally:
+                        st["busy"] = False
+                        busy_row.set_visibility(False)
+                    if hooks.get("history"):
+                        hooks["history"]()
+                    await select_map(st["map"])
+            sc.project = p
+
+            def clean_summaries() -> dict[str, str]:
+                """The report line of the newest step of each cleanup operation of this map (removed / filled /
+                unfilled and why), shown under its Apply button."""
+                from .history_panel import step_summary  # noqa: PLC0415
+
+                out = {}
+                for op_ in clean_secs:
+                    s_ = service.latest_step(p, ("ebsd.clean",), map_id=st["map"], operation=op_)
+                    out[op_] = step_summary(p, s_) if s_ else ""
+                    clean_sum[op_].text = (f"Last applied: {out[op_]}" if out[op_] else "")
+                return out
 
             # 2 maps and IPF key
             with Section(gs, "ipf", "Maps and IPF key", "palette") as si:
@@ -1110,6 +1268,10 @@ def ebsd_page() -> None:
                 with ui.row().classes("w-full no-wrap gap-2"):
                     vs["opacity"] = si.num("opacity", "opacity (0-1)", 1.0, step=0.1, min=0, max=1)
                     vs["lw"] = si.num("lw", "overlay line width [px]", 1.0, "line_width", step=0.5, min=0.5, max=6)
+                ui.label("OIM axes: X = −A2, Y = −A1, Z = −A3 (EDAX setting 2): IPF-X = OIM IPF along A2, IPF-Y = "
+                         "along A1, IPF-Z = OIM [001].").classes("text-xs ti-muted").mark("ipf_oim_axes")                     .tooltip("Checked against OIM Analysis on JU04_area4 (docs/orientation_check.md): app x (right) = "
+                             "−A2, app y (down) = −A1, app z (into the screen) = −A3. A direction and its opposite have "
+                             "the same IPF colour, so the maps match OIM's IPF maps along A2, A1 and A3 ([001]).")
                 ui.label("Scale bar, colour bar and IPF key: the legend buttons in the map toolbar (next to 'Overlays') show them on the map; "
                          "drag them into place, the export puts them exactly there.").classes("text-xs ti-muted")
 
@@ -1308,7 +1470,10 @@ def ebsd_page() -> None:
                                "build direction when it is entered).").classes("text-xs ti-muted")
                 tab_vis.extend([(ga, "alpha"), (gb_, "beta")])
                 with ui.row().classes("w-full no-wrap gap-2"):
-                    gh = sz.num("hagb", "lath boundary [°]", 15.0, "gs_hagb", step=1, min=0)
+                    _gs_g = next((s_ for s_ in p.recipe().steps if s_.id == ls.get("grains")), None)
+                    gh = sz.num("hagb", "lath boundary [°]",
+                                g(_gs_g.params if _gs_g else {}, "grains", "hagb_deg", default=15.0), "gs_hagb",
+                                step=1, min=0)
                     sz.num("min_px", "min. grain [px]", g(ls, "min_px", default=5), "gs_min_px", step=1, min=1)
                 tab_vis.append((gh, "alpha"))
                 sz.check("exclude_edge", "exclude edge grains", g(ls, "exclude_edge", default=True))
@@ -1434,6 +1599,59 @@ def ebsd_page() -> None:
                     .mark("sec_compare"):
                 compare_section(p, lambda: st["map"], show_block, run_step, backend_status())
 
+    # ---- status badges (fix 5): which step each section compares its fields with ------------------------------
+    def _step(sid):
+        try:
+            return p.recipe().step(sid) if sid else None
+        except KeyError:
+            return None
+
+    sg.track(p, lambda: _step(lay.newest_grains(p.recipe().steps, st["map"], tabkey())),
+             lambda s_: {**{k: s_.params.get("grains", {}).get(k) for k in ("hagb_deg", "lagb_deg", "alpha", "min_px")},
+                         "burgers_tol_deg": s_.params.get("boundaries", {}).get("burgers_tol_deg")})
+
+    def kam_step():
+        k_ = kind.value if kind.value in ON_DEMAND else None
+        steps_ = [s_ for s_ in p.recipe().steps if s_.op == "map.compute" and not s_.stale
+                  and s_.params.get("map_id") == st["map"] and (k_ is None or s_.params.get("kind") == k_)]
+        return steps_[-1] if steps_ else None
+
+    def kam_rec(s_):
+        k_ = s_.params.get("kind")
+        keys = {"kam": ("kam_order", "kam_threshold_deg"), "gnd": ("gnd_stencil", "poisson")}.get(k_, ())
+        return {k: s_.params.get(k) for k in keys}
+    sk.track(p, kam_step, kam_rec)
+
+    def recon_rec(s_):
+        from ..backends.base import ReconParams  # noqa: PLC0415
+
+        r_ = ReconParams(**(s_.params.get("params") or {}))
+        vg_ = r_.method == "variantGraph"
+        return {"method": r_.method, "threshold": r_.vgThreshold if vg_ else r_.graphThreshold,
+                "tolerance": r_.vgTolerance if vg_ else r_.graphTolerance, "segAngle": r_.segAngle,
+                "orMode": r_.orMode, "orMaxDev": r_.orMaxDev, "mergeMode": r_.mergeMode,
+                "mergeThreshold": r_.mergeThreshold, "inclusionMaxSize": r_.inclusionMaxSize}
+    sr.track(p, lambda: service.latest_step(p, ("recon.run",), map_id=st["map"]), recon_rec)
+
+    def gs_step():
+        tgt = "prior_beta" if tabkey() == "beta" else "alpha"
+        steps_ = [s_ for s_ in p.recipe().steps if s_.op == "grainsize.run" and not s_.stale
+                  and s_.params.get("map_id") == st["map"] and (s_.params.get("target") or "alpha") == tgt]
+        return steps_[-1] if steps_ else None
+
+    def gs_rec(s_):
+        d_ = {"min_px": s_.params.get("min_px"), "exclude_edge": s_.params.get("exclude_edge")}
+        if (s_.params.get("target") or "alpha") == "alpha":
+            g_ = _step(s_.params.get("grains"))
+            d_.update(lath_min_aspect=s_.params.get("lath_min_aspect"),
+                      colony_tol=(s_.params.get("colony") or {}).get("burgers_tol_deg"),
+                      hagb=(g_.params.get("grains") or {}).get("hagb_deg") if g_ else None)
+        else:
+            d_["beta_line_spacing_um"] = s_.params.get("beta_line_spacing_um")
+        return {k: v for k, v in d_.items() if v is not None}
+    sz.track(p, gs_step, gs_rec)
+    all_secs = [sl, sc, *clean_secs.values(), sg, sk, sr, sz]
+
     def sheet_info():
         from ..sample import missing_fields  # noqa: PLC0415
 
@@ -1445,11 +1663,57 @@ def ebsd_page() -> None:
             state = "OIM-cleaned" if sh.input_state == "oim_cleaned" else "raw"
             if m is not None and m.input_state is None:
                 state += " (suggested from the file name)"
-            sheet_lab.text = f"{sh.specimen_id or 'no sample'}: {state}, {bd}"
+            from ..sample import indexing_label  # noqa: PLC0415
+
+            lab = indexing_label(m)
+            sheet_lab.text = (f"{sh.specimen_id or 'no sample'}: {state}, {bd}"
+                              + (f", indexing: {lab}" if lab else ""))
             miss = missing_fields(m) if m is not None else []
             sheet_link.set_visibility(bool(miss))
         except (KeyError, ValueError):
             sheet_lab.text = "map sheet incomplete (Files tab)"
+        load_info.text = frame_text()
+
+    def frame_text() -> str:
+        """Load section: EDAX setting, the crystal frame (file vs backend) and the OIM axes of the newest load."""
+        s_ = service.latest_step(p, ("ebsd.load",), map_id=st["map"])
+        if s_ is None or "frame" not in s_.outputs:
+            return ("Loads the .ang with EDAX setting 2 (x right, y down; app x = −A2, y = −A1, z = −A3 of OIM)."
+                    if s_ is None else "")
+        try:
+            fr = json.loads((p.root / s_.outputs["frame"].path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        cf = fr.get("crystal_frame")
+        cf = ", ".join(sorted(set(cf.values()))) if isinstance(cf, dict) else str(cf)
+        t_ = (f"Loaded {badges_when(s_)} ({s_.backend}), EDAX setting {fr.get('setting')}: app x = −A2, y = −A1, "
+              f"z = −A3 of OIM. Crystal frame {cf}; the file says '{fr.get('cartesian_alignment') or '?'}'.")
+        if fr.get("warning"):
+            t_ += " ⚠ " + fr["warning"]
+        return t_
+
+    def badges_when(s_) -> str:
+        from ..badges import when  # noqa: PLC0415
+
+        return when(s_)
+
+    def frame_notice(step) -> None:
+        """Warn when a loaded .ang's crystal frame is not the X||a both backends assume (fix 5)."""
+        ref = step.outputs.get("frame")
+        if ref is None:
+            return
+        try:
+            w_ = json.loads((p.root / ref.path).read_text(encoding="utf-8")).get("warning")
+        except (OSError, ValueError):
+            return
+        if w_:
+            ui.notify(f"{st['map']}: {w_}", type="warning", multi_line=True, timeout=0, close_button="OK")
+
+    def refresh_badges() -> None:
+        for sec_ in all_secs:
+            sec_._caption()
+        clean_summaries()
+        sheet_info()
 
     async def on_map_change(e):
         await select_map(e.value)

@@ -842,3 +842,55 @@
   cross-backend replay expects `other_backend` (fix 3 behaviour, the test was stale).
 - **Data note**: the JU06_tensile PRIAS export has a step in its own values at row ~429 (row means 757 -> 744), visible
   as a band at the bottom of the PRIAS map; it is in the exported text, not from the matching.
+
+## D33 (2026-11-13) Fifth user test: orientation check vs OIM, cleanup as steps, tuning, badges (fix 5)
+
+- **Orientation check vs OIM** (docs/orientation_check.md):
+  - The JU04_area4 probe point and map match OIM Analysis in both backends: not mirrored or rotated, crystal frame
+    X||a.
+  - Setting 2 = the file orientation rotated 180° about (1,−1,0)/√2, so app x = −A2, y = −A1, z = −A3.
+  - Nothing changed at load. The `CartesianAlignment` line and the backend's crystal frame are recorded in a new
+    `frame` output of `ebsd.load` (not in `meta`, so the recorded load outputs and replays stay identical), with a
+    warning when they disagree.
+  - Load cache version 3 (frame sidecar).
+- **Cleanup = separate operations** (`ebsd.clean`, `operation` + `params`; `base.CLEAN_OPS`; pymtex
+  `clean_step`, MATLAB `+ti64/cleanStep.m`):
+  - Operations: ci_threshold, spike_removal, noise_removal (with fill of the removed points), void_fill,
+    grain_dilation, smoothing.
+  - Each step works on the CURRENT map of the map id: `recipe.current_map_step` = the newest non-stale load /
+    cleanup step in recipe order. So a 'Load again' after cleanups starts from the loaded map; before fix 5, the
+    newest cleanup was preferred over a newer load.
+  - Void fill now uses the connected not-indexed region size (`component_sizes`) instead of the alpha = 0 grain of
+    the void; that was the same number, except for grain-id-0 regions, which already used the component size.
+  - The default chain (raw: CI 0.1 → noise → void fill) is close to, but not bit-identical with, the old combined
+    `ebsd.cleanup`: there, voids were measured before the noise removal and filled together with it. `ebsd.cleanup`
+    stays for existing recipes; replay is exact.
+- **Grain dilation, OIM style** (tolerance 5°, minimum grain 2 px, multiple rows, single iteration):
+  - Points outside grains of at least the minimum size (calcGrains alpha = 0 at the tolerance) take the orientation
+    and phase of a neighbour in the neighbouring grain with the most neighbours; ties go to the first neighbour in
+    the fixed order W, E, NW, NE, SW, SE.
+  - Sweeps are decided from the state before each sweep (same rules as the fill, `hexgrid.dilation_sweeps`, numba;
+    MATLAB `dilationFill` with maxIter), and the number of changed points per sweep is reported.
+  - A dilated point copies a neighbour's orientation, not the grain mean.
+  - Conformance: tests/conformance/test_fix5.py on JU04_area1.
+- **Tuning replaces** (`service.apply`, used by the GUI and the MCP analysis tools; `run()` and replay
+  unchanged):
+  - When the newest step of the map (sheet records aside) has the same `tune_key`, the new step takes its place in
+    the recipe, keeping the replaced step's source. `tune_key` = op + cleanup operation / map kind / grain-size
+    target / alpha vs prior-beta grains.
+  - Undo restores the previous parameters. Never for sheets, annotations, crops or comparisons, nor for a step
+    another step uses.
+- **Badges** (`badges.py`):
+  - No badge while a section was never used for the map.
+  - 'changed, not applied' only when the fields differ from the recorded parameters of the section's last applied
+    step.
+  - 'applied HH:MM' when that step is current.
+  - 'stale' when it is marked stale or its source map / grains / reconstruction is no longer the current one.
+  - The old rule (any draft vs the defaults) showed 'not applied' on Grain size without a change (report 0919).
+- **Indexing label** (`MapInfo.indexing`, `indexing_asked`):
+  - The question is asked once per file whose name contains 'rescan' or whose header has the older OIM phase names
+    'Ti (alpha)' / 'Ti (beta)'.
+  - It is metadata only: no sheet record, nothing stale. It appears in reports, the export sidecar
+    (`indexing`) and MCP `get_sample_sheet` / `set_indexing_label`.
+- **Tooltips**: 400 ms delay, hidden on mouse-down, key press and window blur, and before the report screenshot
+  (the Feedback tooltip was in every screenshot because it was the hovered button).

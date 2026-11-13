@@ -90,6 +90,83 @@ def dilation_fill(to_fill: np.ndarray, grain_id: np.ndarray, source_ok: np.ndarr
     return src, sweeps
 
 
+def _dilation_kernel():
+    """numba kernel of dilation_sweeps (compiled on first use, cached on disk)."""
+    import numba  # noqa: PLC0415
+
+    @numba.njit(cache=True)
+    def kern(todo, grain_id, ok0, nbr, src, max_iter, counts):
+        n = ok0.size
+        stamp = np.full(n, -1, np.int64)          # sweep in which a pixel was filled (-1: not filled)
+        k = nbr.shape[1]
+        g = np.empty(k, np.int64)
+        use = np.empty(k, np.bool_)
+        left = todo.copy()
+        nleft = left.size
+        sweep = 0
+        while nleft > 0 and sweep < max_iter:
+            nxt = 0
+            done = 0
+            for t in range(nleft):
+                i = left[t]
+                anyok = False
+                for j in range(k):
+                    nb = nbr[i, j]
+                    u = nb >= 0 and (ok0[nb] or (stamp[nb] >= 0 and stamp[nb] < sweep))
+                    use[j] = u
+                    g[j] = grain_id[nb] if u else -1
+                    anyok = anyok or u
+                if not anyok:
+                    left[nxt] = i
+                    nxt += 1
+                    continue
+                best, bestc = -1, -1
+                for j in range(k):                # first slot with the most usable neighbours of its grain
+                    if not use[j]:
+                        continue
+                    c = 0
+                    for jj in range(k):
+                        if use[jj] and g[jj] == g[j]:
+                            c += 1
+                    if c > bestc:
+                        best, bestc = j, c
+                w = nbr[i, best]
+                src[i] = src[w]
+                grain_id[i] = grain_id[w]
+                stamp[i] = sweep
+                done += 1
+            if done == 0:
+                break
+            counts[sweep] = done
+            nleft = nxt
+            sweep += 1
+        return sweep
+
+    return kern
+
+
+_KERN = None
+
+
+def dilation_sweeps(to_fill: np.ndarray, grain_id: np.ndarray, source_ok: np.ndarray, nbr: np.ndarray,
+                    max_iter: int = 100_000) -> tuple[np.ndarray, list[int]]:
+    """dilation_fill (same rules, same result) with numba, also returning how many pixels changed per sweep
+    (grain dilation reports them per iteration). grain_id is updated in place."""
+    global _KERN
+    if _KERN is None:
+        _KERN = _dilation_kernel()
+    n = to_fill.size
+    src = np.arange(n, dtype=np.int64)
+    ok0 = np.ascontiguousarray(source_ok, dtype=np.bool_)
+    todo = np.flatnonzero(to_fill & ~ok0).astype(np.int64)
+    src[todo] = -1
+    counts = np.zeros(max(1, min(max_iter, todo.size + 1)), np.int64)
+    gid = np.ascontiguousarray(grain_id, dtype=np.int64)
+    sweeps = _KERN(todo, gid, ok0, np.ascontiguousarray(nbr, dtype=np.int64), src, int(max_iter), counts)
+    grain_id[:] = gid
+    return src, [int(c) for c in counts[:sweeps]]
+
+
 def component_sizes(mask: np.ndarray, nbr: np.ndarray) -> np.ndarray:
     """Per pixel: size of its connected region within `mask` (neighbours from neighbour_table), 0 outside the mask.
     Used for not-indexed regions that the grain reconstruction leaves without a grain (MTEX 7.2 / pymtex 1.0

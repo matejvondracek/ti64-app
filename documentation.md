@@ -276,6 +276,24 @@ Screenshots: `python scripts/gui_screenshots_fix3.py` → `projects/_screens_fix
 
 Screenshots: `python scripts/gui_screenshots_fix4.py` → `projects/_screens_fix4/` (git-ignored).
 
+### Phase 6.6 fix 5 – orientation check vs OIM, cleanup as steps, tuning, badges (fifth user test, decision D33)
+
+| Change | Where |
+| --- | --- |
+| **Orientation check vs OIM** (JU04_area4): probe point, map (not mirrored / rotated), crystal frame X‖a, app x = −A2, y = −A1, z = −A3; verdict: match, nothing changed at load | `docs/orientation_check.md`, `scripts/orientation_check.py`, `frame.py` |
+| Load step records the .ang's CartesianAlignment + the backend's crystal frame (`frame` output, warning if they differ) | `service._ebsd_load / load_frame`, `EBSDData.alignment`, `matlab/+ti64/exportEbsd.m` |
+| **Probe** like the OIM status bar: row / column, file Euler angles (°), app-frame Euler angles (setting 2), IQ, CI | `probe.py`, `gui/ebsd_tab.on_probe` |
+| **Load** and **Cleanup** are separate sections; each cleanup operation (CI threshold, wild spikes, noise grains, void fill, grain dilation, smoothing) has its own Apply and recipe step on the previous step's output; 'Add default cleanup' | `ebsd.clean` (`ops_ebsd`), `base.CLEAN_OPS`, `PymtexBackend.clean_step`, `matlab/+ti64/cleanStep.m`, `service.add_default_cleanup`, `recipe.current_map_step` |
+| **Grain dilation** (OIM style: tolerance, minimum grain size, multiple rows, single iteration), points changed per iteration | `hexgrid.dilation_sweeps` (numba), `cleanStep.m` + `dilationFill.m` |
+| Void fill report: removed / filled / unfilled and the points left in voids larger than the maximum size; toggle 'highlight not-indexed points' (magenta) | `ops_ebsd.clean_summary`, `layers.LayerParams.highlight_ni` |
+| **Tuning replaces**: the same operation applied directly after itself replaces that step (undo restores it), also Load again and every analysis step | `service.apply / tuning_target / tune_key` (GUI, MCP tools) |
+| **Badges**: none when never used; 'changed, not applied' only against the last applied step; 'applied HH:MM'; 'stale' when upstream changed; tooltips | `badges.py`, `gui/ebsd_tab.Section` |
+| View tab .up2: Pattern panel full height, status line ends at it; Files tab groups indented under their sample; tooltips only on hover (delay, hidden on click / leave, not in report screenshots) | `gui/view_tab.py`, `gui/files_tab.py`, `gui/theme.py`, `gui/shell.py` |
+| **Indexing method label** (Hough / Spherical): asked once for 'Rescan' files or older phase names; tag in the Files tab, map info, reports, export sidecar, MCP | `sample.MapInfo.indexing`, `gui/indexing.py`, MCP `set_indexing_label`, `get_sample_sheet` |
+| Tests | `tests/unit/test_fix5.py`, `tests/integration/test_fix5_orientation.py` (probe point, frame, IPF axes; every .ang in data/ draws IPF, phase, grains, KAM in both backends), `tests/conformance/test_fix5.py` (cleanup operations incl. dilation on JU04_area1) |
+
+Screenshots: `python scripts/gui_screenshots_fix5.py` → `projects/_screens_fix5/` (git-ignored).
+
 ### Stubs (later phases)
 `modules/registration.py`, `crack.py`, `bending.py`, `indexing.py`.
 
@@ -284,8 +302,8 @@ Screenshots: `python scripts/gui_screenshots_fix4.py` → `projects/_screens_fix
 Data and inputs needed from the user:
 - [ ] **OIM images** (IPF and CI exports of the test maps) in `data/reference/`, then run `compare.oim`
       (GUI Maps page or MCP `compare_with_oim`) for the IPF/CI comparison.
-- [ ] **OIM figure with an in-plane reference** (IPF along RD/TD or an OIM pole figure) to settle the
-      x↔y frame question (decision D1: setting 2 vs the bachelor-thesis convention).
+- [x] **OIM frame check**: JU04_area4 probe point and IPF [001] map vs OIM (fix 5, docs/orientation_check.md); a
+      screen capture instead of a photo would allow a pixel-exact colour comparison.
 - [x] **JEOL BSE image + .txt pairs** (JSM-IT500HR): parser verified on 197 real pairs (D5 update, D17).
 - [ ] Images of both specimen edges for position fiducials (phase 7).
 - [ ] A real **2D grid** of overlapping SEM tiles (only 1D sets in data/) to test stitching with loops in the pair
@@ -337,6 +355,6 @@ Phase 5 open points:
       code (D15). Confirm, or port the layout to +ti64 so MATLAB draws them end to end.
 - [ ] Native export of a hex map has non-square pixels (0.2 × 0.1732 µm, declared in the file) and the shifted
       rows half a pixel to the left (D15). Confirm this definition of "1 px per measurement".
-- [ ] Probe shows the quaternion, not Euler angles (convention to be checked against OIM before showing Euler).
+- [x] Probe shows Euler angles as in OIM (file) and in the app frame (fix 5, docs/orientation_check.md).
 - [ ] Viewer: per-phase IPF keys of the view are passed to exports; the backend IPF key image shows one phase
       at a time.

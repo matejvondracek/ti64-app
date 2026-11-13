@@ -16,7 +16,7 @@ from nicegui import ui
 from ..project import Project
 from ..sample import (missing_fields, BuildDirection, FourPointBending, MapInfo, MapPosition, SampleInfo, effective,
                       suggest_input_state, suggest_role, suggest_sample_id)
-from . import dialogs
+from . import dialogs, indexing
 from .shell import check_interrupted, error, header
 from .state import GuiState, autosave, stable
 from .tips import tip
@@ -97,6 +97,7 @@ def files_page(sel: str | None = None) -> None:
                      if with_prias else ""), type="positive", multi_line=True)
         if added:
             select("file", added[-1].id)
+            indexing.ask_pending(p, on_done=lambda: (tree.refresh(), props.refresh()), only=[m.id for m in added])
         unassigned = [m for m in p.files() if m.sample_id is None and suggest_sample_id(m.file)]
         if unassigned and target is None:
             ui.notify("Tip: Auto-assign suggests the sample of each file from its name.", type="info")
@@ -315,7 +316,9 @@ def files_page(sel: str | None = None) -> None:
         with row:
             ui.icon(KIND_ICON.get(m.kind, "description"), size="20px").classes(
                 "text-gray-400" if status == "missing" else "text-primary")
-            ui.label(Path(m.file).name).classes("ti-name truncate grow").tooltip(m.file)
+            ui.label(Path(m.file).name).classes("ti-name truncate").tooltip(m.file)
+            indexing.tag(m)
+            ui.element("div").classes("grow")
             if status == "missing":
                 ui.button("Relocate", icon="travel_explore", on_click=lambda m=m: relocate(m)) \
                     .props("dense flat size=sm color=negative").mark(f"relocate_{m.id}")
@@ -339,6 +342,12 @@ def files_page(sel: str | None = None) -> None:
                     .mark(f"newsample_{m.id}")
                 if status == "missing":
                     ui.menu_item("Find missing files…", on_click=lambda m=m: relocate(m))
+                if m.kind == "ang":
+                    ui.separator()
+                    ui.label("Indexing method").classes("text-xs ti-muted px-4 pt-1")
+                    for v, lab in indexing.OPTIONS.items():
+                        ui.menu_item(("✓ " if (m.indexing or "") == v else "    ") + lab,
+                                     on_click=lambda m=m, v=v: set_indexing(m, v)).mark(f"indexing_{v or 'none'}_{m.id}")
                 ui.separator()
                 ui.menu_item("Remove from project", on_click=lambda m=m: (select("file", m.id), remove_selected()))
         # clicks on a button inside the row (Relocate) do not select the row: selecting redraws the list
@@ -351,6 +360,11 @@ def files_page(sel: str | None = None) -> None:
         row.on("keydown.delete", lambda m=m: (select("file", m.id), remove_selected()))
         row.on("dragstart", lambda m=m: st.update(drag=m.id))
 
+    def set_indexing(m: MapInfo, v: str) -> None:
+        indexing.set_label(p, m.id, v or None)
+        tree.refresh()
+        props.refresh()
+
     def group_files(files: list[MapInfo], samples):
         by_kind: dict[str, list[MapInfo]] = defaultdict(list)
         for m in files:
@@ -359,12 +373,13 @@ def files_page(sel: str | None = None) -> None:
             items = sorted(by_kind.get(kind, []), key=lambda m: (str(Path(m.file).parent).lower(), Path(m.file).name.lower()))
             if not items:
                 continue
-            ui.label(f"{KIND_LABEL[kind]} ({len(items)})").classes("ti-group pl-8")
+            # one level under the sample name, smaller and lighter than it; the files one more level (fix 5)
+            ui.label(f"{KIND_LABEL[kind]} ({len(items)})").classes("ti-group").mark(f"group_{kind}")
             folders = sorted({str(Path(m.file).parent) for m in items})
             for folder in folders:
                 if len(folders) > 1:
-                    ui.label(folder).classes("text-xs ti-muted pl-10 truncate").tooltip(folder)
-                with ui.column().classes("w-full gap-0 pl-8"):
+                    ui.label(folder).classes("ti-folder truncate").tooltip(folder)
+                with ui.column().classes("w-full gap-0").style("padding-left: 92px"):
                     for m in items:
                         if str(Path(m.file).parent) == folder:
                             file_row(m, samples)
@@ -455,6 +470,8 @@ def files_page(sel: str | None = None) -> None:
         tree()
     with props_box:
         props()
+    # fix 5: maps that look re-indexed (also those already in the project) are asked about once
+    ui.timer(0.3, lambda: indexing.ask_pending(p, on_done=lambda: (tree.refresh(), props.refresh())), once=True)
 
 
 def _short(path: str, folder: str) -> str:
@@ -570,8 +587,10 @@ def map_sheet(p: Project, gs: GuiState, m: MapInfo, on_saved, open_tool, relocat
     with ui.row().classes("w-full items-center no-wrap gap-2"):
         ui.icon(KIND_ICON.get(m.kind, "description"), size="26px").classes("text-primary")
         with ui.column().classes("gap-0 grow min-w-0 overflow-hidden"):
-            ui.label(f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}").classes("text-lg font-semibold truncate") \
-                .mark("sheet_map")
+            with ui.row().classes("items-center no-wrap gap-2 min-w-0"):
+                ui.label(f"{m.sample_id or 'Unassigned'} / {Path(m.file).name}") \
+                    .classes("text-lg font-semibold truncate").mark("sheet_map")
+                indexing.tag(m)
             ui.label(m.file).classes("text-xs ti-muted break-all")
         label = {"ang": "Open in EBSD tab", "image": "Open in View tab", "up2": "Open in View tab"}.get(m.kind)
         if label and status != "missing":
@@ -620,6 +639,12 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
             hint.set_visibility(m.input_state is None)
             ist.on_value_change(lambda e: save(input_state=e.value) and hint.set_visibility(False))
         _phases_section(m, save)
+        with ui.row().classes("items-center gap-2"):
+            ui.label("Indexing method").tooltip("How the map was indexed: Hough (the microscope's default) or "
+                                                "spherical indexing (re-indexed in OIM Analysis). Shown as a tag in "
+                                                "the file list, in reports, exports and the MCP map info.")
+            ui.select(indexing.OPTIONS, value=m.indexing or "").props("dense options-dense").classes("w-64") \
+                .mark("ms_indexing").on_value_change(lambda e: save(indexing=e.value or None, indexing_asked=True))
         _prias_section(m)
         # build direction in map coordinates (+ prefill from the sample's other maps)
         bd = m.build_direction

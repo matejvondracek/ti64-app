@@ -26,7 +26,14 @@ body {{ background: {PAGE}; color: {TEXT}; font-family: "Segoe UI", system-ui, s
 .ti-muted {{ color: {MUTED}; }}
 .ti-section .q-expansion-item__container > .q-item {{ font-weight: 600; min-height: 44px; }}
 .ti-section {{ border-bottom: 1px solid {BORDER}; }}
-.ti-draft {{ font-size: 11px; color: {WARN}; border: 1px solid {WARN}; border-radius: 9999px; padding: 0 8px; }}
+.ti-draft {{ font-size: 11px; color: {WARN}; border: 1px solid {WARN}; border-radius: 9999px; padding: 0 8px;
+             white-space: nowrap; }}
+.ti-stale {{ font-size: 11px; color: #9a3412; background: #fff1e6; border: 1px solid #f0b48a; border-radius: 9999px;
+             padding: 0 8px; white-space: nowrap; }}
+.ti-applied {{ font-size: 11px; color: #1e6b3a; border: 1px solid #9fd3b0; border-radius: 9999px; padding: 0 8px;
+               white-space: nowrap; }}
+.ti-subsection {{ border: 1px solid {BORDER}; border-radius: 8px; margin: 4px 0; background: #fbfcfe; }}
+.ti-subsection .q-expansion-item__container > .q-item {{ min-height: 36px; padding: 2px 10px; }}
 .ti-inherited input, .ti-inherited .q-field__native {{ color: {MUTED} !important; font-style: italic; }}
 .ti-row {{ border-radius: 8px; cursor: pointer; padding: 3px 8px; user-select: none; }}
 .ti-row:hover {{ background: #eef3fb; }}
@@ -34,7 +41,11 @@ body {{ background: {PAGE}; color: {TEXT}; font-family: "Segoe UI", system-ui, s
 .ti-row.missing {{ color: #8a94a3; }}
 .ti-row.missing .ti-name {{ text-decoration: line-through; }}
 .ti-row.drop-target {{ background: #e0ecff; outline: 2px dashed {PRIMARY}; }}
-.ti-group {{ font-size: 12px; color: {MUTED}; text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px 2px; }}
+.ti-group {{ font-size: 10.5px; font-weight: 500; color: #9aa3ad; text-transform: uppercase; letter-spacing: .06em;
+             padding: 5px 8px 1px 78px; }}
+.ti-folder {{ font-size: 11px; color: #9aa3ad; padding-left: 78px; }}
+.ti-tag {{ font-size: 10.5px; line-height: 16px; padding: 0 6px; border-radius: 8px; background: #e8eefb;
+          color: #2c4a86; white-space: nowrap; }}
 input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button {{ opacity: 1; }}
 .q-tooltip {{ font-size: 13px; max-width: 360px; line-height: 1.35; }}
 .ti64-showing-original::after {{ content: "Original (unedited)"; position: absolute; top: 36px; left: 50%;

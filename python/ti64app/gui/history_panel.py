@@ -86,7 +86,34 @@ def step_label(s, tab: str = "alpha") -> str:
         return f"{str(s.params['kind']).upper()} map"
     if s.op == "grains.calc" and tab == "beta":
         return "Prior-β grains and boundaries"
+    if s.op == "ebsd.clean":
+        from ..backends.base import CLEAN_LABELS  # noqa: PLC0415
+
+        return "Cleanup: " + CLEAN_LABELS.get(s.params.get("operation"), str(s.params.get("operation")))
     return OP_LABEL.get(s.op, s.op)
+
+
+def _local(ts: str) -> str:
+    """Recipe timestamps are UTC: shown in local time (MM-DD HH:MM), as the section badges (fix 5)."""
+    from datetime import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.fromisoformat(ts).astimezone().strftime("%m-%d %H:%M")
+    except ValueError:
+        return ts[5:16].replace("T", " ")
+
+
+def step_summary(p: Project, s) -> str:
+    """The plain-language result line of a step (cleanup report summary), '' if it has none."""
+    ref = s.outputs.get("report")
+    if ref is None or ref.kind != "json":
+        return ""
+    try:
+        import json  # noqa: PLC0415
+
+        return json.loads((p.root / ref.path).read_text(encoding="utf-8")).get("summary") or ""
+    except (OSError, ValueError, AttributeError):
+        return ""
 
 
 def tab_steps(p: Project, map_id: str | None, tab: str, include_stale: bool = True) -> list:
@@ -170,9 +197,12 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
                     ui.icon("drag_indicator" if not s.stale else "block", size="18px").classes("ti-muted")
                     ui.label(str(n) if not s.stale else "–").classes("text-xs ti-muted w-4")
                     with ui.column().classes("gap-0 grow min-w-0"):
-                        ui.label(step_label(s, tab) + (" (stale)" if s.stale else "")) \
+                        lab = ui.label(step_label(s, tab) + (" (stale)" if s.stale else "")) \
                             .classes("text-sm truncate" + (" ti-muted line-through" if s.stale else ""))
-                        ui.label(f"{s.id} · {s.backend or 'no backend'} · {s.timestamp[5:16].replace('T', ' ')}") \
+                        summ = step_summary(p, s)
+                        if summ:
+                            lab.tooltip(summ)
+                        ui.label(f"{s.id} · {s.backend or 'no backend'} · {_local(s.timestamp)}") \
                             .classes("text-xs ti-muted truncate")
                     with ui.context_menu().mark(f"hist_menu_{s.id}"):       # right-click (fix 3.13)
                         ui.menu_item("Show parameters", on_click=lambda s=s: select(s.id))

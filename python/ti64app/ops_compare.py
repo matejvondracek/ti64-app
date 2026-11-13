@@ -36,7 +36,7 @@ PERF_KEYS = ("seconds", "rss_GB", "peak_GB", "load_s", "transfer_s")
 def default_figure(op_name: str, step: RecipeStep, kind: str | None) -> tuple[str, dict] | None:
     """Quick-look figure of a data operation: (figure op, params) referring to the step that made the data."""
     mid = step.params.get("map_id")
-    if op_name in ("ebsd.load", "ebsd.cleanup"):
+    if op_name in ("ebsd.load", "ebsd.cleanup", "ebsd.clean"):
         return "figure", {"map_id": mid, "kind": kind or "ipf", "source": step.id}
     if op_name == "grains.calc":
         return "figure", {"map_id": mid, "kind": kind or "ipf", "source": step.params.get("source"),

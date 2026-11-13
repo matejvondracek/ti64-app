@@ -184,11 +184,49 @@ class MapInfo(BaseModel):
     process: str | None = None
     heat_treatment: str | None = None
     bending: FourPointBending | None = None
+    # how the EBSD map was indexed (fix 5): 'hough' (microscope default) | 'spherical' (re-indexed in OIM Analysis);
+    # None = no label. Metadata only (reports, exports, MCP); it changes no result.
+    indexing: Literal["hough", "spherical"] | None = None
+    indexing_asked: bool = False              # the 're-indexed with spherical indexing?' question was answered
 
     @field_validator("id")
     @classmethod
     def _safe(cls, v: str) -> str:
         return _check_id(v, "map ID")
+
+
+INDEXING_LABELS = {"hough": "Hough", "spherical": "Spherical"}
+OLD_PHASE_NAMES = ("Ti (alpha)", "Ti (beta)")         # OIM Analysis re-index exports; APEX: 'Ti (Titanium, alpha)'
+
+
+def reindex_hint(path: str | Path) -> str | None:
+    """Why an .ang looks re-indexed in OIM Analysis (spherical indexing): 'Rescan' in the file name, or the older
+    phase names 'Ti (alpha)' / 'Ti (beta)' in its header (the raw APEX exports say 'Ti (Titanium, alpha)'). None =
+    looks like a raw APEX (Hough) export: no question, no label."""
+    p = Path(path)
+    if p.suffix.lower() != ".ang":
+        return None
+    if "rescan" in p.name.lower():
+        return "'Rescan' in the file name"
+    try:
+        from .io.ang import read_header  # noqa: PLC0415
+
+        names = [" ".join(str(ph.get("MaterialName", "")).split()) for ph in read_header(p).phases]
+    except OSError:
+        return None
+    old = [n for n in names if n in OLD_PHASE_NAMES]
+    return f"phase names {', '.join(repr(n) for n in old)} (OIM Analysis re-index)" if old else None
+
+
+def needs_indexing_question(m: "MapInfo") -> str | None:
+    """The reason to ask 'Was this map re-indexed with spherical indexing?' (once per file), else None."""
+    if m.kind != "ang" or m.indexing_asked or m.indexing is not None:
+        return None
+    return reindex_hint(m.file)
+
+
+def indexing_label(m: "MapInfo | None") -> str | None:
+    return INDEXING_LABELS.get(m.indexing) if m is not None and m.indexing else None
 
 
 def file_kind(path: str | Path) -> FileKind | None:

@@ -87,10 +87,14 @@ def recipe_steps(project) -> list[dict]:
     if project is None:
         return []
     out = []
+    from .sample import indexing_label  # noqa: PLC0415
+
+    labels = {m.id: indexing_label(m) for m in project.files()}
     for s in project.recipe().steps:
         t = {k: v for k, v in s.metrics.items() if k.endswith("_s") or k in ("seconds", "peak_GB", "cached")}
-        out.append({"id": s.id, "op": s.op, "map": s.params.get("map_id") or s.params.get("file") and
-                    Path(str(s.params.get("file"))).name, "sample": s.sample_id, "backend": s.backend,
+        mid = s.params.get("map_id")
+        out.append({"id": s.id, "op": s.op, "map": (f"{mid} [{labels[mid]}]" if labels.get(mid) else mid)
+                    or s.params.get("file") and Path(str(s.params.get("file"))).name, "sample": s.sample_id, "backend": s.backend,
                     "status": "stale" if s.stale else "current", "time": s.timestamp, "timings": t})
     return out
 

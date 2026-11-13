@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..sample import InputState
 
@@ -79,6 +79,61 @@ CLEANUP_PRESETS: dict[str, CleanupParams] = {
     # OIM-cleaned: CI already modified by OIM -> no CI filter; same noise cleanup (JU02 reference)
     "oim_cleaned": CleanupParams(ci_threshold=None),
 }
+
+
+# ---- cleanup as separate operations (phase 6.6 fix 5): each is its own recipe step on the output of the previous
+# cleanup step of the map, so the user decides the order. Same names, units and defaults in both backends.
+class CiThresholdParams(BaseModel):
+    ci_threshold: float = Field(0.1, ge=0, le=1)          # indexed points with CI < this -> not indexed
+
+
+class SpikeRemovalParams(BaseModel):
+    spike_angle_deg: float = Field(5.0, gt=0)             # 1-pixel indexed grains at this angle -> not indexed
+
+
+class NoiseRemovalParams(BaseModel):
+    noise_angle_deg: float = Field(3.0, gt=0)             # EBSD_part2 par.cleanAngle
+    noise_max_indexed_px: int = Field(2, ge=0)            # indexed grains <= this many pixels are removed
+    fill: bool = True                                     # removed points take a neighbour's orientation
+
+
+class VoidFillParams(BaseModel):
+    max_void_px: int = Field(4, ge=0)                     # not-indexed regions <= this many pixels are filled
+    angle_deg: float = Field(3.0, gt=0)                   # grain angle of the neighbour vote (which grain wins)
+
+
+class GrainDilationParams(BaseModel):
+    """OIM-style grain dilation: points belonging to no grain of at least min_grain_px (grains at tolerance_deg, hex /
+    square neighbours) take the orientation and phase of the neighbouring grain with the most neighbours (ties: first
+    neighbour in the fixed order W, E, NW, NE, SW, SE), repeated until nothing changes unless single_iteration."""
+    tolerance_deg: float = Field(5.0, gt=0)               # OIM 'grain tolerance angle'
+    min_grain_px: int = Field(2, ge=1)                    # OIM 'minimum grain size'
+    multi_row: bool = False                               # OIM 'grain must span multiple rows'
+    single_iteration: bool = False                        # OIM 'single iteration'
+
+
+class SmoothingParams(BaseModel):
+    hq_alpha: float = Field(0.5, gt=0)                    # halfQuadraticFilter regularisation
+    hq_threshold_deg: float = Field(15.0, gt=0)           # no smoothing across misorientations above this
+
+
+CLEAN_OPS: dict[str, type[BaseModel]] = {
+    "ci_threshold": CiThresholdParams, "spike_removal": SpikeRemovalParams, "noise_removal": NoiseRemovalParams,
+    "void_fill": VoidFillParams, "grain_dilation": GrainDilationParams, "smoothing": SmoothingParams}
+CLEAN_LABELS = {"ci_threshold": "CI threshold", "spike_removal": "Wild-spike removal",
+                "noise_removal": "Noise-grain removal", "void_fill": "Void fill", "grain_dilation": "Grain dilation",
+                "smoothing": "Smoothing (halfQuadraticFilter)"}
+# 'Add default cleanup': the preset of the input state as separate steps in the default order (EBSD_part2.m)
+DEFAULT_CLEANUP: dict[str, list[tuple[str, dict]]] = {
+    "raw": [("ci_threshold", {"ci_threshold": 0.1}), ("noise_removal", {}), ("void_fill", {})],
+    "oim_cleaned": [("noise_removal", {}), ("void_fill", {})],
+}
+
+
+def clean_params(operation: str, params: dict | None = None) -> BaseModel:
+    if operation not in CLEAN_OPS:
+        raise ValueError(f"unknown cleanup operation {operation!r}; known: {sorted(CLEAN_OPS)}")
+    return CLEAN_OPS[operation].model_validate(params or {})
 
 
 def cleanup_params_for(input_state: str, overrides: dict | None = None) -> CleanupParams:
@@ -190,6 +245,9 @@ class EBSDData:
     grid: Literal["hex", "square"] = "hex"
     step_um: float = 0.0
     setting: int = 2
+    # crystal reference frame per phase as the backend loaded it, e.g. 'X||a, Y||b*, Z||c' (fix 5); not in meta()
+    # (recorded load outputs stay identical), stored in the load step's 'frame' output
+    alignment: dict[int, str] = field(default_factory=dict)
 
     @property
     def n(self) -> int:

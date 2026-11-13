@@ -60,7 +60,7 @@ classdef Phase2Test < matlab.unittest.TestCase
 
     function cleanupRaw(tc)
       [~, rep] = ti64.cleanup(tc.Id, tc.preset(0.1));
-      tc.verifyEqual([rep.n_ci_removed rep.n_filled rep.n_unfilled rep.n_indexed_after], [2954 1066 21 87766]);
+      tc.verifyEqual([rep.n_ci_removed rep.n_filled rep.n_unfilled rep.n_indexed_after], [2954 1030 22 87730]);   % fix 4 (D32): larger voids no longer filled
     end
 
     function grainsAndMaps(tc)

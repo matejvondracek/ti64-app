@@ -51,11 +51,12 @@ async def test_ebsd_tab_runs_cleanup(crop300_ju02):
     async with user_simulation(main_file=MAIN) as user:
         sys.modules["ti64app.gui.app"].STATE["project"] = "gui_maps"
         await user.open("/ebsd")
-        await user.should_see("Load and cleanup")
+        await user.should_see("Cleanup")
         await user.should_see(marker="map_viewer", retries=200)
-        user.find("run_cleanup").click()
-        await user.should_see("cleanup done", retries=200)
-    assert [s.op for s in p.recipe().steps][-1] == "ebsd.cleanup"
+        user.find(marker="add_default_cleanup").click()
+        await user.should_see("Default cleanup added", retries=300)
+    ops = [s.params.get("operation") for s in p.recipe().steps if s.op == "ebsd.clean"]
+    assert ops == ["noise_removal", "void_fill"]                 # OIM-cleaned preset as separate steps (fix 5)
 
 
 @pytest.mark.anyio

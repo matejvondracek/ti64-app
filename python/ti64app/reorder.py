@@ -15,9 +15,10 @@ from . import history, service
 from .project import Project
 from .recipe import RecipeStep
 
-MAP_OPS = ("ebsd.load", "ebsd.cleanup")
+MAP_OPS = ("ebsd.load", "ebsd.cleanup", "ebsd.clean")
 REQUIRES: dict[str, tuple[tuple[str, ...], str]] = {
     "ebsd.cleanup": (("ebsd.load",), "a loaded map (Load map)"),
+    "ebsd.clean": (("ebsd.load",), "a loaded map (Load map)"),
     "grains.calc": (MAP_OPS, "a loaded or cleaned map"),
     "map.compute": (MAP_OPS, "a loaded or cleaned map"),
     "figure": (MAP_OPS, "a loaded or cleaned map"),
@@ -31,7 +32,7 @@ REQUIRES: dict[str, tuple[tuple[str, ...], str]] = {
     "grainsize.compare_oim": (("grainsize.run",), "a grain-size analysis"),
 }
 REF_KEYS = ("source", "grains", "recon", "values", "grainsize")
-NAMES = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "grains.calc": "Grains and boundaries",
+NAMES = {"ebsd.load": "Load map", "ebsd.cleanup": "Cleanup", "ebsd.clean": "Cleanup operation", "grains.calc": "Grains and boundaries",
          "map.compute": "KAM / GROD / GOS / GND map", "figure": "Figure", "compare.oim": "Compare with OIM",
          "recon.run": "Prior-β reconstruction", "recon.sweep": "Parameter sweep", "recon.figure": "Reconstruction figure",
          "grainsize.run": "Grain size", "grainsize.figure": "Grain-size figure",

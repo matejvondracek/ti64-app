@@ -46,6 +46,13 @@ class AnnotationsSetParams(BaseModel):
     items: list[Annotation] = Field(default_factory=list)
 
 
+def _indexing(project, map_id: str) -> str | None:
+    """Indexing method label of the map (Hough / Spherical, fix 5) for the sidecar; None = no label."""
+    from .sample import indexing_label  # noqa: PLC0415
+
+    return indexing_label(project.file(map_id))
+
+
 @op("annotations.set", AnnotationsSetParams, uses_backend=False)
 def _annotations_set(ctx: OpContext) -> None:
     """Replace the annotations and ROIs of one map (text, arrow, line, polyline, point, crack, roi_rect,
@@ -222,6 +229,7 @@ def _export_map(ctx: OpContext) -> None:
         lay["values"] = ctx.params.pop("values")
     side: dict[str, Any] = {
         "map_id": p.map_id, "map_file": sheet.map_file, "map_fingerprint": file_fingerprint(sheet.map_file),
+        "indexing": _indexing(ctx.project, p.map_id),
         "input_state": sheet.input_state, "build_direction": sheet.build_direction.model_dump(mode="json") if sheet.build_direction else None,
         "layer": {**lay, "title": spec.title, "colorbar_label": spec.colorbar_label,
                   "ipf_keys": meta.get("keys")},

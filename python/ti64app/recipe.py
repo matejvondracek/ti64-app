@@ -118,3 +118,15 @@ def _keep_version(path: Path) -> None:
 def recipe_versions(project_root: Path) -> list[Path]:
     """Saved versions of a project's recipe.json, newest first (for recovery)."""
     return sorted((Path(project_root) / ".history" / "recipe").glob("recipe_*.json"), reverse=True)
+
+
+# ---- the map chain (phase 6.6 fix 5) ------------------------------------------------------------------------------
+# Steps that produce a map: load, the old one-step cleanup (kept for existing recipes) and the single cleanup
+# operations (ebsd.clean). Each cleanup works on the output of the step before it; the CURRENT map of a map id is
+# the newest non-stale of these steps in recipe order (a 'Load again' after cleanups starts again from the loaded map).
+MAP_CHAIN_OPS = ("ebsd.load", "ebsd.cleanup", "ebsd.clean")
+
+
+def current_map_step(steps: list[RecipeStep], map_id: str) -> RecipeStep | None:
+    hits = [s for s in steps if not s.stale and s.op in MAP_CHAIN_OPS and s.params.get("map_id") == map_id]
+    return hits[-1] if hits else None

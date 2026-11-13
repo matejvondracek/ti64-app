@@ -22,7 +22,7 @@ from .ops_ebsd import _ipf_vector, resolve_source, step_npz
 from .service import OpContext, op
 from .settings import IpfKeySetting
 
-RECON_SOURCES = ("ebsd.load", "ebsd.cleanup")
+RECON_SOURCES = ("ebsd.clean", "ebsd.cleanup", "ebsd.load")   # = MAP_SOURCES: the current map of the map id
 BETA, ALPHA = "Ti (beta)", "Ti (alpha)"
 
 

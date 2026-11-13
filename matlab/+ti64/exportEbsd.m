@@ -48,6 +48,21 @@ end
 mins = ebsd.mineralList;
 info.phaseNames = mins;
 info.phaseMap = ebsd.phaseMap(:)';
+% crystal reference frame per phase (fix 5: the .ang says 'a || x, c* || z'; MTEX loads hexagonal .ang as X||a)
+al = cell(1, numel(ebsd.CSList));
+for k = 1:numel(ebsd.CSList)
+  al{k} = '';
+  if isa(ebsd.CSList(k), 'crystalSymmetry')
+    try
+      a = ebsd.CSList(k).alignment;
+      if iscell(a), a = strjoin(a, ', '); end
+      al{k} = char(a);
+    catch
+      al{k} = '';
+    end
+  end
+end
+info.alignment = al;
 info.isHex = isa(ebsd, 'EBSDhex');
 info.stepUm = ebsd.dx;
 info.setting = ebsd.opt.ti64setting;

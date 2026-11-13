@@ -120,7 +120,11 @@ def gui_context() -> dict:
     fid = g.get("selected_file") if g.get("tab") != "/view" else (g.get("view_file") or g.get("view_source"))
     m = p.file(fid) if isinstance(fid, str) and p.file(fid) else None
     mt = g.get("mtab", {}).get(fid) if isinstance(g.get("mtab"), dict) and isinstance(fid, str) else None
-    return {"tab": g.get("tab"), "file": (f"{m.id} ({Path(m.file).name}, {m.kind})" if m else fid),
+    from ..sample import indexing_label  # noqa: PLC0415
+
+    lab = indexing_label(m)
+    return {"tab": g.get("tab"), "file": (f"{m.id} ({Path(m.file).name}, {m.kind}"
+                                          + (f", indexing {lab}" if lab else "") + ")" if m else fid),
             "map tab": {"alpha": "α map", "beta": "prior β"}.get(mt, mt) if g.get("tab") == "/ebsd" else None,
             "map kind shown": (g.get("layer", {}).get(fid) if isinstance(g.get("layer"), dict) and
                                isinstance(fid, str) else None)}
@@ -193,8 +197,47 @@ def header(active: str | None = None) -> Project | None:
     return p
 
 
+# ---- tooltips (fix 5): only on hover, after a short delay; hidden on mouse leave, click or key press -----------
+TOOLTIP_DELAY_MS = 400
+ui.tooltip.default_props(f"delay={TOOLTIP_DELAY_MS} hide-delay=0 transition-duration=100")
+# a click / key press hides every tooltip and keeps them hidden (also one whose delay runs out after the click, e.g.
+# under a context menu) until the mouse moves onto another element
+TOOLTIP_JS = """
+if (!window.ti64TipGuard) {
+  window.ti64TipGuard = true;
+  const st = document.createElement('style');
+  st.textContent = 'body.ti-tips-off .q-tooltip { display: none !important; }';
+  document.head.appendChild(st);
+  let pressed = null;
+  const off = (e) => { pressed = (e && e.target) || document.body; document.body.classList.add('ti-tips-off'); };
+  window.ti64HideTooltips = () => off(null);
+  document.addEventListener('pointerdown', off, true);
+  document.addEventListener('keydown', off, true);
+  window.addEventListener('blur', () => off(null));
+  document.addEventListener('mouseover', (e) => {
+    if (!pressed || pressed === document.body) { if (pressed) { pressed = e.target; } return; }
+    if (!pressed.contains(e.target) && !e.target.contains(pressed)) {
+      document.body.classList.remove('ti-tips-off'); pressed = null;
+    }
+  }, true);
+}
+"""
+
+
+async def hide_tooltips() -> None:
+    """Hide every tooltip shown now (before a window screenshot) and give the browser a frame to repaint."""
+    import asyncio  # noqa: PLC0415
+
+    try:                                            # not awaited: no answer needed (and none in the test client)
+        ui.run_javascript("window.ti64HideTooltips && window.ti64HideTooltips()")
+    except Exception:  # noqa: BLE001
+        pass
+    await asyncio.sleep(0.15)
+
+
 def right_tools() -> None:
     """Memory use (fix 3.1), Feedback (fix 3.2) and the Settings gear, right end of the top bar."""
+    ui.add_body_html(f"<script>{TOOLTIP_JS}</script>")
     mem_lab = ui.label("").classes("text-xs text-white/90 whitespace-nowrap px-2 py-1 rounded cursor-help") \
         .mark("mem_use")
     with mem_lab:
@@ -272,6 +315,7 @@ async def claude_report_dialog(description: str = "", category: str = "bug") -> 
     from .. import feedback as fb  # noqa: PLC0415
 
     bc.add("dialog", "Save report for Claude")
+    await hide_tooltips()
     shot = await run.io_bound(fb.window_screenshot)
     with ui.dialog() as dlg, ui.card().classes("w-[40rem] max-w-full gap-2").mark("report_dialog"):
         with ui.row().classes("w-full items-center"):
@@ -320,6 +364,7 @@ async def feedback_dialog() -> None:
     from .. import breadcrumbs as bc  # noqa: PLC0415
 
     bc.add("dialog", "Feedback")
+    await hide_tooltips()                              # fix 5: the hover tooltip of 'Feedback' was in every screenshot
     shot = await run.io_bound(fb.window_screenshot)
     s = load_settings()
     p = current_project()

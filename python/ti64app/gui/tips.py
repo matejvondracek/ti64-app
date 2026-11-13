@@ -26,7 +26,26 @@ TIPS: dict[str, str] = {
     "ipf_key": "IPF colour key: how orientations become colours. HKL = as in the Research Assignment, TSL = "
                "like OIM Analysis, HSV = MTEX default, Spot = only near chosen directions.",
     "ipf_dir": "Reference direction of the IPF colours: X, Y, Z of the map, the build direction from the "
-               "sample sheet, or a custom vector.",
+               "sample sheet, or a custom vector. In OIM terms (EDAX setting 2, checked against OIM on JU04_area4): "
+               "X (right) = -A2, Y (down) = -A1, Z (into the screen) = -A3; IPF colours of a direction and its "
+               "opposite are the same, so IPF-X = OIM IPF along A2, IPF-Y = along A1, IPF-Z = OIM [001] (A3).",
+    "clean_ci_threshold": "Indexed points with a confidence index below this become not indexed (raw maps: 0.1).",
+    "clean_spike_angle_deg": "A single indexed point (1-pixel grain at this angle) that differs from all its "
+                             "neighbours becomes not indexed.",
+    "clean_noise_angle_deg": "Grains for the noise test are built with this misorientation angle (EBSD_part2: 3°).",
+    "clean_noise_max_indexed_px": "Indexed grains with at most this many points are noise and are removed.",
+    "clean_fill": "The removed noise points take the orientation of the neighbouring grain with the most neighbours "
+                  "(off: they stay not indexed).",
+    "clean_max_void_px": "Connected not-indexed regions with at most this many points are filled from the "
+                         "neighbouring grains; larger voids stay not indexed (shown in the report).",
+    "clean_angle_deg": "Grain angle used to decide which neighbouring grain a filled point joins.",
+    "clean_tolerance_deg": "OIM 'grain tolerance angle': neighbours within this misorientation form a grain.",
+    "clean_min_grain_px": "OIM 'minimum grain size': points in smaller grains (and not-indexed points) are dilated "
+                          "into the neighbouring grain with the most neighbours.",
+    "clean_multi_row": "OIM 'grain must span multiple rows': grains within one scan row do not count as grains.",
+    "clean_single_iteration": "OIM 'single iteration': one dilation sweep only (off: repeat until nothing changes).",
+    "clean_hq_alpha": "Strength of the halfQuadraticFilter smoothing (larger = smoother).",
+    "clean_hq_threshold_deg": "No smoothing across misorientations above this (keeps grain boundaries sharp).",
     "clim": "Colour range of value maps (CI, IQ, KAM ...). Empty = automatic.",
     "opacity": "Transparency of the map (lets annotations and overlays stand out).",
     "line_width": "Width of the boundary overlay lines on screen (pixels).",

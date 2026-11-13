@@ -331,12 +331,14 @@ class MatlabBackend:
         names = list(info["phaseNames"])
         pmap = np.asarray(info["phaseMap"]).ravel().astype(int)
         phase_names = {int(p): str(n) for p, n in zip(pmap, names) if str(n) != "notIndexed"}
+        al = list(info["alignment"]) if "alignment" in info else []
+        alignment = {int(p): str(a) for p, a, n in zip(pmap, al, names) if str(n) != "notIndexed" and str(a)}
         props = {k[5:]: v for k, v in d.items() if k.startswith("prop_")}
         phase = d["phase"].astype(np.int16)
         phase[phase < 0] = 0
         return EBSDData(d["x"], d["y"], phase, d["quat"], props, phase_names,
                         "hex" if bool(info["isHex"]) else "square", float(info["stepUm"]),
-                        int(info["setting"]))
+                        int(info["setting"]), alignment)
 
     def cleanup(self, handle: EBSDHandle, p: CleanupParams) -> tuple[EBSDHandle, CleanupReport]:
         d = p.model_dump()
@@ -345,6 +347,23 @@ class MatlabBackend:
         new_id, rep = self.call("ti64.cleanup", handle.id, d, nargout=2)
         rep = {k: int(v) for k, v in dict(rep).items()}
         return EBSDHandle(self.name, str(new_id), rep["n_points"]), CleanupReport(**rep, params=p)
+
+    def clean_step(self, handle: EBSDHandle, operation: str, params: dict) -> tuple[EBSDHandle, dict]:
+        """ONE cleanup operation (matlab/+ti64/cleanStep.m, same as PymtexBackend.clean_step)."""
+        from .base import clean_params  # noqa: PLC0415
+
+        p = clean_params(operation, params).model_dump()
+        p = {k: (v if isinstance(v, bool) else float(v)) for k, v in p.items()}
+        new_id, rep = self.call("ti64.cleanStep", handle.id, operation, p, nargout=2)
+        out: dict = {}
+        for k, v in dict(rep).items():
+            if k == "operation":
+                out[k] = str(v)
+            elif k == "changed_per_iteration":
+                out[k] = [int(c) for c in np.asarray(v, float).ravel()]
+            else:
+                out[k] = int(v)
+        return EBSDHandle(self.name, str(new_id), out["n_points"]), out
 
     def _h5(self, fn: str, *args) -> dict:
         """Call a MATLAB exporter that writes an HDF5 file; return its datasets (1-D squeezed)."""

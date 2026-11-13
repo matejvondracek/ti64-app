@@ -20,13 +20,21 @@ from .phases import ALPHA, BETA
 from .service import OpContext, latest_step, op
 from .settings import IpfKeySetting
 
-MAP_SOURCES = ("ebsd.cleanup", "ebsd.load")
+MAP_SOURCES = ("ebsd.clean", "ebsd.cleanup", "ebsd.load")
 
 
 def resolve_source(ctx: OpContext, map_id: str, source: str | None, ops: tuple[str, ...] = MAP_SOURCES) -> str:
+    """The given step, else: for map sources (MAP_SOURCES) the CURRENT map of the map id (newest load / cleanup step
+    in recipe order, recipe.current_map_step; fix 5: cleanup operations form a chain), for other ops the newest
+    non-stale step of those ops."""
     if source:
         return source
-    s = latest_step(ctx.project, ops, map_id=map_id)
+    if set(ops) == set(MAP_SOURCES):
+        from .recipe import current_map_step  # noqa: PLC0415
+
+        s = current_map_step(ctx.project.recipe().steps, map_id)
+    else:
+        s = latest_step(ctx.project, ops, map_id=map_id)
     if s is None:
         raise KeyError(f"map {map_id!r} is not loaded yet: run ebsd.load first")
     return s.id
@@ -63,6 +71,67 @@ def _ebsd_cleanup(ctx: OpContext) -> None:
     ctx.metrics.update(n_filled=rep.n_filled, n_indexed_after=rep.n_indexed_after)
     ctx.output("ebsd", "npz", data)
     ctx.output("report", "json", rep.model_dump(mode="json"))
+
+
+# ---- cleanup as separate operations (fix 5) ---------------------------------------------------------------------
+class EbsdCleanParams(BaseModel):
+    map_id: str
+    operation: Literal["ci_threshold", "spike_removal", "noise_removal", "void_fill", "grain_dilation", "smoothing"]
+    params: dict[str, Any] = Field(default_factory=dict)      # the operation's parameters (base.CLEAN_OPS)
+    source: str | None = None                 # map step it works on (default: the current map = previous step)
+
+
+@op("ebsd.clean", EbsdCleanParams, uses_backend=True)
+def _ebsd_clean(ctx: OpContext) -> None:
+    """ONE cleanup operation on the current map of the map id (the output of the previous load / cleanup step), so
+    the user decides the order: ci_threshold, spike_removal, noise_removal (+ fill of the removed points), void_fill,
+    grain_dilation (OIM style), smoothing (halfQuadraticFilter). Report: removed / filled / unfilled points and why
+    (voids larger than the maximum void size stay not indexed); grain dilation: points changed per iteration."""
+    from .backends.base import clean_params  # noqa: PLC0415
+
+    p = EbsdCleanParams.model_validate(ctx.params)
+    cp = clean_params(p.operation, p.params)
+    src = resolve_source(ctx, p.map_id, p.source)
+    h = ctx.use(src)
+    progress.report(("repeating " if ctx.need_object else "") + p.operation.replace("_", " "), 0.5)
+    new, rep = ctx.backend.clean_step(h, p.operation, cp.model_dump())
+    ctx.remember(new)
+    data = ctx.backend.get_ebsd(new)
+    ctx.params.update(source=src, params=cp.model_dump(mode="json"))
+    rep["summary"] = clean_summary(rep, cp.model_dump())
+    ctx.metrics.update({k: float(v) for k, v in rep.items() if isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and k.startswith("n_")})
+    ctx.output("ebsd", "npz", data)
+    ctx.output("report", "json", rep)
+
+
+def clean_summary(rep: dict, prm: dict) -> str:
+    """One plain-language line of a cleanup step's report (cleanup panel, step summary, notification)."""
+    op = rep.get("operation")
+    ni = rep.get("n_not_indexed_after", 0)
+    tail = f"; {ni:,} points not indexed now"
+    if op in ("ci_threshold", "spike_removal"):
+        return f"{rep.get('n_removed', 0):,} points removed (now not indexed){tail}"
+    if op == "noise_removal":
+        s = f"{rep.get('n_removed', 0):,} points of noise grains removed"
+        if prm.get("fill"):
+            s += (f", {rep.get('n_filled', 0):,} filled from neighbours, {rep.get('n_unfilled', 0):,} unfilled "
+                  "(no indexed neighbour)")
+        return s + tail
+    if op == "void_fill":
+        return (f"{rep.get('n_filled', 0):,} points filled in voids ≤ {prm.get('max_void_px')} px; "
+                f"{rep.get('n_left_large_void_px', 0):,} points left not indexed in {rep.get('n_large_voids', 0):,} "
+                f"voids larger than the maximum void size ({prm.get('max_void_px')} px)"
+                + (f", {rep.get('n_unfilled', 0):,} without an indexed neighbour" if rep.get("n_unfilled") else "")
+                + tail)
+    if op == "grain_dilation":
+        it = rep.get("changed_per_iteration") or []
+        its = ", ".join(f"{c:,}" for c in it[:6]) + (" …" if len(it) > 6 else "")
+        return (f"{rep.get('n_changed', 0):,} of {rep.get('n_candidates', 0):,} points outside grains ≥ "
+                f"{prm.get('min_grain_px')} px dilated in {rep.get('n_iterations', 0)} iteration(s) ({its})" + tail)
+    if op == "smoothing":
+        return f"{rep.get('n_changed_gt_0_1deg', 0):,} orientations changed by > 0.1°{tail}"
+    return ""
 
 
 # ---- shared helpers ---------------------------------------------------------------------------

@@ -96,6 +96,17 @@ def _partial(model: type[BaseModel], name: str, doc: str) -> type[BaseModel]:
     return create_model(name, __doc__=doc, **fields)
 
 
+def _clean_options() -> type[BaseModel]:
+    """Parameters of the single cleanup operations (base.CLEAN_OPS; field names are unique across operations), all
+    optional: only those of the chosen operation are used, missing ones take their defaults."""
+    from .backends.base import CLEAN_OPS  # noqa: PLC0415
+
+    fields = {k: (f.annotation | None, None) for m in CLEAN_OPS.values() for k, f in m.model_fields.items()}
+    return create_model("CleanStepOptions", __doc__="Parameters of the cleanup operation (deg, px, CI 0-1); only the "
+                        "chosen operation's fields are used, the rest are ignored.", **fields)
+
+
+CleanStepOptions = _clean_options()
 CleanupOverrides = _partial(CleanupParams, "CleanupOverrides",
                             "Cleanup fields to change from the input-state preset (deg, px, CI 0-1).")
 GrainSizeOptions = _options(GrainSizeParams, "GrainSizeOptions", {"map_id"},
@@ -116,7 +127,7 @@ StitchOptions = _options(StitchParams, "StitchOptions",
 # every service operation and the tool that runs it (tests check that this covers service.OPS)
 TOOL_FOR_OP = {
     "sample.set": "set_sample_sheet", "ebsd.load": "load_map", "up2.header": "read_up2_header",
-    "bse.load": "load_bse", "ebsd.cleanup": "cleanup_map", "grains.calc": "calc_grains",
+    "bse.load": "load_bse", "ebsd.cleanup": "cleanup_map", "ebsd.clean": "clean_map_step", "grains.calc": "calc_grains",
     "map.compute": "compute_map", "figure": "make_figure", "compare.oim": "compare_with_oim",
     "recon.run": "reconstruct_beta", "recon.figure": "recon_figure", "recon.sweep": "recon_sweep",
     "grainsize.run": "grain_size", "grainsize.figure": "grain_size_figure",
@@ -271,8 +282,31 @@ def set_sample_sheet(
 
 @server.tool()
 def get_sample_sheet(project: str, map_id: str) -> dict[str, Any]:
-    """The stored sample sheet of a map."""
-    return _project(project).sample(map_id).model_dump(mode="json")
+    """The stored sample sheet of a map, plus map info: indexing method label ('Hough' = microscope default,
+    'Spherical' = re-indexed in OIM Analysis, null = no label) and the reference frame of its newest load (the
+    .ang's CartesianAlignment, the crystal frame the backend used, which OIM axis each app axis is)."""
+    import json as _json  # noqa: PLC0415
+
+    from .sample import indexing_label  # noqa: PLC0415
+
+    p = _project(project)
+    out = p.sample(map_id).model_dump(mode="json")
+    m = p.file(map_id)
+    out["indexing"] = indexing_label(m)
+    load = service.latest_step(p, ("ebsd.load",), map_id=map_id)
+    if load is not None and "frame" in load.outputs:
+        out["frame"] = _json.loads((p.root / load.outputs["frame"].path).read_text(encoding="utf-8"))
+    return out
+
+
+@server.tool()
+def set_indexing_label(project: str, map_id: str, indexing: Literal["hough", "spherical"] | None) -> dict[str, Any]:
+    """Label an EBSD map with how it was indexed: 'hough' (the microscope's default), 'spherical' (re-indexed with
+    spherical indexing in OIM Analysis) or null (no label). Metadata only: no result becomes stale."""
+    from .sample import indexing_label  # noqa: PLC0415
+
+    m = _project(project).update_file(map_id, indexing=indexing, indexing_asked=True)
+    return {"map_id": map_id, "indexing": indexing_label(m)}
 
 
 # ---- loaders --------------------------------------------------------------------------------
@@ -281,8 +315,8 @@ def load_map(project: str, map_id: str, backend: Backend | None = None) -> dict[
     """Load a map's .ang (EDAX setting 2) with the project backend or `backend`. The map must be linked in the
     project (set_sample_sheet with map_file + input_state); sample and build direction are not needed to load."""
     p = _project(project)
-    step = service.run(p, "ebsd.load", {"map_id": map_id}, backend=backend)
-    return {**_step_summary(step), "meta": _json_out(p, step, "meta")}
+    step = service.apply(p, "ebsd.load", {"map_id": map_id}, backend=backend)
+    return {**_step_summary(step), "meta": _json_out(p, step, "meta"), "frame": _json_out(p, step, "frame")}
 
 
 @server.tool()
@@ -340,9 +374,41 @@ def cleanup_map(project: str, map_id: str, overrides: CleanupOverrides | None = 
     overrides change single preset fields. source = load step (default newest). The loaded map is not changed."""
     p = _project(project)
     ov = _set(CleanupOverrides, overrides)
-    step = service.run(p, "ebsd.cleanup", _clean({"map_id": map_id, "overrides": ov, "source": source}),
+    step = service.apply(p, "ebsd.cleanup", _clean({"map_id": map_id, "overrides": ov, "source": source}),
                        backend=backend)
     return {**_step_summary(step), "report": _json_out(p, step, "report")}
+
+
+@server.tool()
+def clean_map_step(project: str, map_id: str,
+                   operation: Literal["ci_threshold", "spike_removal", "noise_removal", "void_fill", "grain_dilation",
+                                      "smoothing"],
+                   params: CleanStepOptions | None = None, source: str | None = None,  # type: ignore[valid-type]
+                   backend: Backend | None = None) -> dict[str, Any]:
+    """ONE cleanup operation as its own recipe step, on the current map (the output of the previous load / cleanup
+    step of the map, or `source`), so the order is free. Parameters (defaults):
+    ci_threshold {ci_threshold 0.1}; spike_removal {spike_angle_deg 5}; noise_removal {noise_angle_deg 3,
+    noise_max_indexed_px 2, fill true}; void_fill {max_void_px 4, angle_deg 3}; grain_dilation (OIM style)
+    {tolerance_deg 5, min_grain_px 2, multi_row false, single_iteration false}; smoothing {hq_alpha 0.5,
+    hq_threshold_deg 15}. Applying the same operation again right after itself replaces that step (tuning).
+    Report: removed / filled / unfilled points and why; grain dilation: points changed per iteration."""
+    from .backends.base import CLEAN_OPS  # noqa: PLC0415
+
+    p = _project(project)
+    given = _set(CleanStepOptions, params)
+    prm = {k: v for k, v in given.items() if k in CLEAN_OPS[operation].model_fields}
+    step = service.apply(p, "ebsd.clean", _clean({"map_id": map_id, "operation": operation, "params": prm,
+                                                   "source": source}), backend=backend)
+    return {**_step_summary(step), "report": _json_out(p, step, "report")}
+
+
+@server.tool()
+def add_default_cleanup(project: str, map_id: str, backend: Backend | None = None) -> dict[str, Any]:
+    """The cleanup preset of the map's input state as separate steps in the default order (raw: CI threshold 0.1,
+    noise-grain removal, void fill; OIM-cleaned: noise-grain removal, void fill). One undo entry."""
+    p = _project(project)
+    steps = service.add_default_cleanup(p, map_id, backend)
+    return {"steps": [{**_step_summary(s), "report": _json_out(p, s, "report")} for s in steps]}
 
 
 @server.tool()
@@ -353,7 +419,7 @@ def calc_grains(project: str, map_id: str, hagb_deg: float = 15.0, lagb_deg: flo
     (or `source`); boundary lengths (um) per class: LAGB, HAGB, alpha/beta interface, Burgers types 10.53 / 60 /
     60.83 / 63.26 / 90 deg within burgers_tol_deg. alpha = calcGrains smoothing (3.1), min_px per grain (1)."""
     p = _project(project)
-    step = service.run(p, "grains.calc", _clean({
+    step = service.apply(p, "grains.calc", _clean({
         "map_id": map_id, "source": source,
         "grains": {"hagb_deg": hagb_deg, "lagb_deg": lagb_deg, "min_px": min_px, "alpha": alpha},
         "boundaries": {"burgers_tol_deg": burgers_tol_deg}}), backend=backend)
@@ -367,7 +433,7 @@ def compute_map(project: str, map_id: str, kind: Literal["kam", "grod", "gos", "
     """Per-pixel KAM (kernel order 1-3, cutoff kam_threshold_deg 5), GROD, GOS (deg) or GND (1/m^2, alpha:
     basal/prismatic/pyramidal <a> + pyramidal <c+a>) inside the newest grains of the map (or `grains` step)."""
     p = _project(project)
-    step = service.run(p, "map.compute", _clean({"map_id": map_id, "kind": kind, "kam_order": kam_order,
+    step = service.apply(p, "map.compute", _clean({"map_id": map_id, "kind": kind, "kam_order": kam_order,
                                                  "kam_threshold_deg": kam_threshold_deg, "gnd_stencil": gnd_stencil,
                                                  "grains": grains}), backend=backend)
     return {**_step_summary(step), "stats": _json_out(p, step, "stats")}
@@ -388,7 +454,7 @@ def make_figure(project: str, map_id: str,
     (source, grains, values, recon) default to the newest. Fit/PRIAS report clearly when the file lacks them; PRIAS
     comes from the <map>_prias.txt exports next to the .ang (prias = first channel, prias_top / _center / _bottom)."""
     p = _project(project)
-    step = service.run(p, "figure", _clean({
+    step = service.apply(p, "figure", _clean({
         "map_id": map_id, "kind": kind, "overlays": overlays or [], "phases": phases, "direction": direction,
         "custom_vector": custom_vector, "key": key, "clim": clim, "source": source, "grains": grains,
         "values": values, "recon": recon}))
@@ -417,7 +483,7 @@ def reconstruct_beta(project: str, map_id: str, params: ReconParams | None = Non
     'progressive', mergeThreshold 3, inclusionMaxSize 5, histMinECD 5 um. Returns OR deviation / OR used, grains,
     reconstructed fraction, fit, ECD, merge sweep, variant / packet statistics, size along / across the BD."""
     p = _project(project)
-    step = service.run(p, "recon.run", _clean({"map_id": map_id, "source": source, "min_px": min_px,
+    step = service.apply(p, "recon.run", _clean({"map_id": map_id, "source": source, "min_px": min_px,
                                                "params": _set(ReconParams, params)}),
                        backend=backend)
     return {**_step_summary(step), "summary": _json_out(p, step, "summary")}
@@ -438,7 +504,7 @@ def recon_figure(project: str, map_id: str,
     alpha IPF with prior-beta boundaries, fit / variant / packet maps, boundary misorientation map, beta IPF key,
     histograms (neighbour misorientation, fit, ECD, variants per grain). Returns the PNG path."""
     p = _project(project)
-    step = service.run(p, "recon.figure", _clean({"map_id": map_id, "kind": kind, "recon": recon,
+    step = service.apply(p, "recon.figure", _clean({"map_id": map_id, "kind": kind, "recon": recon,
                                                   "direction": direction, "key": key, "clim": clim}),
                        backend=_backend_of(p, "recon.run", map_id, recon))
     return {**_step_summary(step), "png": _path(p, step, "figure"), "meta": _json_out(p, step, "meta")}
@@ -470,7 +536,7 @@ def grain_size(project: str, map_id: str, params: GrainSizeOptions | None = None
     colony ECD, prior-beta ECD, width / length vs build direction, retained-beta fraction, log-normal fits,
     warnings and the CSV/XLSX table paths."""
     p = _project(project)
-    step = service.run(p, "grainsize.run", {"map_id": map_id, **_set(GrainSizeOptions, params)},
+    step = service.apply(p, "grainsize.run", {"map_id": map_id, **_set(GrainSizeOptions, params)},
                        backend=backend)
     return {**_step_summary(step), "summary": _json_out(p, step, "summary"),
             "tables": {k: str(p.root / r.path) for k, r in step.outputs.items() if r.kind in ("csv", "xlsx")}}
@@ -486,7 +552,7 @@ def grain_size_figure(project: str, map_id: str,
     backend that computed it. bin_width_um = bin width (empty: automatic); min_um / max_um = range shown (the fit and
     the statistics stay those of all grains). Returns the PNG path."""
     p = _project(project)
-    step = service.run(p, "grainsize.figure", _clean({"map_id": map_id, "kind": kind, "grainsize": grainsize,
+    step = service.apply(p, "grainsize.figure", _clean({"map_id": map_id, "kind": kind, "grainsize": grainsize,
                                                       "bin_width_um": bin_width_um, "min_um": min_um,
                                                       "max_um": max_um}),
                        backend=_backend_of(p, "grainsize.run", map_id, grainsize))

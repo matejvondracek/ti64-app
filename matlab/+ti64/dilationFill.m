@@ -1,4 +1,4 @@
-function [src, sweeps] = dilationFill(toFill, grainId, sourceOk, nbr)
+function [src, sweeps, counts] = dilationFill(toFill, grainId, sourceOk, nbr, maxIter)
 % DILATIONFILL  Grain-dilation-like fill (same algorithm as
 %   python/ti64app/backends/hexgrid.py dilation_fill; keep both identical).
 %   Every pixel in toFill takes the orientation of one neighbour: among its neighbours that are
@@ -6,15 +6,19 @@ function [src, sweeps] = dilationFill(toFill, grainId, sourceOk, nbr)
 %   ties -> the grain of the first such neighbour in the fixed order (W, E, NW, NE, SW, SE).
 %   Sweeps: all pixels of one sweep are decided from the state before it; repeat until no change.
 %   src(i) = index of the pixel whose orientation i copies (i if not filled, 0 if it could not be).
+%   maxIter (default Inf): at most this many sweeps (grain dilation 'single iteration' = 1); counts(k) = pixels
+%   changed in sweep k (hexgrid.dilation_sweeps in Python).
 
+if nargin < 5, maxIter = Inf; end
 n = numel(toFill);
+counts = [];
 toFill = toFill(:); grainId = double(grainId(:)); ok = logical(sourceOk(:));
 src = (1:n)';
 todo = find(toFill & ~ok);
 src(todo) = 0;
 sweeps = 0;
 k = size(nbr, 2);
-while ~isempty(todo)
+while ~isempty(todo) && sweeps < maxIter
   nb = nbr(todo, :);
   has = nb > 0;
   nbok = false(size(has));
@@ -37,5 +41,6 @@ while ~isempty(todo)
   ok(t) = true;
   todo = todo(~anyok);
   sweeps = sweeps + 1;
+  counts(sweeps, 1) = numel(rows); %#ok<AGROW>
 end
 end
