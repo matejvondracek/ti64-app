@@ -13,6 +13,7 @@ Units GPa; porosity ignored.
 from __future__ import annotations
 
 import json
+import re
 from typing import Literal
 
 import numpy as np
@@ -40,7 +41,7 @@ class TextureInput(BaseModel):
 class TextureParams(TextureInput):
     halfwidth_deg: float = Field(5.0, gt=0.5, le=30)
     poles: list[str] | None = None                    # default: all poles of the phase
-    ipf_dirs: list[str] = Field(default_factory=lambda: ["BD", "beam axis", "width"])
+    ipf_dirs: list[str] | None = None                # None = the frame's defaults (map axes; BD / specimen axes)
     custom_vector: tuple[float, float, float] | None = None
     plot: Literal["density", "scatter", "both"] = "density"
     scatter_points: int = Field(5000, ge=100, le=200_000)
@@ -92,24 +93,6 @@ def _phase_name(phase: str) -> str:
     return ALPHA if phase == "alpha" else BETA
 
 
-def _ipf_vectors(s: tx.OrientationSet, names: list[str], custom) -> list[tuple[str, tuple]]:
-    out = []
-    for n in names:
-        if n == "custom":
-            if custom is None:
-                raise tx.TextureInputError("custom IPF direction: enter the vector")
-            out.append((f"custom {tuple(round(c, 3) for c in custom)}", tuple(custom)))
-        elif n in s.frame.directions:
-            out.append((n, s.frame.directions[n]))
-        else:
-            s.warnings.append(f"IPF direction '{n}' is not available in this frame "
-                              f"({', '.join(s.frame.directions)}): skipped")
-    if not out:
-        raise tx.TextureInputError("no inverse-pole-figure direction available (enter the build direction or the "
-                                   "map position on the Files tab, or a custom vector)")
-    return out
-
-
 @op("texture.run", TextureParams, uses_backend=True)
 def _texture_run(ctx: OpContext) -> None:
     """Texture of alpha or reconstructed prior-beta orientations (whole map, an ROI or all maps of a sample; per pixel
@@ -127,7 +110,7 @@ def _texture_run(ctx: OpContext) -> None:
     progress.report("building the ODF", 0.3)
     odfh, st = ctx.backend.odf_build(h, phase, s.quat, s.weights, p.halfwidth_deg)
     poles = tx.poles_for(p.phase, p.poles)
-    ipfs = _ipf_vectors(s, p.ipf_dirs, p.custom_vector)
+    ipfs = tx.pick_directions(s.frame, p.ipf_dirs, p.custom_vector, s.warnings)
     style = load_settings().figure
     rng = np.random.default_rng(0)
     sc = None
@@ -173,7 +156,7 @@ def _texture_run(ctx: OpContext) -> None:
     ctx.metrics.update(max_mrd=st["max_mrd"], texture_index=st["texture_index"],
                        n_grains=float(s.n_grains or 0))
     ctx.output("summary", "json", summary)
-    ctx.output("values", "npz", {k_.replace(" ", "_"): v for k_, v in vals.items()} | {"pf_dirs": dirs,
+    ctx.output("values", "npz", {re.sub(r"[^A-Za-z0-9_{}()-]+", "_", k_): v for k_, v in vals.items()} | {"pf_dirs": dirs,
                                                                                          "ipf_dirs": sec})
     ctx.output("orientations", "npz", {"quat": s.quat, "weights": s.weights,
                                        **({"grain_quat": s.grain_quat, "grain_weights": s.grain_weights}
@@ -224,7 +207,7 @@ class ElasticParams(TextureInput):
     preset_alpha: str | None = None                   # Settings preset name (None = default)
     preset_beta: str | None = None
     include_beta: bool = True                         # retained beta mixed in by its area fraction
-    directions: list[str] = Field(default_factory=lambda: ["BD", "beam axis", "width"])
+    directions: list[str] | None = None               # None = the frame's defaults
     custom_vector: tuple[float, float, float] | None = None
     bootstrap_runs: int = Field(200, ge=0, le=5000)
     seed: int = 0
@@ -272,16 +255,7 @@ def _elastic_run(ctx: OpContext) -> None:
             extra = (area[k] / tot, C, S)
     Cm, Sm = el.mix_phases(parts)
     av = el.averages(Cm, Sm)
-    dirs = []
-    for n in p.directions:
-        if n == "custom":
-            if p.custom_vector is None:
-                raise tx.TextureInputError("custom direction: enter the vector")
-            dirs.append((f"custom {tuple(round(c, 3) for c in p.custom_vector)}", tuple(p.custom_vector)))
-        elif n in sa.frame.directions:
-            dirs.append((n, sa.frame.directions[n]))
-        else:
-            notes.append(f"direction '{n}' not available ({', '.join(sa.frame.directions)}): skipped")
+    dirs = tx.pick_directions(sa.frame, p.directions, p.custom_vector, notes)
     D = np.array([v for _n, v in dirs], float).reshape(-1, 3)
     E = {m: el.youngs_modulus(av[m], D) if len(D) else np.zeros(0) for m in av}
     boot = None

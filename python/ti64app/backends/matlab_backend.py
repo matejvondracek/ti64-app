@@ -353,12 +353,15 @@ class MatlabBackend:
         from .base import clean_params  # noqa: PLC0415
 
         p = clean_params(operation, params).model_dump()
-        p = {k: (v if isinstance(v, bool) else float(v)) for k, v in p.items()}
+        p = {k: (v if isinstance(v, (bool, str)) else float(v)) for k, v in p.items()}
         new_id, rep = self.call("ti64.cleanStep", handle.id, operation, p, nargout=2)
         out: dict = {}
         for k, v in dict(rep).items():
-            if k == "operation":
+            if k in ("operation", "mode"):
                 out[k] = str(v)
+            elif k.startswith("ci_mean"):
+                f = float(np.asarray(v, float).ravel()[0])
+                out[k] = f if np.isfinite(f) else None
             elif k == "changed_per_iteration":
                 out[k] = [int(c) for c in np.asarray(v, float).ravel()]
             else:
@@ -559,6 +562,7 @@ class MatlabBackend:
         out["fit_quantiles"] = np.asarray(res["fit_quantiles"], float).ravel().tolist()
         for k in ("n_noise_px", "n_child_grains", "n_grains_min_ecd", "n_grains_all"):
             out[k] = int(out[k])
+        out["beta_added"] = bool(out.get("beta_added", False))
         return EBSDHandle(self.name, str(rid), handle.n_points), out
 
     def get_recon(self, handle: EBSDHandle) -> ReconData:

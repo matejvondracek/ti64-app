@@ -16,7 +16,7 @@ from ti64app.backends import get_backend
 from ti64app.backends.base import LoadParams
 
 REPO = Path(__file__).resolve().parents[2]
-ANG4 = REPO / "data" / "JU04" / "JU04_area4.ang"
+ANG4 = next((REPO / "data" / "JU04").rglob("JU04_area4.ang"), REPO / "data" / "JU04" / "EBSD" / "JU04_area4.ang")
 I_PROBE = 43 * 1501 + 43 * 1500 + 305           # rows alternate NCOLS_ODD 1501 / NCOLS_EVEN 1500
 EULER_FILE = (2.57265, 0.59602, 1.71747)
 
@@ -33,7 +33,7 @@ def _backend(name):
 @pytest.fixture(scope="module", params=["pymtex", pytest.param("matlab", marks=pytest.mark.matlab)])
 def area4(request):
     if not ANG4.is_file():
-        pytest.skip("data/JU04/JU04_area4.ang missing (git-ignored)")
+        pytest.skip("data/JU04/EBSD/JU04_area4.ang missing (git-ignored)")
     be = _backend(request.param)
     h = be.load_ebsd(LoadParams(file=ANG4, input_state="raw", setting=2, phase_names={1: "Ti (alpha)"}))
     d = be.get_ebsd(h)
@@ -153,3 +153,53 @@ def test_every_ang_draws(ang, backend, tmp_path):
     p = Project.create("all_ang", base=tmp_path, backend=backend)
     service.run(p, "sample.set", {"map_id": "M", "map_file": str(crop), "input_state": "raw"})
     _draw_all(p, "M")
+
+
+# ---- fix 6.7.1 item 1: every .ang in data/ runs the whole chain in both backends -------------------------------------
+def _beta_in_header(ang: Path) -> bool:
+    from ti64app.io.ang import read_header
+
+    return any(str(ph.get("Symmetry")).strip() == "43" for ph in read_header(ang).phases)
+
+
+@pytest.mark.parametrize("backend", ["pymtex", pytest.param("matlab", marks=pytest.mark.matlab)])
+@pytest.mark.parametrize("ang", ANGS, ids=[f.stem[:40] for f in ANGS])
+def test_every_ang_full_chain(ang, backend, tmp_path):
+    """Load, default cleanup, grains, prior-beta reconstruction, grain size, texture (alpha and prior beta) and elastic
+    properties on a 100-row head crop of every .ang: raw APEX exports with alpha only (JU04_area3/4, JU06_*) get the
+    parent phase added by the reconstruction; retained beta is 0 / 'not in file', never an error. No build direction
+    and no position are entered (item 2: texture and E fall back to the map axes)."""
+    import json
+
+    _backend(backend)
+    from ti64app import service
+    from ti64app.project import Project
+
+    crop = _head_crop(ang, tmp_path / f"{ang.stem[:30]}_head.ang", 100)
+    has_beta = _beta_in_header(ang)
+    p = Project.create("chain", base=tmp_path, backend=backend)
+    service.run(p, "sample.set", {"map_id": "M", "map_file": str(crop), "input_state": "raw"})
+    service.run(p, "ebsd.load", {"map_id": "M"})
+    service.add_default_cleanup(p, "M")
+    service.run(p, "figure", {"map_id": "M", "kind": "phase"})
+    service.run(p, "grains.calc", {"map_id": "M"})
+    rec = service.run(p, "recon.run", {"map_id": "M"})
+    summ = json.loads((p.root / rec.outputs["summary"].path).read_text(encoding="utf-8"))
+    assert summ["beta_added"] is (not has_beta)
+    assert summ["state_counts"]["reconstructed_alpha"] > 0
+    if not has_beta:
+        assert summ["state_counts"]["retained_beta"] == 0
+    service.run(p, "recon.figure", {"map_id": "M", "kind": "parent_ipf"})
+    gs = service.run(p, "grainsize.run", {"map_id": "M"})
+    gsum = json.loads((p.root / gs.outputs["summary"].path).read_text(encoding="utf-8"))
+    if not has_beta:
+        assert gsum["retained_beta"]["in_file"] is False
+    for phase in ("alpha", "beta"):
+        t = service.run(p, "texture.run", {"map_id": "M", "phase": phase, "halfwidth_deg": 10})
+        ts = json.loads((p.root / t.outputs["summary"].path).read_text(encoding="utf-8"))
+        assert ts["ipf_dirs"] == ["x", "y", "z"], ts["ipf_dirs"]
+    e = service.run(p, "elastic.run", {"map_id": "M", "bootstrap_runs": 5})
+    es = json.loads((p.root / e.outputs["summary"].path).read_text(encoding="utf-8"))
+    assert [r["direction"] for r in es["E_table"]] == ["x", "y", "z"]
+    if not has_beta:
+        assert "beta" not in es["phases"]

@@ -14,7 +14,7 @@ from nicegui import run as ng_run
 from nicegui import ui
 
 from ..project import Project
-from ..sample import (missing_fields, BuildDirection, FourPointBending, MapInfo, MapPosition, SampleInfo, effective,
+from ..sample import (AXIS_KEYS, AXIS_ROLE, MapAxes, missing_fields, BuildDirection, FourPointBending, MapInfo, MapPosition, SampleInfo, effective,
                       suggest_input_state, suggest_role, suggest_sample_id)
 from . import dialogs, indexing
 from .shell import check_interrupted, error, header
@@ -619,6 +619,7 @@ def map_sheet(p: Project, gs: GuiState, m: MapInfo, on_saved, open_tool, relocat
 
     if m.kind in ("ang", "image"):
         _map_fields(p, m, s, save, msg)
+        _role_fields(p, m, s, save)
     _inherited_fields(m, s, save, msg)
     notes = ui.textarea("Notes (this file)", value=m.notes).classes("w-full").props("autogrow outlined")
     notes.on("blur", lambda: save(notes=notes.value or ""))
@@ -646,20 +647,75 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
             ui.select(indexing.OPTIONS, value=m.indexing or "").props("dense options-dense").classes("w-64") \
                 .mark("ms_indexing").on_value_change(lambda e: save(indexing=e.value or None, indexing_asked=True))
         _prias_section(m)
-        # build direction in map coordinates (+ prefill from the sample's other maps)
-        bd = m.build_direction
-        ui.label("Build direction in map coordinates (x right, y down)").classes("text-sm mt-1").tooltip(tip("bd_map"))
+        # map axes (fix 6.7.1 item 9): exact (build direction + position) or approximate (axis labels + BD axis);
+        # only the fields of the chosen mode are shown (item 8)
+        _axes_fields(p, m, save, msg)
+    else:
+        ui.label("Image sheet").classes("font-semibold")
+        _position_fields(m, save, msg)
+
+
+def _axes_fields(p: Project, m: MapInfo, save, msg) -> None:
+    """Map axes of an .ang: mode exact (build direction angle / vector + position on the specimen, as before) or
+    approximate (names of the map's horizontal, vertical and normal axes + which one is the build direction). Both
+    prefilled from the sample's other maps on request ('Use'). Only the fields of the chosen mode are visible."""
+    ax0 = m.axes or MapAxes()
+    with ui.row().classes("items-center gap-2 mt-1"):
+        ui.label("Map axes").classes("text-sm").tooltip(tip("map_axes"))
+        mode = ui.toggle({"exact": "exact", "approximate": "approximate"}, value=ax0.mode) \
+            .props("no-caps dense rounded unelevated toggle-color=primary").tooltip(tip("map_axes")) \
+            .mark("ms_axes_mode")
+    sib = [x for x in p.files() if x.sample_id == m.sample_id and m.sample_id and x.id != m.id and x.kind == "ang"]
+
+    # -- approximate: three labels + the BD axis
+    approx = ui.column().classes("gap-1 w-full").mark("ms_axes_approx")
+    with approx:
+        ui.label("Name the map's axes (they name the directions in pole figures, IPFs, texture and elastic results, "
+                 "exports and MCP), and mark the build direction.").classes("text-xs ti-muted")
         with ui.row().classes("items-end gap-2"):
-            mode = ui.toggle({"angle": "angle", "vector": "vector"},
-                             value="vector" if bd and bd.vector is not None else "angle").props("no-caps dense")
+            lab = {k: ui.input(f"{AXIS_ROLE[k]}", value=ax0.label(k)).classes("w-40").props("dense")
+                   .tooltip(tip(f"axis_{k}")).mark(f"ms_axis_{k}") for k in AXIS_KEYS}
+            bax = ui.select({None: "not set", **{k: f"{k} ({ax0.label(k)})" for k in AXIS_KEYS}}, value=ax0.build_axis,
+                            label="build direction along").classes("w-44").tooltip(tip("axis_bd")).mark("ms_axis_bd")
+
+    def bd_options(_=None):
+        bax.options = {None: "not set", **{k: f"{k} ({(lab[k].value or k).strip()})" for k in AXIS_KEYS}}
+        bax.update()
+
+    def save_axes(_=None):
+        try:
+            na = MapAxes(mode=mode.value, x_label=lab["x"].value or "x", y_label=lab["y"].value or "y",
+                         z_label=lab["z"].value or "z", build_axis=bax.value)
+        except Exception as e:  # noqa: BLE001
+            msg.text = "Not saved: " + str(e).splitlines()[-1]
+            return False
+        bd_options()
+        return save(axes=None if na == MapAxes() else na)
+    for w in lab.values():
+        w.on("blur", save_axes)
+        w.on("keydown.enter", save_axes)
+    bax.on_value_change(save_axes)
+
+    # -- exact: build direction (angle OR vector) + position
+    exact = ui.column().classes("gap-1 w-full").mark("ms_axes_exact")
+    with exact:
+        bd = m.build_direction
+        ui.label("Build direction in map coordinates (x right, y down)").classes("text-sm").tooltip(tip("bd_map"))
+        with ui.row().classes("items-end gap-2"):
+            bmode = ui.toggle({"angle": "angle", "vector": "vector"},
+                              value="vector" if bd and bd.vector is not None else "angle").props("no-caps dense") \
+                .mark("ms_bd_mode")
             ang = _num("angle from +x toward +y [°]", bd.angle_deg if bd else None, "bd_map", step=90).classes("w-56") \
                 .mark("ms_bd_angle")
             vec = [_num(c, (bd.vector[i] if bd and bd.vector else None), "bd_map", step=1).classes("w-20")
-                   for i, c in enumerate("xyz")]
+                   .mark(f"ms_bd_{c}") for i, c in enumerate("xyz")]
+        ang.bind_visibility_from(bmode, "value", backward=lambda v: v == "angle")
+        for w in vec:
+            w.bind_visibility_from(bmode, "value", backward=lambda v: v == "vector")
 
         def save_bd(_=None):
             try:
-                if mode.value == "angle":
+                if bmode.value == "angle":
                     nb = BuildDirection(angle_deg=float(ang.value)) if ang.value is not None else None
                 else:
                     nb = (BuildDirection(vector=tuple(float(v.value or 0) for v in vec))
@@ -671,34 +727,66 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
         for w in (ang, *vec):
             w.on("blur", save_bd)
             w.on("keydown.enter", save_bd)
-        mode.on_value_change(save_bd)
-        if bd is None:
-            sib = [x for x in p.files() if x.sample_id == m.sample_id and x.id != m.id and x.build_direction]
-            if sib:
-                x = sib[0]
-                txt = (f"{x.build_direction.angle_deg:g}°" if x.build_direction.angle_deg is not None
-                       else str(x.build_direction.vector))
+        bmode.on_value_change(save_bd)
+        bsib = [x for x in sib if x.build_direction]
+        if bd is None and bsib:
+            x = bsib[0]
+            txt = (f"{x.build_direction.angle_deg:g}°" if x.build_direction.angle_deg is not None
+                   else str(x.build_direction.vector))
 
-                def use(x=x):
-                    if save(build_direction=x.build_direction):
-                        if x.build_direction.angle_deg is not None:
-                            mode.value, ang.value = "angle", x.build_direction.angle_deg
-                with ui.row().classes("items-center gap-2"):
-                    ui.label(f"Prefill from {x.id} of this sample: {txt}").classes("text-xs ti-muted")
-                    ui.button("Use", on_click=use).props("dense outline size=sm").mark("ms_bd_use")
-            else:
-                ui.label("Not needed to load the map; steps that use it (IPF along the build direction, prior-β length / "
-                         "width along BD) ask for it. Never guessed.").classes("text-xs text-amber-800")
-    else:
-        ui.label("Image sheet").classes("font-semibold")
-    # position + role
+            def use(x=x):
+                if save(build_direction=x.build_direction):
+                    if x.build_direction.angle_deg is not None:
+                        bmode.value, ang.value = "angle", x.build_direction.angle_deg
+                    else:
+                        bmode.value = "vector"
+                        for w, c in zip(vec, x.build_direction.vector):
+                            w.value = c
+            with ui.row().classes("items-center gap-2"):
+                ui.label(f"Prefill from {x.id} of this sample: {txt}").classes("text-xs ti-muted")
+                ui.button("Use", on_click=use).props("dense outline size=sm").mark("ms_bd_use")
+        elif bd is None:
+            ui.label("Not needed to load the map; steps that use it (IPF along the build direction, prior-β length / "
+                     "width along BD) ask for it. Never guessed.").classes("text-xs text-amber-800")
+    pos_axes = _position_fields(m, save, msg)
+
+    # prefill of the axes from the sample's other maps (like the build direction)
+    asib = [x for x in sib if x.axes is not None]
+    if m.axes is None and asib:
+        x = asib[0]
+
+        def use_axes(x=x):
+            if save(axes=x.axes):
+                mode.value = x.axes.mode
+                for k in AXIS_KEYS:
+                    lab[k].value = x.axes.label(k)
+                bax.value = x.axes.build_axis
+                bd_options()
+        with ui.row().classes("items-center gap-2"):
+            ui.label(f"Prefill map axes from {x.id} of this sample: {x.axes.mode}, {x.axes.text()}") \
+                .classes("text-xs ti-muted")
+            ui.button("Use", on_click=use_axes).props("dense outline size=sm").mark("ms_axes_use")
+
+    def show_mode(_=None):
+        approx.set_visibility(mode.value == "approximate")
+        exact.set_visibility(mode.value == "exact")
+        for w in pos_axes:                     # approximate: the labels name the axes, not the specimen position
+            w.set_visibility(mode.value == "exact")
+    mode.on_value_change(lambda e: (show_mode(), save_axes()))
+    show_mode()
+
+
+def _position_fields(m: MapInfo, save, msg) -> list:
+    """Position on the specimen: origin (mm; the 4PB role uses it, so it is shown in both map-axes modes) and which
+    specimen axes the map +x / +y point along (exact mode only). Returns the two axis selects (the caller hides them
+    in approximate mode)."""
     pos = m.position
     ui.label("Position on the specimen (sample frame, mm)").classes("text-sm mt-1").tooltip(tip("position"))
     with ui.row().classes("items-end gap-2"):
         pw = {k: _num(k.replace("origin_", "").replace("_mm", " [mm]"), getattr(pos, k) if pos else None,
                       "position", step=0.1).classes("w-28") for k in ("origin_X_mm", "origin_Y_mm", "origin_Z_mm")}
-        ax = ui.select(AXES, value=pos.map_x_axis if pos else "+X", label="map +x along").classes("w-32")
-        ay = ui.select(AXES, value=pos.map_y_axis if pos else "-Y", label="map +y along").classes("w-32")
+        ax = ui.select(AXES, value=pos.map_x_axis if pos else "+X", label="map +x along").classes("w-32")             .mark("ms_pos_x_axis").tooltip(tip("position"))
+        ay = ui.select(AXES, value=pos.map_y_axis if pos else "-Y", label="map +y along").classes("w-32")             .mark("ms_pos_y_axis").tooltip(tip("position"))
 
     def save_pos(_=None):
         vals = {k: w.value for k, w in pw.items()}
@@ -714,6 +802,11 @@ def _map_fields(p: Project, m: MapInfo, s: SampleInfo | None, save, msg) -> None
         w.on("blur", save_pos)
     ax.on_value_change(save_pos)
     ay.on_value_change(save_pos)
+    return [ax, ay]
+
+
+def _role_fields(p: Project, m: MapInfo, s: SampleInfo | None, save) -> None:
+    """Stage position from the JEOL .txt and the map's role (from the position + tension side)."""
     stage = _stage(m)
     if stage:
         ui.label("Stage position from the JEOL .txt: " + ", ".join(f"{k} {v:g} mm" for k, v in stage.items())

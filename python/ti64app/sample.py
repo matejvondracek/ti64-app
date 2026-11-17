@@ -95,6 +95,62 @@ class MapPosition(BaseModel):
         return self
 
 
+AxisKey = Literal["x", "y", "z"]
+AXIS_KEYS: tuple[str, str, str] = ("x", "y", "z")
+AXIS_ROLE = {"x": "horizontal (x)", "y": "vertical (y)", "z": "normal (z, beam)"}
+AXIS_VECTORS = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+
+
+class MapAxes(BaseModel):
+    """How the map's axes are named (fix 6.7.1 item 9), per map, prefilled from the sample's other maps.
+
+    exact        (default) the build direction (angle / vector) and the position on the specimen define the specimen
+                 frame; derived directions keep their names (BD, beam axis, thickness, width). Without a position the
+                 map axes are used, named by the labels below (default x, y, z).
+    approximate  the user names the map's horizontal (x), vertical (y) and normal (z, electron beam) axes, e.g. L / S /
+                 T or BD / TD / ND, and marks one of them as the build direction. No rotation: the frame is the map
+                 frame, only the names change. The labels appear wherever directions are named (pole-figure and IPF
+                 axes, IPF direction choices, texture and elastic results, exports, MCP)."""
+    mode: Literal["exact", "approximate"] = "exact"
+    x_label: str = "x"
+    y_label: str = "y"
+    z_label: str = "z"
+    build_axis: AxisKey | None = None        # approximate: which labelled axis is the build direction
+
+    @field_validator("x_label", "y_label", "z_label")
+    @classmethod
+    def _label(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) > 24:
+            raise ValueError("axis labels: 1-24 characters")
+        return v
+
+    @model_validator(mode="after")
+    def _distinct(self):
+        if len({self.x_label.lower(), self.y_label.lower(), self.z_label.lower()}) < 3:
+            raise ValueError("the three axis labels must differ")
+        return self
+
+    def label(self, k: str) -> str:
+        return {"x": self.x_label, "y": self.y_label, "z": self.z_label}[k]
+
+    @property
+    def labels(self) -> dict[str, str]:
+        return {k: self.label(k) for k in AXIS_KEYS}
+
+    @property
+    def build_direction(self) -> "BuildDirection | None":
+        """Approximate mode: the marked axis as a map-frame build direction (sign irrelevant: directions are axial)."""
+        if self.mode != "approximate" or self.build_axis is None:
+            return None
+        return BuildDirection(vector=AXIS_VECTORS[self.build_axis])
+
+    def text(self) -> str:
+        """'x = L, y = S (BD), z = T' for the map info."""
+        return ", ".join((k if self.label(k) == k else f"{k} = {self.label(k)}")
+                         + (" (BD)" if self.mode == "approximate" and self.build_axis == k else "") for k in AXIS_KEYS)
+
+
 class SheetIncomplete(ValueError):
     """A step needs a value of the map sheet that the user has not entered (e.g. the build direction). Loading and
     most steps work without it; only the steps that need it raise this, naming what is missing and where to enter it.
@@ -117,6 +173,7 @@ class SampleSheet(BaseModel):
     build_direction: BuildDirection | None = None
     bending: FourPointBending | None = None
     position: MapPosition | None = None
+    axes: MapAxes | None = None              # map axis names / exact vs approximate (fix 6.7.1); None = exact, x y z
     material: str = "Ti-6Al-4V"
     process: str = "EBM"
     notes: str = ""
@@ -177,6 +234,7 @@ class MapInfo(BaseModel):
     input_state: InputState | None = None
     build_direction: BuildDirection | None = None
     position: MapPosition | None = None
+    axes: MapAxes | None = None               # map axes: exact (BD + position) or approximate (labels + BD axis)
     role: Role | None = None
     phase_map: dict[str, PhaseRole] | None = None   # {file phase id: role}; None = by crystal symmetry
     notes: str = ""
@@ -272,9 +330,11 @@ def effective_sheet(m: MapInfo, s: SampleInfo | None) -> SampleSheet:
     """The SampleSheet the EBSD ops use: map values + inherited sample values. Loads with whatever is known: the
     input state falls back to the suggestion from the file name (CLAUDE.md: auto-suggested, the user can change it);
     sample and build direction stay None until entered (never guessed), see require_build_direction()."""
+    ax = m.axes
+    bd = ax.build_direction if ax is not None and ax.mode == "approximate" else m.build_direction
     return SampleSheet(map_id=m.id, specimen_id=s.id if s else None, map_file=m.file,
-                       input_state=m.input_state or suggest_input_state(m.file),
-                       build_direction=m.build_direction, bending=effective(m, s, "bending")[0], position=m.position,
+                       input_state=m.input_state or suggest_input_state(m.file), axes=ax,
+                       build_direction=bd, bending=effective(m, s, "bending")[0], position=m.position,
                        material=effective(m, s, "material")[0] or "", process=effective(m, s, "process")[0] or "",
                        notes=m.notes, phase_map=m.phase_map)
 
@@ -286,8 +346,9 @@ def require_build_direction(sheet: SampleSheet, needed_for: str) -> BuildDirecti
     return sheet.build_direction
 
 
-SHEET_RESULT_KEYS = ("map_file", "input_state", "phase_map", "build_direction", "bending", "position")
+SHEET_RESULT_KEYS = ("map_file", "input_state", "phase_map", "build_direction", "bending", "position", "axes")
 BD_OPS = ("grainsize.run", "grainsize.figure", "grainsize.compare_oim")   # use the build direction (length / width)
+FRAME_OPS = ("texture.run", "texture.export_odf", "elastic.run")     # use the frame: BD, position, axis labels
 
 
 def stale_on_sheet_change(map_id: str, old: dict | None, new: dict):
@@ -300,8 +361,11 @@ def stale_on_sheet_change(map_id: str, old: dict | None, new: dict):
     changed = {k for k in SHEET_RESULT_KEYS if (old or {}).get(k) != (new or {}).get(k)}
     if old is None or changed & {"map_file", "input_state", "phase_map"}:
         return lambda s: s.params.get("map_id") == map_id
-    if "build_direction" in changed:
-        return lambda s: s.params.get("map_id") == map_id and (s.op in BD_OPS or '"build"' in json.dumps(s.params))
+    bd = "build_direction" in changed
+    frame = bool(changed & {"build_direction", "position", "axes"})
+    if bd or frame:
+        return lambda s: s.params.get("map_id") == map_id and (
+            (bd and (s.op in BD_OPS or '"build"' in json.dumps(s.params))) or (frame and s.op in FRAME_OPS))
     return lambda s: False
 
 
@@ -312,7 +376,7 @@ def missing_fields(m: MapInfo) -> list[str]:
         out.append("sample")
     if m.input_state is None:
         out.append("input state (suggested from the file name until set)")
-    if m.build_direction is None:
+    if m.build_direction is None and (m.axes is None or m.axes.build_direction is None):
         out.append("build direction")
     return out
 
@@ -326,7 +390,7 @@ def split_sheet(sheet: SampleSheet, sample: SampleInfo | None) -> tuple[SampleIn
         sample = SampleInfo(id=sheet.specimen_id, material=sheet.material, process=sheet.process,
                             bending=sheet.bending)
     m = {"input_state": sheet.input_state, "build_direction": sheet.build_direction, "position": sheet.position,
-         "notes": sheet.notes, "phase_map": sheet.phase_map}
+         "notes": sheet.notes, "phase_map": sheet.phase_map, "axes": sheet.axes}
     for k in ("material", "process", "bending"):
         if getattr(sheet, k) != getattr(sample, k):
             m[k] = getattr(sheet, k)

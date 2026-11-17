@@ -76,7 +76,8 @@ def _ebsd_cleanup(ctx: OpContext) -> None:
 # ---- cleanup as separate operations (fix 5) ---------------------------------------------------------------------
 class EbsdCleanParams(BaseModel):
     map_id: str
-    operation: Literal["ci_threshold", "spike_removal", "noise_removal", "void_fill", "grain_dilation", "smoothing"]
+    operation: Literal["ci_threshold", "spike_removal", "noise_removal", "void_fill", "grain_dilation", "grain_ci",
+                       "smoothing"]
     params: dict[str, Any] = Field(default_factory=dict)      # the operation's parameters (base.CLEAN_OPS)
     source: str | None = None                 # map step it works on (default: the current map = previous step)
 
@@ -124,6 +125,11 @@ def clean_summary(rep: dict, prm: dict) -> str:
                 f"voids larger than the maximum void size ({prm.get('max_void_px')} px)"
                 + (f", {rep.get('n_unfilled', 0):,} without an indexed neighbour" if rep.get("n_unfilled") else "")
                 + tail)
+    if op == "grain_ci":
+        what = "average" if prm.get("mode", "mean") == "mean" else "maximum"
+        return (f"{rep.get('n_changed', 0):,} points changed CI (set to their grain's {what} CI; "
+                f"{rep.get('n_in_grains', 0):,} points in {rep.get('n_grains', 0):,} grains ≥ "
+                f"{prm.get('min_grain_px')} px at {prm.get('tolerance_deg')}°); orientations unchanged")
     if op == "grain_dilation":
         it = rep.get("changed_per_iteration") or []
         its = ", ".join(f"{c:,}" for c in it[:6]) + (" …" if len(it) > 6 else "")
@@ -318,6 +324,17 @@ class FigureParams(BaseModel):
     prias_column: int = 0                     # PRIAS columns in the .ang rows (0 bottom, 1 centre, 2 top), if any
 
 
+def direction_label(sheet, direction: str) -> str:
+    """Name of an IPF reference direction for titles / legends: the map axes by the map sheet's labels (fix 6.7.1
+    item 9: 'z = T'), 'BD', 'custom'."""
+    if direction in ("X", "Y", "Z"):
+        k = direction.lower()
+        ax = getattr(sheet, "axes", None)
+        lab = ax.label(k) if ax is not None else k
+        return k if lab == k else f"{k} = {lab}"
+    return {"build": "BD", "custom": "custom"}.get(direction, direction)
+
+
 def _ipf_vector(sheet, direction: str, custom) -> tuple[float, float, float]:
     if direction == "X":
         return (1.0, 0.0, 0.0)
@@ -468,7 +485,8 @@ def figure_spec(ctx: OpContext, p: FigureParams):
             s = (p.ipf_keys or {}).get(ph) or style.ipf.get(ph) or IpfKeySetting()
             key = p.key or s.key
             vec = _ipf_vector(sheet, p.direction or s.direction, p.custom_vector or s.custom_vector)
-            keys[ph] = {"key": key, "direction": p.direction or s.direction, "vector": list(vec)}
+            keys[ph] = {"key": key, "direction": p.direction or s.direction, "vector": list(vec),
+                        "direction_label": direction_label(sheet, p.direction or s.direction)}
             if by_quat:
                 k = next(n for n, v in names.items() if v == ph)
                 m = phase == k
@@ -480,7 +498,7 @@ def figure_spec(ctx: OpContext, p: FigureParams):
             rgb[m] = c[m]
         meta["keys"] = keys
         spec.rgb = rgb
-        spec.title = "IPF " + ", ".join(f"{k}: {v['key']} ∥ {v['direction']}" for k, v in keys.items())
+        spec.title = "IPF " + ", ".join(f"{k}: {v['key']} ∥ {v['direction_label']}" for k, v in keys.items())
     elif p.kind == "phase":
         rgb = np.full((phase.size, 3), np.nan)
         for k, n in names.items():

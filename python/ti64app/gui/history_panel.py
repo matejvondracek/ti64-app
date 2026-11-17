@@ -169,7 +169,7 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
                 ui.button("Rerun", icon="replay", on_click=stable(rerun_it)).props("dense outline")
         steps = tab_steps(p, mid, tab)
         live = [s for s in steps if not s.stale]
-        ui.label(("Prior-β map" if tab == "beta" else "α map") + f" {mid or ''}: {len(live)} step{'' if len(live) == 1 else 's'}"
+        ui.label(("Prior-β map" if tab == "beta" else "Map") + f" {mid or ''}: {len(live)} step{'' if len(live) == 1 else 's'}"
                  + (f" (+ {len(steps) - len(live)} stale)" if len(steps) > len(live) else "")
                  + ". Drag a step onto another to change the order; right-click a step to delete it.").classes("text-xs ti-muted").mark("history_info")
         with ui.row().classes("w-full items-center gap-1 no-wrap"):
@@ -342,7 +342,7 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
 
     def confirm_delete(stale_only: bool):
         mid, tab = current_map(), current_tab()
-        tab_name = ("prior-β map" if tab == "beta" else "α map") + f" of {mid}"
+        tab_name = ("prior-β map" if tab == "beta" else "map") + f" of {mid}"
         shown = [s for s in tab_steps(p, mid, tab) if s.stale or not stale_only]
         if stale_only:
             shown = [s for s in shown if s.stale]
@@ -398,6 +398,7 @@ def history_section(p: Project, run_step, current_map=None, current_tab=None, on
             if hasattr(r, "__await__"):
                 await r
 
+    @stable          # the History row (and its menu) is rebuilt by the refresh after deleting
     async def delete_one(sid: str):
         """Right-click > Delete: no dependents -> deleted at once (undoable); else ask: delete them too / keep them
         marked stale."""

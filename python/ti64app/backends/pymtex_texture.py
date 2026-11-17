@@ -75,7 +75,9 @@ class PymtexTexture:
     """Mixin of PymtexBackend (uses self._store, self._map_or_grains_ebsd)."""
 
     def _cs(self, handle, phase: str):
-        return self._map_or_grains_ebsd(handle)[phase].CS
+        from .pymtex_recon import phase_cs  # noqa: PLC0415
+
+        return phase_cs(self._map_or_grains_ebsd(handle), phase)
 
     def _odf(self, odfh: OdfHandle):
         st = self._store.get(odfh.id)

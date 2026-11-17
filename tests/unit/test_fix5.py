@@ -172,7 +172,7 @@ def test_numba_dilation_equals_numpy_fill():
 def test_grain_dilation_step(loaded):
     p, load = loaded
     _clean(p, "ci_threshold", ci_threshold=0.3)
-    d = _clean(p, "grain_dilation")
+    d = _clean(p, "grain_dilation", single_iteration=False)
     rep = json.loads((p.root / d.outputs["report"].path).read_text(encoding="utf-8"))
     assert rep["n_changed"] == sum(rep["changed_per_iteration"]) and rep["n_iterations"] >= 1
     assert rep["n_changed"] + rep["n_unchanged"] == rep["n_candidates"]

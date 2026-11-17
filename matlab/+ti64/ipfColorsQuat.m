@@ -3,7 +3,7 @@ function ipfColorsQuat(id, phase, keyName, vec, h5in, h5file)
 %   grain mean orientations). h5in: /quat (n x 4, a b c d, NaN rows allowed). Output /rgb (n x 3).
 S = ti64.store('get', id);
 if isstruct(S), ebsd = S.ebsd; else, ebsd = S; end
-cs = ebsd(phase).CS;
+cs = ti64.phaseCS(ebsd, phase);
 Q = h5read(h5in, '/quat')';
 rgb = nan(size(Q, 1), 3);
 ok = all(isfinite(Q), 2);

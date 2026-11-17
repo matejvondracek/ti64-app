@@ -18,6 +18,15 @@ function [rid, res] = reconstruct(id, par)
 tAll = tic;
 ebsdRaw = ti64.store('get', id);
 deg = degree;
+% Raw APEX exports of alpha-only scans have no cubic phase (JU04_area3/4, JU06_*.ang): add the parent phase
+% (m-3m, a from Settings = par.betaLattice, EBSD_part2.m: 3.32 A) to the phase list BEFORE the reconstructor
+% is built (fix 6.7.1 item 1). Phases are named by symmetry at load time, so 'Ti (beta)' <=> cubic phase.
+if isfield(par, 'betaLattice'), aBeta = double(par.betaLattice); else, aBeta = 3.32; end
+res.beta_added = ~any(strcmpi(ebsdRaw.mineralList, 'Ti (beta)'));
+if res.beta_added            % MTEX 7.2 phaseList: CSList is a phaseItem array, phaseMap the file's phase numbers
+  ebsdRaw.CSList(end + 1) = crystalSymmetry('m-3m', [aBeta aBeta aBeta], 'mineral', 'Ti (beta)');
+  ebsdRaw.phaseMap(end + 1) = max(ebsdRaw.phaseMap) + 1;
+end
 
 % --- noise cleanup (on ALL pixels so grains don't grow into voids) ---
 [grains1, e1] = calcGrains(ebsdRaw, 'angle', par.cleanAngle * deg, 'alpha', 0);
@@ -35,11 +44,7 @@ res.n_child_grains = numel(grains);
 % --- job and OR ---
 alpha = ebsd('Ti (alpha)');
 job = parentGrainReconstructor(ebsd, grains);
-try
-  job.csParent = ebsdRaw('Ti (beta)').CS;    % phase list of the file (beta may be all noise)
-catch
-  job.csParent = crystalSymmetry('m-3m', [3.32 3.32 3.32], 'mineral', 'Ti (beta)');
-end
+job.csParent = ebsdRaw.CSList(ebsdRaw.name2id('Ti (beta)'));   % of the file, or added above
 job.csChild = alpha.CS;
 p2cB = orientation.Burgers(job.csParent, job.csChild);
 job.p2c = p2cB;
@@ -187,3 +192,4 @@ P.prop.ti64_parent_grain = reshape(pgId, size(P));
 P.prop.ti64_recon_fit = reshape(fit, size(P));
 P.prop.ti64_recon_state = reshape(st, size(P));
 end
+

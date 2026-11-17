@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from .backends.base import ChartSpec, RECON_TRANSFORMED, ReconData, ReconParams, RenderSpec
 from .modules.recon_analysis import grain_mean_parent, grain_shape, ti_variants, variant_stats
-from .ops_ebsd import _ipf_vector, resolve_source, step_npz
+from .ops_ebsd import _ipf_vector, direction_label, resolve_source, step_npz
 from .service import OpContext, op
 from .settings import IpfKeySetting
 
@@ -53,7 +53,17 @@ class ReconRunParams(BaseModel):
 
 SUMMARY_KEYS = ("or_dev_deg", "or_used", "n_noise_px", "n_child_grains", "n_grains_min_ecd", "n_grains_all",
                 "rec_frac", "mean_fit_deg", "bad_fit_frac", "ecd_aw_um", "bridged_pct", "split_pct",
-                "fit_quantiles", "mis_share", "sweep")
+                "fit_quantiles", "mis_share", "sweep", "beta_added")
+
+
+def _beta_lattice(ctx: OpContext, base_key: str = "params") -> None:
+    """Fill ReconParams.betaLattice from Settings (Settings > Phases) when the request does not give it, and record
+    it in the step, so replay uses the same lattice (fix 6.7.1 item 1)."""
+    from .settings import load_settings  # noqa: PLC0415
+
+    rp = ctx.params.setdefault(base_key, {"sweep": []} if base_key == "base" else {})
+    if isinstance(rp, dict) and "betaLattice" not in rp:
+        rp["betaLattice"] = float(load_settings().phases.beta_lattice_a)
 
 
 @op("recon.run", ReconRunParams, uses_backend=True)
@@ -62,6 +72,7 @@ def _recon_run(ctx: OpContext) -> None:
     with refinement and the visible 1° rule, variant graph, vote, merge, inclusions, merge sweep).
     Outputs: parent map, parent grains + boundaries, Ti variant / packet IDs (12 ideal Burgers variants),
     variant-selection statistics, prior-beta grain size and caliper along / across the build direction."""
+    _beta_lattice(ctx)
     p = ReconRunParams.model_validate(ctx.params)
     sheet = ctx.project.sample(p.map_id)
     src = resolve_source(ctx, p.map_id, p.source, RECON_SOURCES)
@@ -192,7 +203,8 @@ def recon_figure(ctx: OpContext, p: ReconFigureParams, rstep_id: str, out_png) -
         rgb[ok] = gcol[lut[pg[ok]]]
         hagb = inner & (np.nan_to_num(b["mis_deg"], nan=0) > rp.hagbAngle)
         spec.rgb, spec.seg, spec.seg_rgb = rgb, _segs(b, hagb), np.zeros((int(hagb.sum()), 3))
-        spec.title = f"prior β grains, mean orientation, {key} ∥ {d}; boundaries > {rp.hagbAngle:g}°"
+        spec.title = (f"prior β grains, mean orientation, {key} ∥ {direction_label(sheet, d)}; boundaries > "
+                      f"{rp.hagbAngle:g}°")
         meta.update(key=key, direction=d, vector=list(vec))
     elif p.kind == "alpha_parent_gb":
         key, d, vec = _ipf_choice(p, sheet, style, ALPHA)
@@ -200,7 +212,7 @@ def recon_figure(ctx: OpContext, p: ReconFigureParams, rstep_id: str, out_png) -
         rgb = ctx.backend.ipf_colors(ctx.use(src), ALPHA, key, vec)
         ctx.backend.render(ctx.use(src), RenderSpec(
             rgb=rgb, seg=_segs(b, inner), seg_rgb=np.zeros((int(inner.sum()), 3)), seg_width=lw,
-            title=f"α {key} ∥ {d} with prior β boundaries", width_cm=width, dpi=dpi, scale_bar=style.scale_bar),
+            title=f"α {key} ∥ {direction_label(sheet, d)} with prior β boundaries", width_cm=width, dpi=dpi, scale_bar=style.scale_bar),
             out_png)
         meta.update(key=key, direction=d, vector=list(vec))
         return meta
@@ -306,6 +318,7 @@ def _recon_sweep(ctx: OpContext) -> None:
     steps, split noise, OR used, and a parent-grain IPF thumbnail (drawn by the active backend)."""
     from .settings import load_settings  # noqa: PLC0415
 
+    _beta_lattice(ctx, "base")
     p = ReconSweepParams.model_validate(ctx.params)
     unknown = set(p.grid) - set(ReconParams.model_fields)
     if unknown:

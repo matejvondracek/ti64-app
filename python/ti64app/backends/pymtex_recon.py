@@ -46,16 +46,42 @@ def _metrics(job, par, mergeIdPre, gidPairs, misPre, segLen):
             100 * float(segLen[noise & ~inside].sum() / max(segLen[noise].sum(), 1e-12))]
 
 
-def _phase_cs(ebsd, mineral: str):
-    """Crystal symmetry of a phase from the map's phase list (declared in the .ang header even if no pixel
-    is indexed, or all were removed as noise); beta fallback as EBSD_part2.m: m-3m, a = 3.32 A."""
+def with_parent_phase(ebsd, a_angstrom: float = 3.32):
+    """The map with the parent phase in its phase list. Raw APEX exports of alpha-only scans have no cubic phase
+    (JU04_area3/4, all JU06_*.ang); the reconstruction adds 'Ti (beta)' (m-3m, a from Settings, EBSD_part2.m
+    uses 3.32 A) BEFORE the reconstructor is built, so the parent map, its legend and later steps find it. Phases
+    are named by symmetry at load time (phases.py), so 'Ti (beta)' present <=> a cubic phase is present.
+    Returns the same object when nothing is missing, else a copy."""
+    from mtex import crystalFrame  # noqa: PLC0415
+    from mtex.maps.reconstruction import _withFrames  # noqa: PLC0415
+
+    if any(m.lower() == "ti (beta)" for m in ebsd.CSList.mineralList):
+        return ebsd
+    out = ebsd.copy()
+    out.CSList = _withFrames(ebsd.CSList, [crystalFrame("m-3m", [a_angstrom] * 3, mineral="Ti (beta)")])
+    return out
+
+
+def phase_cs(ebsd, mineral: str):
+    """Crystal symmetry of a phase by name from the phase LIST, not from its pixels (there may be none: a crop
+    without beta, an alpha-only export). Beta missing from the list: m-3m, a = 3.32 A (only the symmetry matters
+    for colours, ODFs and tensors). Same as matlab/+ti64/phaseCS.m."""
     from mtex import crystalFrame  # noqa: PLC0415
 
     try:
         return ebsd.CSList[ebsd.CSList.phaseId(mineral)]
+    except ValueError:
+        if "beta" in mineral.lower():
+            return crystalFrame("m-3m", [3.32] * 3, mineral=mineral)
+        raise ValueError(f"phase {mineral!r} is not in the map") from None
+
+
+def _phase_cs(ebsd, mineral: str):
+    """Crystal symmetry of a phase from the map's phase list (declared in the .ang header even if no pixel
+    is indexed, or all were removed as noise, or added by with_parent_phase)."""
+    try:
+        return ebsd.CSList[ebsd.CSList.phaseId(mineral)]
     except Exception:  # noqa: BLE001
-        if "beta" in mineral:
-            return crystalFrame("m-3m", [3.32, 3.32, 3.32], mineral=mineral)
         raise ValueError(f"phase {mineral!r} is not in the map") from None
 
 
@@ -65,6 +91,9 @@ def reconstruct(ebsdRaw, par) -> tuple[dict, dict]:
 
     t_all = time.time()
     res: dict = {}
+    added = not any(m.lower() == "ti (beta)" for m in ebsdRaw.CSList.mineralList)
+    ebsdRaw = with_parent_phase(ebsdRaw, getattr(par, "betaLattice", 3.32))
+    res["beta_added"] = bool(added)          # the file had no beta phase; the parent phase was added (Settings)
     # noise cleanup on ALL pixels, alpha = 0 (as the MATLAB port)
     e1 = ebsdRaw.copy()
     g1 = calcGrains(e1, angle=par.cleanAngle * degree, alpha=0)

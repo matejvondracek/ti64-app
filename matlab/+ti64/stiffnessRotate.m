@@ -6,7 +6,7 @@ function stiffnessRotate(id, phase, C66, h5in, doMean, h5out)
 %   the full 3x3x3x3 tensors); else /C, /S (n x 81) per orientation. Python converts to Voigt notation.
 S0 = ti64.store('get', id);
 if isstruct(S0), ebsd = S0.ebsd; else, ebsd = S0; end
-cs = ebsd(phase).CS;
+cs = ti64.phaseCS(ebsd, phase);
 C = stiffnessTensor(C66, cs);
 Sc = inv(C);
 Q = h5read(h5in, '/quat')';

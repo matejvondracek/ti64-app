@@ -12,9 +12,10 @@ from ti64app.backends import get_backend
 from ti64app.backends.base import LoadParams
 
 pytestmark = [pytest.mark.matlab, pytest.mark.slow]
-ANG = Path(__file__).resolve().parents[2] / "data" / "JU04" / "JU04_area1.ang"
+ANG = next((Path(__file__).resolve().parents[2] / "data" / "JU04").rglob("JU04_area1.ang"),
+           Path(__file__).resolve().parents[2] / "data" / "JU04" / "EBSD" / "JU04_area1.ang")
 CHAIN = [("ci_threshold", {"ci_threshold": 0.1}), ("spike_removal", {}), ("noise_removal", {}), ("void_fill", {}),
-         ("grain_dilation", {}), ("grain_dilation", {"single_iteration": True, "multi_row": True, "min_grain_px": 4}),
+         ("grain_dilation", {"single_iteration": False}), ("grain_dilation", {"single_iteration": True, "multi_row": True, "min_grain_px": 4}),
          ("smoothing", {})]
 
 

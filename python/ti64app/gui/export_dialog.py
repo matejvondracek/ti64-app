@@ -23,6 +23,7 @@ from ..project import Project
 from ..settings import pictures_dir
 from . import dialogs
 from .shell import error, notify_actions
+from .tips import tip
 from .state import GuiState
 
 EXT = {"png": ".png", "tiff": ".tif", "svg": ".svg", "pdf": ".pdf", "bigtiff": ".tif"}
@@ -153,9 +154,9 @@ async def export_dialog(p: Project, gs: GuiState, kind: str, run_step, map_id: s
         if is_map:
             reg_opts = {"map": "whole map", "view": "current view", **{k: v for k, v in (rois or {}).items()}}
             with ui.row().classes("w-full items-end gap-2"):
-                ui.label("Region").classes("w-24 ti-muted pb-2")
+                ui.label("Region").classes("w-24 ti-muted pb-2").tooltip(tip("exp_region"))
                 region = ui.select(reg_opts, value=last["region"] if last["region"] in reg_opts else "map") \
-                    .classes("w-56").mark("exp_region")
+                    .classes("w-56").mark("exp_region").tooltip(tip("exp_region"))
         size_lab = ui.label().classes("text-sm font-semibold").mark("exp_size")
         warn_box = ui.column().classes("w-full gap-1").mark("exp_size_warn")
         hex_lab = ui.label().classes("text-xs ti-muted").mark("exp_hex_note")

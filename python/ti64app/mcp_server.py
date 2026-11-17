@@ -230,6 +230,30 @@ def suggest_sample_defaults(map_file: str) -> dict[str, str]:
     return {"map_id": map_id_from_file(map_file), "input_state": suggest_input_state(map_file)}
 
 
+def _axes(mode, labels, build_axis):
+    from .sample import MapAxes  # noqa: PLC0415
+
+    if mode is None and labels is None and build_axis is None:
+        return None
+    lab = list(labels or ["x", "y", "z"])
+    if len(lab) != 3:
+        raise ValueError("axis_labels: give three names (horizontal x, vertical y, normal z)")
+    return MapAxes(mode=mode or "approximate", x_label=lab[0], y_label=lab[1], z_label=lab[2], build_axis=build_axis)
+
+
+@server.tool()
+def map_directions(project: str, map_id: str) -> dict[str, Any]:
+    """Directions that texture (ipf_dirs) and elastic_properties (directions) accept for a map, named by the map
+    sheet's axis labels / specimen axes: available ones with their vector in the result frame, unavailable ones with
+    what the user has to enter, the defaults, and the frame (axis labels, exact / approximate)."""
+    from . import texture as tx  # noqa: PLC0415
+
+    p = _project(project)
+    fr = tx.frame_for(p, map_id)
+    return {"map_id": map_id, "frame": fr.as_dict(), "defaults": fr.defaults,
+            "choices": tx.direction_choices(p, map_id)}
+
+
 @server.tool()
 def set_sample_sheet(
     project: str,
@@ -251,6 +275,9 @@ def set_sample_sheet(
     map_y_axis: Literal["+X", "-X", "+Y", "-Y", "+Z", "-Z"] | None = None,
     notes: str = "",
     phase_map: dict[str, Literal["alpha", "beta", "other"]] | None = None,
+    axes_mode: Literal["exact", "approximate"] | None = None,
+    axis_labels: list[str] | None = None,
+    build_axis: Literal["x", "y", "z"] | None = None,
 ) -> dict[str, Any]:
     """Enter the sample sheet of one map (creates the project if needed). Only map_file and input_state are needed
     to load the map. The build direction (angle in deg from map +x toward +y, or a 3-vector in map coordinates) and
@@ -259,7 +286,10 @@ def set_sample_sheet(
     axes along map +x / +y. A relative map_file is resolved against the server's working directory.
     Phases are found by crystal symmetry (6/mmm -> 'Ti (alpha)', m-3m -> 'Ti (beta)'), never by name; phase_map
     ({file phase id: 'alpha' | 'beta' | 'other'}) is only needed when the symmetry does not decide (loading then says
-    so) and must come from the user."""
+    so) and must come from the user.
+    Map axes (fix 6.7.1): axes_mode 'exact' (default: BD + position define the specimen frame) or 'approximate':
+    axis_labels = names of the map's horizontal (x), vertical (y) and normal (z, beam) axes, e.g. ['L', 'S', 'T'], and
+    build_axis = which of them is the build direction. The labels name the directions in texture / elastic results."""
     bend = None
     geo = (outer_span_mm, inner_span_mm, width_mm, thickness_mm)
     if any(v is not None for v in geo):
@@ -276,7 +306,8 @@ def set_sample_sheet(
           if build_direction_angle_deg is not None or build_direction_vector else None)
     sheet = SampleSheet(map_id=map_id or map_id_from_file(map_file), specimen_id=specimen_id,
                         map_file=map_file, input_state=input_state, build_direction=bd,
-                        bending=bend, position=pos, notes=notes, phase_map=phase_map)
+                        bending=bend, position=pos, notes=notes, phase_map=phase_map, axes=_axes(
+                            axes_mode, axis_labels, build_axis))
     step = service.run(_project(project, create=True), "sample.set", sheet)
     return {**_step_summary(step), "map_id": sheet.map_id, "build_direction_unit": bd.unit_vector if bd else None}
 
@@ -383,14 +414,16 @@ def cleanup_map(project: str, map_id: str, overrides: CleanupOverrides | None = 
 @server.tool()
 def clean_map_step(project: str, map_id: str,
                    operation: Literal["ci_threshold", "spike_removal", "noise_removal", "void_fill", "grain_dilation",
-                                      "smoothing"],
+                                      "grain_ci", "smoothing"],
                    params: CleanStepOptions | None = None, source: str | None = None,  # type: ignore[valid-type]
                    backend: Backend | None = None) -> dict[str, Any]:
     """ONE cleanup operation as its own recipe step, on the current map (the output of the previous load / cleanup
     step of the map, or `source`), so the order is free. Parameters (defaults):
     ci_threshold {ci_threshold 0.1}; spike_removal {spike_angle_deg 5}; noise_removal {noise_angle_deg 3,
     noise_max_indexed_px 2, fill true}; void_fill {max_void_px 4, angle_deg 3}; grain_dilation (OIM style)
-    {tolerance_deg 5, min_grain_px 2, multi_row false, single_iteration false}; smoothing {hq_alpha 0.5,
+    {tolerance_deg 5, min_grain_px 2, multi_row false, single_iteration true}; grain_ci (OIM 'Grain CI
+    Standardization': every point of a grain gets the grain's mean or max CI, orientations unchanged; usually after
+    grain dilation) {tolerance_deg 5, min_grain_px 2, mode 'mean' | 'max'}; smoothing {hq_alpha 0.5,
     hq_threshold_deg 15}. Applying the same operation again right after itself replaces that step (tuning).
     Report: removed / filled / unfilled points and why; grain dilation: points changed per iteration."""
     from .backends.base import CLEAN_OPS  # noqa: PLC0415
@@ -422,8 +455,10 @@ def texture(project: str, map_id: str, phase: Literal["alpha", "beta"] = "alpha"
     """Texture (phase 6.7) of alpha or reconstructed prior-beta ('beta') orientations of a map, an ROI or all maps of
     its sample, in the specimen frame (X beam axis, Y thickness, Z width, from the map sheet position; BD from the
     sample sheet): kernel-density ODF (halfwidth deg), max MRD, texture index, grains used (warns when few), pole
-    figures (alpha {0001} {10-10} {11-20} {10-11}; beta {100} {110} {111}) and inverse pole figures (BD, beam axis,
-    width, custom) drawn by the backend. weighting: per pixel (area) or one point per grain."""
+    figures (alpha {0001} {10-10} {11-20} {10-11}; beta {100} {110} {111}) and inverse pole figures drawn by the
+    backend. weighting: per pixel (area) or one point per grain. ipf_dirs: names from map_directions (the map axes by
+    the map sheet's labels, BD, beam axis / thickness / width when the position is entered, 'custom'); default = the
+    map's default directions. Unavailable directions are skipped with a note, never an error."""
     p = _project(project)
     step = service.apply(p, "texture.run", _clean({
         "map_id": map_id, "phase": phase, "region": region, "roi_id": roi_id, "weighting": weighting,
@@ -449,9 +484,10 @@ def elastic_properties(project: str, map_id: str, region: Literal["map", "roi", 
                        directions: list[str] | None = None, custom_vector: tuple[float, float, float] | None = None,
                        bootstrap_runs: int = 200, backend: Backend | None = None) -> dict[str, Any]:
     """Young's modulus from texture (phase 6.7): single-crystal constants (Settings presets, GPa; list them with
-    elastic_presets) rotated into the specimen frame and averaged: Voigt / Reuss / Hill 6x6 matrices, E along BD /
-    beam axis / width / custom with +- SD from a bootstrap over grains, Emax / Emin, stereographic + 3D plot. Alpha +
-    retained beta mixed by area fraction; porosity ignored."""
+    elastic_presets) rotated into the specimen frame and averaged: Voigt / Reuss / Hill 6x6 matrices, E along the
+    directions (names from map_directions, e.g. the user's axis labels L / S / T; default = the map's defaults) with
+    +- SD from a bootstrap over grains, Emax / Emin, stereographic + 3D plot. Alpha + retained beta mixed by area
+    fraction (a map without beta: alpha only); porosity ignored."""
     p = _project(project)
     step = service.apply(p, "elastic.run", _clean({
         "map_id": map_id, "region": region, "roi_id": roi_id, "weighting": weighting, "preset_alpha": preset_alpha,

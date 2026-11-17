@@ -51,6 +51,27 @@ classdef CleanStepTest < matlab.unittest.TestCase
       tc.verifyLessThanOrEqual(r1.n_changed, r.n_changed);
     end
 
+    function grainCiStandardization(tc)
+      % fix 6.7.1 item 5: CI of every point of a grain := the grain's mean (default) or max CI; orientations kept
+      d = ti64.cleanStep(tc.Id, 'grain_dilation', struct('tolerance_deg', 5, 'min_grain_px', 2, 'multi_row', false, ...
+        'single_iteration', true));
+      w0 = ti64.store('get', d);
+      for mode = ["mean", "max"]
+        [n, r] = ti64.cleanStep(d, 'grain_ci', struct('tolerance_deg', 5, 'min_grain_px', 2, 'mode', char(mode)));
+        w = ti64.store('get', n);
+        tc.verifyEqual(r.mode, char(mode));
+        tc.verifyGreaterThan(r.n_changed, 0);
+        tc.verifyLessThanOrEqual(r.n_changed, r.n_in_grains);
+        tc.verifyEqual(nnz(abs(w.prop.ci(:) - w0.prop.ci(:)) > 1e-9), r.n_changed);
+        tc.verifyEqual(angle(w.rotations(:), w0.rotations(:)), angle(w0.rotations(:), w0.rotations(:)), 'AbsTol', 1e-9);
+        if mode == "max"
+          tc.verifyGreaterThanOrEqual(r.ci_mean_after, r.ci_mean_before);
+        else
+          tc.verifyEqual(r.ci_mean_after, r.ci_mean_before, 'AbsTol', 1e-6);
+        end
+      end
+    end
+
     function dilationFillLimit(tc)
       nbr = [0 2; 1 3; 2 0];                       % a chain 1-2-3, 1-based, 0 = none
       [src, sweeps, counts] = ti64.dilationFill([false; true; true], [1; 1; 1], [true; false; false], nbr, 1);

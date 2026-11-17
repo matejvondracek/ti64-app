@@ -35,6 +35,7 @@ from .io import bse as bse_io
 from .io import up2 as up2_io
 from .project import Project, write_json
 from .exportlog import EXPORT_OPS, ExportEntry
+from .views import VIEW_OPS
 from .recipe import FileInput, OutputRef, RecipeStep
 from .sample import SampleSheet
 
@@ -343,6 +344,8 @@ def run(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
     one takes the place of in the recipe (tuning, see apply()); undo brings the old one back."""
     if op_name in EXPORT_OPS and record:
         return export(project, op_name, params, backend)[0]
+    if op_name in VIEW_OPS and record:
+        return draw_view(project, op_name, params, backend)
     if op_name not in OPS:
         raise KeyError(f"unknown operation {op_name!r}; known: {sorted(OPS)}")
     spec = OPS[op_name]
@@ -428,7 +431,7 @@ def tune_key(project: Project, op_name: str, params: dict) -> tuple | None:
         return None
     if op_name == "ebsd.clean":
         return (op_name, params.get("operation"))
-    if op_name in ("map.compute", "figure", "recon.figure", "grainsize.figure"):
+    if op_name in ("map.compute", "figure", "recon.figure"):
         return (op_name, params.get("kind"))
     if op_name == "texture.run":
         return (op_name, params.get("phase") or "alpha")
@@ -509,6 +512,36 @@ def export(project: Project, op_name: str, params: dict[str, Any] | BaseModel, b
     return step, e
 
 
+def draw_view(project: Project, op_name: str, params: dict[str, Any] | BaseModel,
+              backend: str | None = None) -> RecipeStep:
+    """Draw a view figure (views.VIEW_OPS: grain-size histograms, colony map) WITHOUT a recipe step (fix 6.7.1
+    item 6): display, not analysis. Files go to views/<id>/ in the project; the settings are kept per map in
+    views.json (view state) and the figure is registered there, so Save / Export work on it like on a step."""
+    import uuid  # noqa: PLC0415
+
+    from . import views  # noqa: PLC0415
+
+    if op_name not in VIEW_OPS:
+        raise ValueError(f"{op_name} is not a view figure")
+    vid = "v" + uuid.uuid4().hex[:7]
+    step = run(project, op_name, params, backend, record=False, step_id=vid, out_dir=project.root / "views" / vid)
+    views.remember(project.root, step)
+    return step
+
+
+def find_step(project: Project, step_id: str) -> RecipeStep:
+    """A recipe step, or a drawn view figure (views.json) with that id."""
+    try:
+        return project.recipe().step(step_id)
+    except KeyError:
+        from . import views  # noqa: PLC0415
+
+        v = views.step(project.root, step_id)
+        if v is None:
+            raise
+        return v
+
+
 def export_again(project: Project, entry_id: str, target: str | Path | None = None,
                  backend: str | None = None) -> tuple[RecipeStep | None, ExportEntry]:
     """Export again with the settings of a logged export (to `target`, default: the same file as before). Uses the
@@ -537,7 +570,7 @@ def render_figure_as(project: Project, step_id: str, fmt: str, variant: str | No
     'pf' / 'ipf'). Returns the file (in cache/save/)."""
     import uuid  # noqa: PLC0415
 
-    s = project.recipe().step(step_id)
+    s = find_step(project, step_id)
     if s.op in FIGURE_VARIANTS:
         if variant not in FIGURE_VARIANTS[s.op]:
             raise ValueError(f"{s.op}: choose the figure: {FIGURE_VARIANTS[s.op]}")
@@ -582,7 +615,7 @@ def export_result(project: Project, step_id: str, fmt: str, target: str | Path,
     if fmt not in EXPORT_FORMATS:
         raise ValueError(f"format {fmt!r}; choose one of {EXPORT_FORMATS}")
     t = save_figure(project, step_id, fmt, target, variant)
-    s = project.recipe().step(step_id)
+    s = find_step(project, step_id)
     return exportlog.append(project.root, ExportEntry(op=RESULT_EXPORT, params={"step": step_id, "format": fmt,
                                                                                  **({"variant": variant} if variant else {}),
                                                                                  "figure_op": s.op, **{k: v for k, v in s.params.items() if k in ("map_id", "kind")}},

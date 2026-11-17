@@ -109,7 +109,17 @@ class GrainDilationParams(BaseModel):
     tolerance_deg: float = Field(5.0, gt=0)               # OIM 'grain tolerance angle'
     min_grain_px: int = Field(2, ge=1)                    # OIM 'minimum grain size'
     multi_row: bool = False                               # OIM 'grain must span multiple rows'
-    single_iteration: bool = False                        # OIM 'single iteration'
+    single_iteration: bool = True                         # OIM 'single iteration' (default on, fix 6.7.1)
+
+
+class GrainCiParams(BaseModel):
+    """Grain CI standardization (OIM Analysis 'Grain CI Standardization', fix 6.7.1): every indexed point of a grain
+    (grains at tolerance_deg with at least min_grain_px points, as in grain dilation) gets the grain's average CI
+    (default) or its maximum CI (as OIM). Orientations and phases are not changed; points outside such grains keep
+    their CI. Usually run after grain dilation, so that a later CI threshold keeps whole grains."""
+    tolerance_deg: float = Field(5.0, gt=0)               # OIM 'grain tolerance angle'
+    min_grain_px: int = Field(2, ge=1)                    # OIM 'minimum grain size'
+    mode: Literal["mean", "max"] = "mean"                 # grain's average CI | maximum CI (OIM)
 
 
 class SmoothingParams(BaseModel):
@@ -119,9 +129,11 @@ class SmoothingParams(BaseModel):
 
 CLEAN_OPS: dict[str, type[BaseModel]] = {
     "ci_threshold": CiThresholdParams, "spike_removal": SpikeRemovalParams, "noise_removal": NoiseRemovalParams,
-    "void_fill": VoidFillParams, "grain_dilation": GrainDilationParams, "smoothing": SmoothingParams}
+    "void_fill": VoidFillParams, "grain_dilation": GrainDilationParams, "grain_ci": GrainCiParams,
+    "smoothing": SmoothingParams}
 CLEAN_LABELS = {"ci_threshold": "CI threshold", "spike_removal": "Wild-spike removal",
                 "noise_removal": "Noise-grain removal", "void_fill": "Void fill", "grain_dilation": "Grain dilation",
+                "grain_ci": "Grain CI standardization",
                 "smoothing": "Smoothing (halfQuadraticFilter)"}
 # 'Add default cleanup': the preset of the input state as separate steps in the default order (EBSD_part2.m)
 DEFAULT_CLEANUP: dict[str, list[tuple[str, dict]]] = {
@@ -522,5 +534,6 @@ class ReconParams(BaseModel):
     hagbAngle: float = 10.0                   # prior-beta boundaries drawn black in the parent grain map
     misMapMin: float = 1.5                    # boundary misorientation map: shown from ...
     misMapMax: float = 8.0                    # ... colour scale max
+    betaLattice: float = 3.32                 # parent beta a (A) ADDED when the map has no cubic phase (Settings)
     sweep: list[tuple[str, float]] = [("single", 0.5), ("single", 3.0), ("single", 6.0), ("single", 8.0),
                                       ("progressive", 3.0)]

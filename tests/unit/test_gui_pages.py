@@ -94,5 +94,10 @@ async def test_ebsd_tab_grainsize(crop300_ju02):
         await user.should_see("grain size done", retries=400)
         await user.should_see(marker="gs_summary")
         user.find("run_gs_fig").click()
-        await user.should_see("figure alpha_ecd done", retries=200)
-    assert [s.op for s in p.recipe().steps][-3:] == ["grains.calc", "grainsize.run", "grainsize.figure"]
+        await user.should_see("α grain ECD (pymtex)", retries=200)
+    # fix 6.7.1 item 6: drawing is display, not a recipe step; the settings are kept per map (views.json)
+    assert [s.op for s in p.recipe().steps][-2:] == ["grains.calc", "grainsize.run"]
+    from ti64app import views
+
+    assert views.settings(p.root, "JU02_c300")["kind"] == "alpha_ecd"
+    assert any(f["op"] == "grainsize.figure" for f in views.load(p.root)["figures"].values())

@@ -12,7 +12,7 @@ from ti64app.io import prias, up2
 
 pytestmark = pytest.mark.slow
 REPO = Path(__file__).resolve().parents[2]
-NEW = sorted((REPO / "data" / "JU04").glob("*.ang")) + sorted((REPO / "data" / "JU06").glob("*.ang"))
+NEW = sorted((REPO / "data" / "JU04").rglob("*.ang")) + sorted((REPO / "data" / "JU06").rglob("*.ang"))
 SMALL = [f for f in NEW if f.stat().st_size < 40e6]          # JU04_area1/2, JU06_* (area3/4 only in the script run)
 UP2 = {"Area 1": "JU04_area1.ang", "Area 2": "JU04_area2.ang"}
 
@@ -91,7 +91,7 @@ def test_up2_hex_padding_and_pairing(area, tmp_path):
     from ti64app.modules import up2_overview as uo
     from ti64app.modules import up2_pair as pr
 
-    f = next(iter((REPO / "data" / "JU04").glob(f"*{area}*.up2")), None)
+    f = next(iter((REPO / "data" / "JU04").rglob(f"*{area}*.up2")), None)
     _need([f] if f else [])
     h = up2.read_header(f)
     assert h.hex_grid and h.extra_patterns and h.size_ok and h.n_patterns == h.n_rows * h.n_cols
@@ -119,7 +119,7 @@ def test_up2_padding_at_end_full_resolution(tmp_path):
     from ti64app.modules import up2_overview as uo
     from ti64app.modules import up2_pair as pr
 
-    f = next(iter((REPO / "data" / "JU04").glob("*Area 2*.up2")), None)
+    f = next(iter((REPO / "data" / "JU04").rglob("*Area 2*.up2")), None)
     _need([f] if f else [])
     pair = pr.paired(None, f)
     c = pr.compare(uo.compute(f, tmp_path, 1), pair)

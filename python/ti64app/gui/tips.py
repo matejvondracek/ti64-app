@@ -40,10 +40,14 @@ TIPS: dict[str, str] = {
                          "neighbouring grains; larger voids stay not indexed (shown in the report).",
     "clean_angle_deg": "Grain angle used to decide which neighbouring grain a filled point joins.",
     "clean_tolerance_deg": "OIM 'grain tolerance angle': neighbours within this misorientation form a grain.",
-    "clean_min_grain_px": "OIM 'minimum grain size': points in smaller grains (and not-indexed points) are dilated "
-                          "into the neighbouring grain with the most neighbours.",
+    "clean_min_grain_px": "OIM 'minimum grain size': smaller groups of points do not count as grains. Grain dilation: "
+                          "their points (and not-indexed points) are dilated into the neighbouring grain with the most "
+                          "neighbours. Grain CI standardization: their points keep their own CI.",
     "clean_multi_row": "OIM 'grain must span multiple rows': grains within one scan row do not count as grains.",
-    "clean_single_iteration": "OIM 'single iteration': one dilation sweep only (off: repeat until nothing changes).",
+    "clean_single_iteration": "OIM 'single iteration': one dilation sweep only (on by default; off: repeat until "
+                              "nothing changes).",
+    "clean_mode": "Grain CI standardization: every point of a grain gets the grain's average CI (default) or its "
+                  "maximum CI (as OIM's 'Grain CI Standardization'). Orientations are not changed.",
     "clean_hq_alpha": "Strength of the halfQuadraticFilter smoothing (larger = smoother).",
     "clean_hq_threshold_deg": "No smoothing across misorientations above this (keeps grain boundaries sharp).",
     "clim": "Colour range of value maps (CI, IQ, KAM ...). Empty = automatic.",
@@ -93,10 +97,14 @@ TIPS: dict[str, str] = {
     "lath_min_aspect": "Only grains at least this elongated count as laths for the thickness measurement.",
     "colony_tol": "α grains whose misorientation is within this angle are grouped into one colony.",
     "beta_line_spacing_um": "Spacing of the test lines for prior-β width / length (µm).",
-    "gs_fig": "Which grain-size figure to draw with the backend.",
-    "gs_range": "Smallest and largest grain size shown in the histogram (µm; empty = from 0 / up to the largest grains). Grains outside are not drawn (the title says how many); the statistics and the log-normal fit stay those of all grains.",
-    "gs_bin": "Histogram bin width in µm (empty = automatic, Freedman-Diaconis). The log-normal fit is drawn as "
-              "before; only the bars change.",
+    "gs_fig": "Which grain-size figure to draw with the backend that computed the grain size. Drawing is display: no "
+              "recipe step; the settings are kept for this map.",
+    "gs_lognormal": "Draw the log-normal fit of the grains shown (inside 'shown from' / 'up to'), scaled to the bars, "
+                    "with its median and σ; off: only the bins. Also shows the log-normal numbers in the grain-size "
+                    "summary on the Results tab.",
+    "gs_range": "Smallest and largest grain size shown in the histogram (µm; empty = from 0 / up to the largest grains). Grains outside are not drawn (the title says how many); the log-normal fit (if ticked) is that of the shown grains. The grain-size statistics of the step stay those of all grains.",
+    "gs_bin": "Histogram bin width in µm (empty = automatic, Freedman-Diaconis). The log-normal fit (if ticked) is "
+              "scaled to the bars.",
     "gs_oim": "Grain file exported from OIM Analysis, to compare the grain sizes with OIM.",
     # files / sheets
     "sample_id": "Specimen ID, e.g. JU04. Output folders and export names start with it.",
@@ -146,6 +154,33 @@ TIPS: dict[str, str] = {
     "st_min_score": "Matches with a lower normalised cross-correlation are not trusted; such tiles are placed "
                     "from the stage position (red border).",
 }
+
+
+ROI_HELP = ("ROI = region of interest: an area drawn on the map; analyses can run on the whole map or only inside "
+            "it. Draw one with 'ROI ▭' or 'ROI polygon' in the 'tool' list of the map toolbar.")
+TIPS.update({
+    "roi": ROI_HELP,
+    "tex_roi": ROI_HELP + " Choose which ROI the texture / elastic properties use.",
+    "tex_region": "Which orientations are used: the whole map, only inside an ROI (" + ROI_HELP[:ROI_HELP.index(";")]
+                  + ") or all maps of the sample.",
+    "annotations": "Annotations and ROIs: texts, arrows, lines, crack paths and " + ROI_HELP,
+    "viewer_tool": "Map tool: pan / zoom, probe a point, measure, draw annotations, a crack path or an ROI. " + ROI_HELP,
+    "exp_region": "Part of the map to export: the whole map, the current view or an ROI. " + ROI_HELP,
+})
+
+
+TIPS.update({
+    "map_axes": "How the map's axes are defined. Exact: the build direction (angle or vector in map coordinates) and "
+                "the position on the specimen give the specimen frame (beam axis, thickness, width, BD). Approximate: "
+                "name the map's horizontal (x), vertical (y) and normal (z, beam) axes yourself, e.g. L / S / T or "
+                "BD / TD / ND, and mark one as the build direction. The names then appear wherever directions are "
+                "named (pole figures, IPFs, texture and elastic results, exports, MCP).",
+    "axis_x": "Name of the map's horizontal axis (x, to the right), e.g. L, TD or BD.",
+    "axis_y": "Name of the map's vertical axis (y, down on screen), e.g. S, ND or BD.",
+    "axis_z": "Name of the axis normal to the map (z, along the electron beam), e.g. T or ND.",
+    "axis_bd": "Which of the three named axes is the build direction (used for IPFs along BD and prior-β length / "
+               "width along BD). Not set: steps that need BD say so.",
+})
 
 
 def tip(key: str) -> str:

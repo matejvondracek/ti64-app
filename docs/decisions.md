@@ -945,3 +945,55 @@
     variant pf | ipf).
   - texture.export_odf goes to the export log (MTEX text + JSON sidecar), so it is listed under 'Earlier exports' and
     can be exported again.
+
+## D36 (2026-11-17) Phase 6.7 fix 1: alpha-only maps, map axes, grain CI, figures as view state
+
+- **Parent phase for alpha-only maps (item 1).**
+  - Raw APEX exports of α-only scans (JU04_area3/4, all JU06_*.ang) have no cubic phase. Before the reconstructor is
+    built, both backends add Ti (beta) (m-3m) to the map's phase list (pymtex: `with_parent_phase`; MATLAB 7.2:
+    `CSList(end+1)` + `phaseMap(end+1)`, because CSList is a phaseItem array there, not a cell).
+  - The lattice parameter is a setting (Settings > Parent β phase, default a = 3.32 Å as EBSD_part2.m). It is
+    recorded in the step as `ReconParams.betaLattice`, so replay uses the same value. Only the symmetry matters for
+    the reconstruction; the lattice is kept for completeness.
+  - The reconstruction summary says `beta_added`. Retained β is 0 / "not in file" in grain size and elastic results.
+  - Crystal symmetries are now read from the phase LIST, never from the phase's pixels (`phase_cs` / `ti64.phaseCS`).
+    A crop or file without β pixels used to fail in IPF colours, ODFs and tensors.
+  - On a JU04_area3 head crop (150 rows), pymtex and MATLAB agree: reconstructed fraction within 2 %, ≥ 97 % of the
+    points in the same reconstruction state (tests/conformance/test_fix671.py).
+  - Every .ang in data/ runs load → default cleanup → grains → reconstruction → grain size → texture (α, prior β) →
+    elastic in both backends on a 100-row head crop (tests/integration/test_fix5_orientation.py).
+- **Directions never fail (item 2) and map axes (item 9).**
+  - The map axes are always available. In 'exact' mode they are called x / y / z without a position, or beam axis /
+    thickness / width with one. In 'approximate' mode they carry the user's labels.
+  - Directions that cannot be resolved yet (BD, beam axis, …) are listed with what to enter. The GUI greys them out
+    with a tooltip; the ops skip them with a note. If none is left, the defaults (the map axes) are used.
+  - Default directions: exact with a position = BD (else thickness), beam axis, width. Otherwise the three map axes,
+    plus BD when it is not along one of them.
+  - 'Approximate' does not rotate anything: the frame stays the map frame. The axis marked as BD becomes the map's
+    build direction (a unit vector along that axis; the sign does not matter for axial quantities), so prior-β
+    length / width and IPF colouring along BD use it.
+  - The position ORIGIN stays visible in both modes, because the 4PB role uses it. The 'map +x / +y along' selects
+    belong to exact mode only.
+  - Changing the BD, the position or the axes marks texture / elastic results of the map stale.
+  - Old recipes with direction names 'map x / map y / map z' still resolve.
+- **Grain CI standardization (item 5).** Same grains as grain dilation (calcGrains, alpha = 0, tolerance angle,
+  minimum size; no 'multiple rows' option). Every indexed point of such a grain gets the grain's mean CI (default) or
+  max CI (as OIM). Points of smaller grains and not-indexed points keep their CI, and orientations are not changed.
+  The report counts points whose CI changed (> 1e-9).
+- **Dilation default (item 4).** `single_iteration` is on by default. Recorded steps store all their parameters, so
+  old recipes replay unchanged.
+- **Figures from results are view state (item 6).**
+  - `grainsize.figure` is a view op: no recipe step and not in History. It is drawn by the backend that computed the
+    grain size into `views/<id>/`.
+  - `views.json` keeps the settings per map (the GUI fills its fields from them) and a registry of drawn figures, so
+    Save / Export / Export again still work.
+  - When a project is opened, old `grainsize.figure` steps are moved from recipe.json and the undo snapshots into
+    `views.json`. This uses the same mechanism as exports in fix 3.4.
+- **Log-normal fit (item 7).**
+  - Off by default. The bars are the grains inside the shown range: without a range the automatic bins end at the
+    99.5th percentile. Area percentages are of the shown area.
+  - The fit is the MLE log-normal of the SAME shown grains. It is scaled so that its area inside the range equals the
+    bars' area (pdf × n × bin / P(range)), and the title says "n of N shown".
+  - The log-normal numbers in the grain-size summary on Results are shown only when the box is ticked. The CSV / XLSX
+    tables always keep them.
+  - The OIM grain-file comparison keeps its fit.

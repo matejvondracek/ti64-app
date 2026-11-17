@@ -93,7 +93,7 @@ def _recon_spec(ctx, map_id: str, lp: LayerParams):
     from .backends.base import ReconData  # noqa: PLC0415
     from .ops_ebsd import resolve_source, step_npz  # noqa: PLC0415
     from .ops_recon import BETA, discrete_hsv  # noqa: PLC0415
-    from .ops_ebsd import _ipf_vector  # noqa: PLC0415
+    from .ops_ebsd import _ipf_vector, direction_label  # noqa: PLC0415
 
     style = load_settings().figure
     rid = resolve_source(ctx, map_id, lp.recon, ("recon.run",))
@@ -130,8 +130,9 @@ def _recon_spec(ctx, map_id: str, lp: LayerParams):
         ok = (pg > 0) & (lut[pg] >= 0)
         rgb[ok] = gcol[lut[pg[ok]]]
         spec.rgb = rgb
-        spec.title = f"prior β grains, mean orientation, {key} ∥ {d}"
-        meta["keys"] = {BETA: {"key": key, "direction": d, "vector": list(vec)}}
+        dl = direction_label(ctx.project.sample(map_id), d)
+        spec.title = f"prior β grains, mean orientation, {key} ∥ {dl}"
+        meta["keys"] = {BETA: {"key": key, "direction": d, "vector": list(vec), "direction_label": dl}}
     elif lp.kind == "recon_fit":
         spec.values, spec.cmap = pmap["prop_recon_fit"].astype(float), style.colormap_scalar
         spec.clim = lp.clim or (0.0, 5.0)

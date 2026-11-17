@@ -56,6 +56,12 @@ class FeedbackSettings(BaseModel):
     repo_url: str = "https://github.com/matejvondracek/ti64-app"
 
 
+class PhaseSettings(BaseModel):
+    """Lattice of the parent beta phase that the prior-beta reconstruction ADDS to maps without a cubic phase
+    (raw APEX exports with alpha only, fix 6.7.1 item 1). a = 3.32 A as EBSD_part2.m (bcc Ti at room temperature)."""
+    beta_lattice_a: float = 3.32       # angstrom
+
+
 def _elastic():
     from .elastic import ElasticSettings  # noqa: PLC0415
 
@@ -68,6 +74,7 @@ class Settings(BaseModel):
     figure: FigureStyle = Field(default_factory=FigureStyle)
     feedback: FeedbackSettings = Field(default_factory=FeedbackSettings)
     elastic: "ElasticSettings" = Field(default_factory=_elastic)     # single-crystal constants (phase 6.7)
+    phases: PhaseSettings = Field(default_factory=PhaseSettings)      # parent beta lattice (fix 6.7.1)
 
 
 def settings_file_candidates() -> list[Path]:
@@ -104,7 +111,7 @@ def load_settings(path: Path | None = None) -> Settings:
     prefs = preferences_path()
     if prefs.is_file():
         p = json.loads(prefs.read_text(encoding="utf-8"))
-        data.update({k: v for k, v in p.items() if k in ("backend", "figure", "feedback", "elastic")})
+        data.update({k: v for k, v in p.items() if k in ("backend", "figure", "feedback", "elastic", "phases")})
         # paths edited on the Settings page override the TOML file, field by field (empty = keep TOML)
         data["paths"] = {**data.get("paths", {}), **{k: v for k, v in p.get("paths", {}).items() if v}}
     return Settings.model_validate(data)
@@ -116,7 +123,7 @@ def save_preferences(settings: Settings, paths: dict[str, str] | None = None) ->
     p = preferences_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     old = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {}
-    d = settings.model_dump(mode="json", include={"backend", "figure", "feedback", "elastic"})
+    d = settings.model_dump(mode="json", include={"backend", "figure", "feedback", "elastic", "phases"})
     d["paths"] = old.get("paths", {}) if paths is None else {k: v for k, v in paths.items() if k in Paths.model_fields}
     tmp = p.with_name(f".{p.name}.tmp")                 # atomic: temp file + rename
     tmp.write_text(json.dumps(d, indent=1), encoding="utf-8")

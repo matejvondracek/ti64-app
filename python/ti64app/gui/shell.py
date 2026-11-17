@@ -125,7 +125,7 @@ def gui_context() -> dict:
     lab = indexing_label(m)
     return {"tab": g.get("tab"), "file": (f"{m.id} ({Path(m.file).name}, {m.kind}"
                                           + (f", indexing {lab}" if lab else "") + ")" if m else fid),
-            "map tab": {"alpha": "α map", "beta": "prior β"}.get(mt, mt) if g.get("tab") == "/ebsd" else None,
+            "map tab": {"alpha": "Map", "beta": "prior β"}.get(mt, mt) if g.get("tab") == "/ebsd" else None,
             "map kind shown": (g.get("layer", {}).get(fid) if isinstance(g.get("layer"), dict) and
                                isinstance(fid, str) else None)}
 
@@ -594,6 +594,24 @@ IPF_KEYS = ["ipfHKLKey", "ipfTSLKey", "ipfHSVKey", "ipfSpotKey"]
 DIRECTIONS = ["X", "Y", "Z", "build", "custom"]
 
 
+def _phase_settings(s, save) -> None:
+    """Lattice of the parent β phase that the prior-β reconstruction adds to maps without a β phase (fix 6.7.1)."""
+    with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_phases"):
+        ui.label("Parent β phase (prior-β reconstruction)").classes("font-semibold")
+        ui.label("Raw APEX exports of α-only scans have no β phase. The reconstruction then adds Ti (beta) (cubic "
+                 "m-3m) with this lattice parameter; maps with a β phase use the file's own. Each reconstruction "
+                 "records the value it used.").classes("text-xs ti-muted")
+        n = ui.number("β lattice parameter a [Å]", value=s.phases.beta_lattice_a, step=0.01, min=2.5, max=4.0,
+                      format="%.3f").classes("w-56").props("dense").mark("settings_beta_lattice")
+
+        def upd(e):
+            if e.value is None:
+                return
+            s.phases.beta_lattice_a = float(e.value)
+            save()
+        n.on_value_change(upd)
+
+
 def _elastic_settings(s, save) -> None:
     """Single-crystal elastic constants (phase 6.7): default preset per phase, every preset's constants editable (GPa),
     source and DOI shown; 'Reset' brings back the literature values."""
@@ -769,6 +787,7 @@ def _settings_body(s, status, p: Project | None) -> None:
             w.on("blur", upd_paths)
             w.on("keydown.enter", upd_paths)
 
+    _phase_settings(s, save)
     _elastic_settings(s, save)
 
     with ui.column().classes("ti-card w-full p-3 gap-1").mark("settings_feedback"):

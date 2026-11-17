@@ -3,8 +3,9 @@
 Specimen frame (CLAUDE.md): X = beam axis, Y = thickness (neutral axis at Y = 0), Z = width. The map frame is x right,
 y down, z = x cross y (into the screen; EDAX setting 2, docs/orientation_check.md). The map sheet's position says which
 specimen axes the map +x / +y point along; R (3x3) maps map-frame vectors to specimen-frame vectors and every
-orientation becomes g_specimen = R g_map (crystal -> specimen). Without a position the map frame is kept (axes x / y / z)
-and the result says so. The build direction comes from the sample sheet (specimen frame) or the map sheet (map frame).
+orientation becomes g_specimen = R g_map (crystal -> specimen). Without a position the map frame is kept (axes named by
+the map sheet's labels, default x / y / z) and the result says so; in 'approximate' map-axes mode the user's labels name
+the map axes and one of them is the build direction (fix 6.7.1). The build direction comes from the sample sheet (specimen frame) or the map sheet (map frame).
 
 Orientation sets: alpha (current map of the map id) or prior beta (newest reconstruction); whole map, an ROI, or all
 maps of a sample combined (each rotated into the specimen frame; needs every map's position); weights: per pixel (area
@@ -72,24 +73,68 @@ class SpecimenFrame:
     directions: dict[str, tuple[float, float, float]]   # named directions (BD, beam axis, width, ...) in the frame
     text: str
     warnings: list[str] = field(default_factory=list)
+    unavailable: dict[str, str] = field(default_factory=dict)   # direction name -> what to enter to resolve it
+    defaults: list[str] = field(default_factory=list)          # directions offered by default (IPF / elastic)
+    axis_labels: dict[str, str] = field(default_factory=lambda: {"x": "x", "y": "y", "z": "z"})   # map x / y / z
+    mode: str = "exact"                          # map sheet 'Map axes': exact | approximate
 
     @property
     def quat(self) -> np.ndarray:
         return quat_from_matrix(self.R)
 
+    def resolve(self, name: str) -> tuple[float, float, float] | None:
+        """A named direction; the old names 'map x' / 'map y' / 'map z' (recipes before fix 6.7.1) mean the map axes."""
+        if name in self.directions:
+            return self.directions[name]
+        if name in ("map x", "map y", "map z"):
+            return tuple(float(c) for c in self.R @ np.eye(3)["xyz".index(name[-1])])
+        return None
+
     def as_dict(self) -> dict:
-        return {"kind": self.kind, "R_map_to_frame": np.round(self.R, 6).tolist(), "labels": self.labels,
+        return {"kind": self.kind, "mode": self.mode, "R_map_to_frame": np.round(self.R, 6).tolist(),
+                "labels": self.labels, "axis_labels": self.axis_labels,
                 "directions": {k: [round(c, 6) for c in v] for k, v in self.directions.items()},
-                "text": self.text, "warnings": self.warnings, "quat": np.round(self.quat, 8).tolist()}
+                "unavailable": self.unavailable, "text": self.text, "warnings": self.warnings,
+                "quat": np.round(self.quat, 8).tolist()}
+
+
+ENTER_BD = "enter the build direction (Files tab > map sheet > Build direction, or mark an axis as BD in 'Map axes')"
+ENTER_POS = "enter the map's position on the specimen (Files tab > map sheet > Position on the specimen, mode exact)"
+
+
+def _unit(k: str) -> tuple[float, float, float]:
+    return tuple(float(c) for c in np.eye(3)["xyz".index(k)])
 
 
 def frame_for(project: Project, map_id: str) -> SpecimenFrame:
-    """Rotation from the map frame into the specimen frame (map sheet position + sample sheet BD)."""
+    """Frame of the texture / elastic results of one map (fix 6.7.1 items 2 and 9). Never fails for missing input:
+    the map axes are always available (named by the map sheet's axis labels, default x / y / z); directions that
+    cannot be resolved yet are listed in `unavailable` with what to enter.
+      exact + position     specimen frame (map sheet position + sample sheet BD): beam axis, thickness, width, BD
+      exact, no position   map frame: the map axes + BD if entered on the map sheet
+      approximate          map frame, axes named by the user's labels, BD = the axis marked as BD"""
+    from .sample import MapAxes  # noqa: PLC0415
+
     sheet = project.sample(map_id)
     m = project.file(map_id)
     s = project.sample_info(m.sample_id) if m is not None and m.sample_id else None
     bd_spec = getattr(s, "build_direction_specimen", None) if s is not None else None
+    ax = sheet.axes or MapAxes()
+    names = ax.labels
     warnings: list[str] = []
+    unavailable: dict[str, str] = {}
+    if ax.mode == "approximate":
+        R = np.eye(3)
+        labels = {k: names[k] + (" = BD" if ax.build_axis == k and names[k] != "BD" else "") for k in "xyz"}
+        dirs = {names[k]: _unit(k) for k in "xyz"}
+        if ax.build_axis is not None:
+            if names[ax.build_axis] != "BD":
+                dirs["BD"] = dirs[names[ax.build_axis]]
+        else:
+            unavailable["BD"] = "mark one axis as the build direction (Files tab > map sheet > Map axes)"
+        text = f"map axes named on the map sheet (approximate): {ax.text()}"
+        return SpecimenFrame("map", R, labels, dirs, text, warnings, unavailable, [names[k] for k in "xyz"], names,
+                             "approximate")
     if sheet.position is not None:
         ex, ey = _axis_vec(sheet.position.map_x_axis), _axis_vec(sheet.position.map_y_axis)
         R = np.column_stack([ex, ey, np.cross(ex, ey)])      # columns: images of map x, y, z
@@ -105,22 +150,75 @@ def frame_for(project: Project, map_id: str) -> SpecimenFrame:
         elif sheet.build_direction is not None:
             dirs["BD"] = tuple(R @ np.asarray(sheet.build_direction.unit_vector))
         else:
+            unavailable["BD"] = ENTER_BD
             warnings.append("build direction not entered (sample sheet 'build direction in the specimen frame' or the "
                             "map sheet): no BD direction")
+        defaults = (["BD"] if "BD" in dirs else ["thickness"]) + ["beam axis", "width"]
         text = (f"map frame -> specimen frame: map +x = {sheet.position.map_x_axis}, map +y = "
                 f"{sheet.position.map_y_axis}, map z (into the screen) = "
                 f"{_axis_name(np.cross(ex, ey))} (map sheet 'Position on the specimen')")
-        return SpecimenFrame("specimen", R, labels, dirs, text, warnings)
+        mapped = {k: AXIS_NAMES[_axis_name(R[:, i])[1]] for i, k in enumerate("xyz")}
+        return SpecimenFrame("specimen", R, labels, dirs, text, warnings, unavailable, defaults, mapped, "exact")
     R = np.eye(3)
-    labels = {"x": "map x (right)", "y": "map y (down)", "z": "map z (into the screen)"}
-    dirs = {"map x": (1.0, 0.0, 0.0), "map y": (0.0, 1.0, 0.0), "map z": (0.0, 0.0, 1.0)}
+    custom = names != {"x": "x", "y": "y", "z": "z"}
+    labels = {k: names[k] if custom else f"{k} ({w})" for k, w in zip("xyz", ("right", "down", "into the screen"))}
+    dirs = {names[k]: _unit(k) for k in "xyz"}
+    defaults = [names[k] for k in "xyz"]
     if sheet.build_direction is not None:
-        dirs["BD"] = tuple(sheet.build_direction.unit_vector)
+        bd = tuple(float(c) for c in sheet.build_direction.unit_vector)
+        along_axis = any(abs(abs(float(np.dot(bd, v))) - 1) < 1e-6 for v in dirs.values())
+        dirs["BD"] = bd
+        if not along_axis:
+            defaults = ["BD"] + defaults                       # BD not along one of the map axes: offered too
     else:
+        unavailable["BD"] = ENTER_BD
         warnings.append("build direction not entered (Files tab, map sheet): no BD direction")
+    for a in ("beam axis", "thickness", "width"):
+        unavailable[a] = ENTER_POS
     warnings.append("the map's position on the specimen is not entered (Files tab, map sheet 'Position on the "
-                    "specimen'): axes are the map axes x / y / z, not beam axis / thickness / width")
-    return SpecimenFrame("map", R, labels, dirs, "map frame kept (no position on the specimen entered)", warnings)
+                    "specimen'): axes are the map axes " + " / ".join(names.values()) + ", not beam axis / thickness / "
+                    "width")
+    return SpecimenFrame("map", R, labels, dirs, "map frame kept (no position on the specimen entered)", warnings,
+                         unavailable, defaults, names, "exact")
+
+
+def direction_choices(project: Project, map_id: str) -> list[dict]:
+    """Directions offered for inverse pole figures and E(direction) of a map, in display order:
+    [{name, available, vector | None, why (what to enter; '' if available), default}], 'custom' last."""
+    try:
+        fr = frame_for(project, map_id)
+    except (KeyError, ValueError) as e:
+        return [{"name": "custom", "available": True, "vector": None, "why": "", "default": False, "error": str(e)}]
+    out = [{"name": n, "available": True, "vector": list(v), "why": "", "default": n in fr.defaults}
+           for n, v in fr.directions.items()]
+    out += [{"name": n, "available": False, "vector": None, "why": why, "default": False}
+            for n, why in fr.unavailable.items()]
+    out.append({"name": "custom", "available": True, "vector": None, "why": "", "default": False})
+    return out
+
+
+def pick_directions(fr: SpecimenFrame, names: list[str] | None, custom, notes: list[str]) -> list[tuple[str, tuple]]:
+    """[(name, vector)] for IPFs / E(direction). names None = the frame's defaults. Never fails for missing input
+    (fix 6.7.1 item 2): a direction that cannot be resolved yet is skipped with a note saying what to enter; if none
+    is left, the defaults (the map axes) are used."""
+    out: list[tuple[str, tuple]] = []
+    for n in (fr.defaults if names is None else names):
+        if n == "custom":
+            if custom is None:
+                notes.append("custom direction: no vector entered, skipped")
+            else:
+                out.append((f"custom {tuple(round(c, 3) for c in custom)}", tuple(float(c) for c in custom)))
+            continue
+        v = fr.resolve(n)
+        if v is not None:
+            out.append((n, v))
+        else:
+            notes.append(f"direction '{n}' skipped: {fr.unavailable.get(n, 'not available in this frame (' + ', '.join(fr.directions) + ')')}")
+    if not out:
+        notes.append("none of the chosen directions is available: the default directions " + ", ".join(fr.defaults)
+                     + " are used")
+        out = [(n, fr.directions[n]) for n in fr.defaults]
+    return out
 
 
 def _axis_name(v) -> str:
@@ -207,7 +305,7 @@ def map_set(project: Project, map_id: str, phase: str, weighting: str, roi_id: s
         else:
             pid = next((k for k, v in map_phase_names(project, map_id).items() if v == BETA), None)
             if pid is None:
-                raise TextureInputError(f"{map_id} has no beta phase")
+                raise TextureInputError(f"{map_id} has no retained beta: the file has no beta phase (not in file)")
         gid = (grains or newest_grains(steps, map_id, "alpha")) if phase == "alpha" else None
         gtab = None
         if gid:
@@ -223,7 +321,11 @@ def map_set(project: Project, map_id: str, phase: str, weighting: str, roi_id: s
         used["recon"] = rid
         d = _npz(project, rid, "ebsd")
         names = map_phase_names(project, map_id)
-        pid = next((k for k, v in names.items() if v == BETA), 2)
+        pid = next((k for k, v in names.items() if v == BETA), None)
+        if pid is None:          # file without beta: the reconstruction ADDED the parent phase (fix 6.7.1 item 1)
+            st = d.get("prop_recon_state")
+            ph_t = d["phase"][st == 2] if st is not None else np.zeros(0, int)
+            pid = int(np.bincount(ph_t.astype(np.int64)).argmax()) if ph_t.size else max(names, default=1) + 1
         rz = _npz(project, rid, "recon")
         pix = d.get("prop_parent_grain")
         gtab = None

@@ -6,7 +6,7 @@ function [odfId, maxMrd, ti] = odfBuild(id, phase, h5in, halfwidthDeg)
 %   index = squared L2 norm (norm(odf)^2; textureindex is deprecated in MTEX 7.2).
 S = ti64.store('get', id);
 if isstruct(S), ebsd = S.ebsd; else, ebsd = S; end
-cs = ebsd(phase).CS;
+cs = ti64.phaseCS(ebsd, phase);
 Q = h5read(h5in, '/quat')';
 w = h5read(h5in, '/weights'); w = w(:) / sum(w(:));
 o = orientation(quaternion(Q(:, 1), Q(:, 2), Q(:, 3), Q(:, 4)), cs);

@@ -1,7 +1,8 @@
 function [newId, rep] = cleanStep(id, operation, p)
 % CLEANSTEP  ONE cleanup operation on a stored map (phase 6.6 fix 5); the input map stays untouched.
 %   [newId, rep] = ti64.cleanStep(id, operation, p)
-%   operation: 'ci_threshold' | 'spike_removal' | 'noise_removal' | 'void_fill' | 'grain_dilation' | 'smoothing'
+%   operation: 'ci_threshold' | 'spike_removal' | 'noise_removal' | 'void_fill' | 'grain_dilation' | 'grain_ci' |
+%              'smoothing'
 %   p: struct with the fields of the operation's parameters (python/ti64app/backends/base.py CLEAN_OPS: same names,
 %   units and defaults as the pymtex backend, PymtexBackend.clean_step; keep both identical).
 %   Grains for spike / noise / void vote / dilation use 'alpha', 0 (not-indexed regions stay separate, decisions D7).
@@ -96,6 +97,26 @@ switch operation
     rep.n_candidates = nnz(cand); rep.n_changed = nnz(done); rep.n_unchanged = nnz(cand & ~done);
     rep.n_iterations = numel(counts); rep.changed_per_iteration = counts(:)';
     rep.n_grains_kept = nnz(validG(2:end));
+  case 'grain_ci'
+    % Grain CI standardization (fix 6.7.1; OIM 'Grain CI Standardization'): CI of every indexed point of a grain
+    % (alpha = 0 grains at tolerance_deg, >= min_grain_px points) := the grain's mean (default) or max CI
+    [gid, npx, gidx] = grainsAlpha0(w, p.tolerance_deg);
+    validG = gidx & npx >= p.min_grain_px;
+    m = valid & pid ~= 1 & ~isnan(pid) & validG(gid + 1);
+    ci = double(w.prop.ci(:));
+    if strcmp(p.mode, 'max')
+      val = accumarray(gid(m) + 1, ci(m), [numel(validG) 1], @max, -Inf);
+    else
+      val = accumarray(gid(m) + 1, ci(m), [numel(validG) 1], @sum, 0) ./ ...
+            max(accumarray(gid(m) + 1, 1, [numel(validG) 1]), 1);
+    end
+    newCi = ci; newCi(m) = val(gid(m) + 1);
+    rep.mode = char(p.mode); rep.n_in_grains = nnz(m);
+    rep.n_changed = nnz(m & abs(newCi - ci) > 1e-9);
+    rep.n_grains = nnz(validG(2:end));
+    if any(m), rep.ci_mean_before = mean(ci(m)); rep.ci_mean_after = mean(newCi(m));
+    else, rep.ci_mean_before = NaN; rep.ci_mean_after = NaN; end
+    w.prop.ci = reshape(newCi, size(w));
   case 'smoothing'
     w = applyState(w, rot, pid);
     F = l1TVFilter;                               % = halfQuadraticFilter of MTEX < 7.2 / pymtex 1.0

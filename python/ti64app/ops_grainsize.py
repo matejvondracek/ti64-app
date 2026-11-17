@@ -134,7 +134,7 @@ def _grainsize_run(ctx: OpContext) -> None:
     step, grid = grid_info(x, y)
     sample = p.sample_um or step / 4
     pid = _phase_ids(ctx, p.map_id)
-    alpha, beta = pid.get("alpha", 1), pid.get("beta", 2)
+    alpha, beta = pid.get("alpha", 1), pid.get("beta", -1)      # -1: the file has no beta phase (fix 6.7.1)
     warnings: list[str] = []
     needs: list[str] = []                     # sheet values the user still has to enter for the full result
     gi = GridIndex(x, y, step)
@@ -214,7 +214,9 @@ def _grainsize_run(ctx: OpContext) -> None:
     lphase = step_npz(ctx, load.id, "ebsd")["phase"]
     rb = {"loaded": {"beta_px": int((lphase == beta).sum()), "indexed_px": int((lphase > 0).sum())},
           "source_map": {"step": msrc, "beta_px": int((phase == beta).sum()), "indexed_px": int((phase > 0).sum())},
-          "n_beta_grains": int((g["phase"] == beta).sum()), "note": RESOLUTION_NOTE}
+          "n_beta_grains": int((g["phase"] == beta).sum()), "note": RESOLUTION_NOTE, "in_file": beta >= 0}
+    if beta < 0:
+        rb["note"] = "not in file: the map has no beta phase (alpha-only export); retained beta = 0 %"
     for k in ("loaded", "source_map"):
         rb[k]["fraction"] = rb[k]["beta_px"] / max(rb[k]["indexed_px"], 1)
 
@@ -423,8 +425,9 @@ class GrainSizeFigureParams(BaseModel):
                   "colony_ecd_area", "beta_ecd", "beta_width", "beta_length", "colony_map"]
     grainsize: str | None = None              # grainsize.run step (default newest of the map with that part)
     bin_width_um: float | None = None         # histogram bin width (um); None = automatic (Freedman-Diaconis)
-    min_um: float | None = None               # shown range of the histogram (um, fix 3.15); the statistics and the
-    max_um: float | None = None               # log-normal fit stay those of all grains
+    min_um: float | None = None               # shown range of the histogram (um, fix 3.15)
+    max_um: float | None = None
+    lognormal_fit: bool = False               # draw the log-normal fit of the PLOTTED grains (fix 6.7.1 item 7)
     width_cm: float | None = None
     dpi: int | None = None
 
@@ -438,36 +441,50 @@ def _read_csv(ctx: OpContext, step, name: str) -> dict[str, np.ndarray]:
 
 def _hist_chart(v: np.ndarray, w: np.ndarray | None, xlabel: str, title: str,
                 weight_label: str = "area", bin_width: float | None = None,
-                x_range: tuple[float | None, float | None] = (None, None)) -> ChartSpec:
-    """Number histogram (count) with the number-weighted log-normal fit, or, with weights, the area-weighted
-    histogram (% of area) with the area-weighted log-normal fit. x_range = (min, max) um shown (fix 3.15): grains
-    outside are not drawn (said in the title), the fit and the area fractions are still those of all grains."""
+                x_range: tuple[float | None, float | None] = (None, None), fit: bool = False) -> ChartSpec:
+    """Number histogram (count) or, with weights, the area-weighted histogram (% of the plotted area). x_range = (min,
+    max) um shown (fix 3.15); the bins cover the plotted grains only (those inside the shown range; without a range
+    the automatic bins end at the 99.5th percentile), and the title says how many are shown.
+    fit (fix 6.7.1 item 7, off by default): the log-normal fit of the SAME plotted grains (number- or area-weighted),
+    scaled to the plotted bins: the curve's area inside the shown range equals the bars' area, so curve and bars
+    agree even when part of the distribution is outside the range."""
+    from math import erf, log, sqrt  # noqa: PLC0415
+
     v = np.asarray(v, float)
     ok = np.isfinite(v) & (v > 0)
     v = v[ok]
     w = None if w is None else np.asarray(w, float)[ok]
     lo, hi = x_range
     e = hist_edges(v, bin_width=bin_width, lo=lo, hi=hi)
-    if lo is not None or hi is not None:
-        out = int(((v < e[0]) | (v > e[-1])).sum())
-        title = f"{title}; shown {e[0]:g}-{e[-1]:g} µm" + (f" ({out} outside)" if out else "")
+    shown = (v >= e[0]) & (v <= e[-1])
+    out = int((~shown).sum())
+    title = f"{title}; {int(shown.sum())} of {v.size} shown ({e[0]:g}-{e[-1]:g} µm" + (f", {out} outside)" if out
+                                                                                      else ")")
+    vs, ws = v[shown], (None if w is None else w[shown])
     bw = float(e[1] - e[0])
     xs = np.linspace(e[0] + bw / 20, e[-1], 300)
-    s = dist_stats(v, w)
-    if w is None:
-        h, _ = np.histogram(v, e)
-        curves = [(xs, lognormal_pdf(xs, s["lognormal"]["mu"], s["lognormal"]["sigma"]) * v.size * bw,
-                   f"log-normal fit (median {s['lognormal']['median']:.2f}, σ {s['lognormal']['sigma']:.2f})")] \
-            if s and s["lognormal"]["sigma"] > 0 else []
+    curves = []
+
+    def mass(mu: float, sigma: float) -> float:                 # log-normal probability inside the shown range
+        cdf = [0.5 * (1 + erf((log(max(x, 1e-300)) - mu) / (sigma * sqrt(2)))) if x > 0 else 0.0 for x in (e[0], e[-1])]
+        return max(cdf[1] - cdf[0], 1e-12)
+    s = dist_stats(vs, ws) if fit and vs.size > 1 else None
+    if ws is None:
+        h, _ = np.histogram(vs, e)
+        if s and s["lognormal"]["sigma"] > 0:
+            ln = s["lognormal"]
+            curves = [(xs, lognormal_pdf(xs, ln["mu"], ln["sigma"]) * vs.size * bw / mass(ln["mu"], ln["sigma"]),
+                       f"log-normal fit of the {vs.size} shown grains (median {ln['median']:.2f}, σ {ln['sigma']:.2f})")]
         ylabel = "count"
     else:
-        h, _ = np.histogram(v, e, weights=w)
-        h = 100 * h / w.sum()
+        h, _ = np.histogram(vs, e, weights=ws)
+        h = 100 * h / max(ws.sum(), 1e-300)
         aw = s["area_weighted"]["lognormal"] if s else None
-        curves = [(xs, lognormal_pdf(xs, aw["mu"], aw["sigma"]) * 100 * bw,
-                   f"{weight_label}-weighted log-normal (median {aw['median']:.2f}, σ {aw['sigma']:.2f})")] \
-            if aw and aw["sigma"] > 0 else []
-        ylabel = f"{weight_label} fraction (%)"
+        if aw and aw["sigma"] > 0:
+            curves = [(xs, lognormal_pdf(xs, aw["mu"], aw["sigma"]) * 100 * bw / mass(aw["mu"], aw["sigma"]),
+                       f"{weight_label}-weighted log-normal fit of the {vs.size} shown grains (median "
+                       f"{aw['median']:.2f}, σ {aw['sigma']:.2f})")]
+        ylabel = f"{weight_label} fraction of the shown grains (%)"
     return ChartSpec((e[:-1] + e[1:]) / 2, h.astype(float), bw, xlabel, ylabel, title, curves=curves)
 
 
@@ -494,7 +511,7 @@ def grainsize_step_for(project, map_id: str, part: str) -> str | None:
 
 @op("grainsize.figure", GrainSizeFigureParams, uses_backend=True)
 def _grainsize_figure(ctx: OpContext) -> None:
-    """Histograms with log-normal fits (alpha ECD number / area-weighted, lath thickness by intercept and by
+    """Histograms, optionally with the log-normal fit of the shown grains (alpha ECD number / area-weighted, lath thickness by intercept and by
     minor axis, colony ECD number / area-weighted, prior-beta ECD, width and length intercepts relative to the
     build direction) and the colony map; drawn by the backend that computed the grain-size step."""
     from .settings import load_settings  # noqa: PLC0415
@@ -549,26 +566,26 @@ def _grainsize_figure(ctx: OpContext) -> None:
             t = _read_csv(ctx, s, "alpha_grains")
             used, lath = t["used"].astype(bool), t["is_lath"].astype(bool)
             if p.kind == "alpha_ecd":
-                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                c = _hist_chart(t["ecd_um"][used], None, "alpha grain ECD (µm)", f"alpha grains, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
             elif p.kind == "alpha_ecd_area":
                 c = _hist_chart(t["ecd_um"][used], t["area_um2"][used], "alpha grain ECD (µm)",
-                                "alpha grains, area-weighted", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                                "alpha grains, area-weighted", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
             elif p.kind == "lath_thickness":
                 c = _hist_chart(t["thickness_intercept_um"][lath], None, "lath thickness, intercept ⊥ long axis (µm)",
-                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                                f"alpha laths (aspect ≥ {summ['params']['lath_min_aspect']:g}), median chord per lath", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
             else:
                 c = _hist_chart(t["ellipse_minor_um"][lath], None, "lath minor axis 2b (µm)",
-                                "alpha laths, second-moment ellipse", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                                "alpha laths, second-moment ellipse", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
         elif p.kind in ("colony_ecd", "colony_ecd_area"):
             t = _read_csv(ctx, s, "colonies")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], t["area_um2"][used] if p.kind == "colony_ecd_area" else None,
-                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""), bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                            "colony ECD (µm)", "colonies" + (", area-weighted" if p.kind == "colony_ecd_area" else ""), bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
         elif p.kind == "beta_ecd":
             t = _read_csv(ctx, s, "prior_beta")
             used = t["used"].astype(bool)
             c = _hist_chart(t["ecd_um"][used], None, "prior-β grain ECD (µm)",
-                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                            f"prior-β grains, ECD ≥ {summ['prior_beta']['min_ecd_um']:g} µm, {n_rule}", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
         else:
             name = "across_bd" if p.kind == "beta_width" else "along_bd"
             ch = step_npz(ctx, sid, "chords")
@@ -582,7 +599,7 @@ def _grainsize_figure(ctx: OpContext) -> None:
             c = _hist_chart(ch[f"{name}_um"], ch[f"{name}_um"],
                             f"prior-β {'width (chords across BD)' if name == 'across_bd' else 'length (chords along BD)'} (µm)",
                             f"complete chords, length-weighted; E112 mean {b['mean_e112_um']:.1f} µm "
-                            f"({b['n_truncated']} edge chords counted half)", "line length", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um))
+                            f"({b['n_truncated']} edge chords counted half)", "line length", bin_width=p.bin_width_um, x_range=(p.min_um, p.max_um), fit=p.lognormal_fit)
         c.width_cm, c.dpi = width, dpi
         meta["n"] = int(np.isfinite(np.asarray(c.heights, float)).sum())
         ctx.backend.render_chart(c, out_png)
@@ -641,7 +658,7 @@ def _grainsize_compare_oim(ctx: OpContext) -> None:
                                         if s_app and s_oim else None),
            "lath_partition": summ["lath_partition"], "note": "OIM grain definition (tolerance, min size) must match "
            "grains.calc (hagb_deg, min_px) for a like-for-like comparison; OIM grain file format not yet verified (D14)"}
-    c = _hist_chart(e_app, None, "alpha grain ECD (µm)", f"app ({ctx.backend.name}) vs OIM")
+    c = _hist_chart(e_app, None, "alpha grain ECD (µm)", f"app ({ctx.backend.name}) vs OIM", fit=True)
     edges = np.r_[c.centers - c.bar_width / 2, c.centers[-1] + c.bar_width / 2]
     ho, _ = np.histogram(e_oim, edges)
     c.curves = [(c.centers, ho.astype(float), f"OIM (n = {e_oim.size})")] + c.curves

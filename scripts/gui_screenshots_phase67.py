@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gui_screenshots import DATA, REPO, Run, choose, mark, wait_idle  # noqa: E402
 
-JU06 = REPO / "data" / "JU06"
+JU06 = REPO / "data" / "JU06" / "EBSD"
 
 
 def prepare(work: Path) -> str:

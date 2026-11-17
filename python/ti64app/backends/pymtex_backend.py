@@ -131,7 +131,9 @@ class PymtexBackend(PymtexTexture, PymtexAnalysis):
         from .pymtex_plot import make_key  # noqa: PLC0415
 
         e = self._map_or_grains_ebsd(handle)
-        cs = e[phase].CS
+        from .pymtex_recon import phase_cs  # noqa: PLC0415
+
+        cs = phase_cs(e, phase)
         quat = np.asarray(quat, float).reshape(-1, 4)
         out = np.full((quat.shape[0], 3), np.nan)
         ok = ~np.isnan(quat).any(axis=1)
@@ -301,6 +303,8 @@ class PymtexBackend(PymtexTexture, PymtexAnalysis):
                        n_left_large_void_px=int(big.sum()), n_large_voids=_n_regions(big, nbr))
         elif operation == "grain_dilation":
             rep.update(self._grain_dilation(w, p, pad, q, ph, flag, hexg))
+        elif operation == "grain_ci":
+            rep.update(self._grain_ci(w, p, pad, ph))
         elif operation == "smoothing":
             cp = CleanupParams(hq_filter=True, hq_alpha=p.hq_alpha, hq_threshold_deg=p.hq_threshold_deg)
             rep.update(n_changed_gt_0_1deg=self._hq_filter(w, cp, pad))
@@ -338,6 +342,28 @@ class PymtexBackend(PymtexTexture, PymtexAnalysis):
         return {"n_candidates": int(cand.sum()), "n_changed": int(done.sum()), "n_unchanged": int((cand & ~done).sum()),
                 "n_iterations": len(per_iter), "changed_per_iteration": per_iter,
                 "n_grains_kept": int(valid_g[1:].sum())}
+
+    def _grain_ci(self, w, p, pad, ph) -> dict:
+        """Grain CI standardization (base.GrainCiParams): the CI of every indexed point of a grain (alpha = 0 grains at
+        tolerance_deg, >= min_grain_px points) := the grain's mean or max CI. Same as cleanStep.m 'grain_ci'."""
+        gid, npx, gidx = self._grains_alpha0(w, p.tolerance_deg)
+        name = PROP_NAMES[self.name]["ci"]
+        ci = _arr(w.prop[name]).ravel().astype(float)
+        valid_g = gidx & (npx >= p.min_grain_px)
+        m = ~pad & (ph != PHASE_NOT_INDEXED) & valid_g[gid]
+        n = valid_g.size
+        if p.mode == "mean":
+            val = np.bincount(gid[m], weights=ci[m], minlength=n) / np.maximum(np.bincount(gid[m], minlength=n), 1)
+        else:
+            val = np.full(n, -np.inf)
+            np.maximum.at(val, gid[m], ci[m])
+        new = ci.copy()
+        new[m] = val[gid[m]]
+        changed = m & (np.abs(new - ci) > 1e-9)
+        w.prop[name] = new.reshape(w.shape)
+        return {"mode": p.mode, "n_in_grains": int(m.sum()), "n_changed": int(changed.sum()),
+                "n_grains": int(valid_g[1:].sum()), "ci_mean_before": float(ci[m].mean()) if m.any() else None,
+                "ci_mean_after": float(new[m].mean()) if m.any() else None}
 
     @staticmethod
     def _hq_filter(w, p: CleanupParams, pad) -> int:

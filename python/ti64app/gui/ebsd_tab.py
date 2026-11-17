@@ -17,7 +17,7 @@ from nicegui import run as ng_run
 from nicegui import ui
 
 from .. import layers as lay
-from .. import progress, service
+from .. import progress, service, views
 from ..annotations import ROI_TYPES, Annotation, load_annotations, roi_box
 from ..backends import backend_status
 from ..backends.base import CLEAN_LABELS
@@ -43,7 +43,6 @@ ON_DEMAND = ("kam", "grod", "gos", "gnd")             # listed in the map select
 IPF_KINDS = ("ipf", "parent_ipf")
 PANEL_TABS = ("results", "pf", "ipf", "elastic")
 REGION_LABELS = {"map": "whole map", "roi": "ROI", "sample": "all maps of the sample"}
-IPF_DIR_OPTIONS = ["BD", "beam axis", "width", "thickness", "map x", "map y", "map z", "custom"]      # map tabs without the map viewer (phase 6.7: texture, elastic)
 # cleanup sub-panels (fix 5): operation, icon, fields (name, num | check, label, default, number options)
 CLEAN_UI = [
     ("ci_threshold", "filter_alt", [("ci_threshold", "num", "CI threshold (points below → not indexed)", 0.1,
@@ -59,7 +58,12 @@ CLEAN_UI = [
                                          {"step": 0.5, "min": 0}),
                                         ("min_grain_px", "num", "minimum grain size [px]", 2, {"step": 1, "min": 1}),
                                         ("multi_row", "check", "grain must span multiple rows", False, {}),
-                                        ("single_iteration", "check", "single iteration", False, {})]),
+                                        ("single_iteration", "check", "single iteration", True, {})]),
+    ("grain_ci", "verified", [("tolerance_deg", "num", "grain tolerance angle [°]", 5.0, {"step": 0.5, "min": 0}),
+                              ("min_grain_px", "num", "minimum grain size [px]", 2, {"step": 1, "min": 1}),
+                              ("mode", "select", "CI of the grain",
+                               "mean", {"options": {"mean": "average CI of the grain",
+                                                    "max": "maximum CI of the grain (as OIM)"}})]),
     ("smoothing", "blur_linear", [("hq_alpha", "num", "filter strength", 0.5, {"step": 0.1, "min": 0}),
                                   ("hq_threshold_deg", "num", "filter limit [°]", 15.0, {"step": 1, "min": 0})]),
 ]
@@ -114,7 +118,7 @@ class Section:
     'stale' when an upstream step changed after it. track() tells the section which step is its last applied one."""
 
     def __init__(self, gs: GuiState, key: str, title: str, icon: str, opened: bool = False,
-                 group: str | None = "ebsd", sub: bool = False) -> None:
+                 group: str | None = "ebsd", sub: bool = False, tooltip: str = "") -> None:
         self.gs, self.key, self.title = gs, key, title
         self.fields: dict[str, ui.element] = {}
         self.defaults: dict = {}
@@ -128,6 +132,8 @@ class Section:
             with ui.row().classes("w-full items-center no-wrap gap-3"):
                 ui.icon(icon, size="18px" if sub else "22px").classes("text-primary")
                 self.title_label = ui.label(title).classes(("text-sm " if sub else "") + "font-semibold grow")
+                if tooltip:
+                    self.title_label.tooltip(tooltip)
                 self.chip = ui.label("").classes("ti-draft").mark(f"badge_{key}")
                 with self.chip:
                     self.chip_tip = ui.tooltip("")
@@ -330,13 +336,14 @@ def ebsd_page() -> None:
                              "margin, auto size")
                 with lay_btn:
                     lay_menu = ui.menu().props("anchor='bottom left' self='top left'").mark("legend_layout_menu")
-            tool = ui.select(TOOLS, value="pan", label="tool").classes("w-32").props("dense").mark("viewer_tool")
+            tool = ui.select(TOOLS, value="pan", label="tool").classes("w-32").props("dense").mark("viewer_tool") \
+                .tooltip(tip("viewer_tool"))
             ui.space()
             hist_toggle = ui.button(icon="history", on_click=lambda: toggle_history()).props("flat round dense") \
                 .mark("history_toggle").tooltip("Show / hide the History panel (right of the map)")
         mtabs = ui.tabs().classes("w-full bg-white border-b").props("dense align=left no-caps")
         with mtabs:
-            t_alpha = ui.tab("alpha", label="α map", icon="map").mark("mtab_alpha")
+            t_alpha = ui.tab("alpha", label="Map", icon="map").mark("mtab_alpha")
             t_beta = ui.tab("beta", label="prior β", icon="hub").mark("mtab_beta")
             t_beta.set_visibility(False)                # shown once the map has a reconstruction
             ui.tab("results", label="Results", icon="insights").mark("rtab_results")
@@ -484,16 +491,22 @@ def ebsd_page() -> None:
                         ui.menu_item("Save: show the table files (CSV / XLSX / JSON) in Explorer",
                                      on_click=lambda d=d: _reveal_dir(d)).mark("result_save")
 
+    @stable          # the card (and the menu item that called this) is deleted below: notify via the page root
     async def delete_result(card, step) -> None:
+        # a view figure (grain-size histogram, fix 6.7.1) is not a recipe step: only its card is removed
+        recorded = any(s_.id == step.id for s_ in p.recipe().steps)
         try:
-            service.delete_step(p, step.id)
+            if recorded:
+                service.delete_step(p, step.id)
         except KeyError:
-            pass
+            recorded = False
         except Exception as e:  # noqa: BLE001
             error(e, "Could not delete the figure")
             return
         card.delete()
-        ui.notify(f"Figure {step.id} deleted (also from History). Undo (Ctrl+Z) brings the step back.", type="positive")
+        ui.notify(f"Figure {step.id} deleted (also from History). Undo (Ctrl+Z) brings the step back." if recorded
+                  else "Figure removed from Results (a drawn figure is display only, not a History step; 'Draw' "
+                       "in the section 'Grain size' draws it again).", type="positive")
         if hooks.get("history"):
             hooks["history"]()
 
@@ -613,7 +626,7 @@ def ebsd_page() -> None:
                                      "exports use the figure line width x factor.")
                         wn.on_value_change(lambda e, o=o: set_ov_style(o, width=float(e.value or 1)))
             if not available:
-                ui.label("No overlays yet: boundaries appear after 'Grains and boundaries' (α map) or the "
+                ui.label("No overlays yet: boundaries appear after 'Grains and boundaries' (Map tab) or the "
                          "reconstruction (prior β tab); crack paths after drawing one.").classes("text-xs px-3 pb-2")
         ov_label()
 
@@ -622,7 +635,7 @@ def ebsd_page() -> None:
         names = ", ".join(lay.OVERLAY_LABELS[o] for o in st["ovsel"])
         ov_btn.text = f"Overlays ({len(st['ovsel'])})" if st["ovsel"] else "Overlays"
         if not st.get("ov_avail", True):
-            ov_tip.text = ("No overlays yet: grain boundaries appear after 'Grains and boundaries' (α map), prior-β "
+            ov_tip.text = ("No overlays yet: grain boundaries appear after 'Grains and boundaries' (Map tab), prior-β "
                            "boundaries after the reconstruction (prior β tab), crack paths after drawing one.")
             return
         ov_tip.text = (f"Shown: {names}. " if names else "No overlay shown. ") +             "Boundaries and crack paths on the map, with their colour and line width."
@@ -767,9 +780,9 @@ def ebsd_page() -> None:
                         if a.type in ROI_TYPES:
                             b = roi_box(a)
                             ui.button(icon="zoom_in", on_click=lambda b=b: viewer["v"] and viewer["v"].run_method(
-                                "zoomTo", *b)).props("dense flat round size=sm").tooltip("Zoom to this ROI")
+                                "zoomTo", *b)).props("dense flat round size=sm").tooltip("Zoom to this ROI. " + tip("roi"))
                             ui.button(icon="content_cut", on_click=lambda a=a: crop_dialog(a)) \
-                                .props("dense flat round size=sm").tooltip("Crop the map to this ROI (new map)")
+                                .props("dense flat round size=sm").tooltip("Crop the map to this ROI (new map). " + tip("roi"))
                         ui.button(icon="delete", on_click=lambda a=a: delete_annotation(a.id)) \
                             .props("dense flat round size=sm").tooltip("Delete").mark(f"del_{a.id}")
 
@@ -781,6 +794,7 @@ def ebsd_page() -> None:
             if "crack" in st["ovsel"]:
                 await show_overlays()
 
+    @stable          # the list row with the delete button is rebuilt by save_items
     async def delete_annotation(aid: str):
         await save_items([a for a in load_annotations(p, st["map"]) if a.id != aid], "annotation deleted")
 
@@ -863,7 +877,7 @@ def ebsd_page() -> None:
                 ui.html(f'<div style="width:12px;height:10px;background:{col};border:1px solid #999"></div>')
                 ui.label(lab).classes("text-xs")
             if info.get("keys"):
-                ui.label(" · ".join(f"{ph.replace('Ti ', '')}: {k['key']} ∥ {k['direction']}"
+                ui.label(" · ".join(f"{ph.replace('Ti ', '')}: {k['key']} ∥ {k.get('direction_label', k['direction'])}"
                                     for ph, k in info["keys"].items())).classes("text-xs ti-muted")
             ui.label(f"coloured by {info.get('backend')}").classes("text-xs ti-muted")
 
@@ -960,7 +974,7 @@ def ebsd_page() -> None:
             # the IPF key after the map is on screen (first MATLAB figure render of an engine takes ~45 s, fix 3.8)
             viewer["v"].set(legend_data=await legend_data(L))
         status.text = (f"{st['map']}: {L.layout.lut.shape[0]} rows, {'hex' if L.layout.hex else 'square'} grid, "
-                       f"step {L.layout.dx:.3g} µm; {L.info.get('title', '')}")
+                       f"step {L.layout.dx:.3g} µm; axes {axes_text()}; {L.info.get('title', '')}")
         sk._caption()                                  # the KAM section compares with the kind shown (fix 5)
         await prepare_original(L)
 
@@ -1050,7 +1064,7 @@ def ebsd_page() -> None:
         refresh_overlay_menu(ov_av)
         st["legends"] = [dict(i) for i in (gs.get("legends", m, t) or [default_item("scale_bar").model_dump()])]
         gs.set("legends", m, t, st["legends"])
-        hist_title.text = f"History · {'prior β map' if t == 'beta' else 'α map'}"
+        hist_title.text = f"History · {'prior β map' if t == 'beta' else 'Map'}"
         if hooks.get("history"):
             hooks["history"]()
         refresh_badges()
@@ -1099,18 +1113,78 @@ def ebsd_page() -> None:
         """Edit-menu parts that belong to one map tab, and figure lists that only offer what exists (fix 8 / 9)."""
         for el, tb in tab_vis:
             el.set_visibility(tb == t)
-        sg.title_label.text = "Grains and boundaries · " + ("prior β" if t == "beta" else "α map")
-        gs_title.text = "Grain size · " + ("prior β" if t == "beta" else "α map")
+        sg.title_label.text = "Grains and boundaries · " + ("prior β" if t == "beta" else "Map")
+        gs_title.text = "Grain size · " + ("prior β" if t == "beta" else "Map")
         kinds = [k for k in GS_FIG_KINDS if (k in GS_BETA_KINDS) == (t == "beta")]
         gfk.options = {k: GS_FIG_LABELS[k] for k in kinds}
         if gfk.value not in kinds:
-            sz.defaults["fig"] = kinds[0]          # switching the map tab is not an unapplied edit
             gfk.value = kinds[0]
         gfk.update()
         gs_fig_row.set_visibility(bool(av.get("grainsize")))
+        refresh_dirs()
+        refresh_ipf_dir_labels()
         recon_figs.set_visibility(bool(av.get("recon")))
 
     # ---- edit menu ---------------------------------------------------------------------------------------------
+    dir_widgets: list = []           # (multi-select, row of greyed directions, recorded choice) of texture / elastic
+
+    def dir_choices() -> dict:
+        """Directions of the current map (texture.direction_choices, fix 6.7.1 items 2 and 9): options = the ones
+        that can be resolved (+ custom), unavailable = {name: what to enter}, pick(recorded) = the recorded choice
+        limited to the options, else the map's defaults (the map axes by their labels)."""
+        from .. import texture as tx_  # noqa: PLC0415
+
+        ch = tx_.direction_choices(p, st["map"]) if st["map"] else []
+        opts = [c["name"] for c in ch if c["available"]]
+        defaults = [c["name"] for c in ch if c.get("default")]
+
+        def pick(rec):
+            keep = [d for d in (rec or []) if d in opts]
+            return keep or defaults or opts[:1]
+        return {"options": opts, "unavailable": {c["name"]: c["why"] for c in ch if not c["available"]},
+                "pick": pick}
+
+    def refresh_dirs() -> None:
+        """Offer the directions of the current map; grey out (with what to enter) those that cannot be resolved."""
+        ch = dir_choices()
+        for sel_w, na_row, rec in dir_widgets:
+            cur = [d for d in (sel_w.value or []) if d in ch["options"]]
+            sel_w.options = ch["options"]
+            sel_w.value = cur or ch["pick"](rec())
+            sel_w.update()
+            na_row.clear()
+            with na_row:
+                if ch["unavailable"]:
+                    ui.label("not available yet:").classes("text-xs ti-muted")
+                for n_, why_ in ch["unavailable"].items():
+                    ui.label(n_).classes("text-xs px-2 rounded-full bg-gray-200 text-gray-500 cursor-help") \
+                        .tooltip(f"'{n_}' cannot be resolved yet: {why_}").mark(f"dir_na_{n_.replace(' ', '_')}")
+            na_row.set_visibility(bool(ch["unavailable"]))
+
+    def ipf_dir_labels() -> dict[str, str]:
+        """Reference directions of the IPF map named by the map's axis labels (x = L ...) and BD."""
+        from ..sample import MapAxes  # noqa: PLC0415
+
+        try:
+            sh = p.sample(st["map"]) if st["map"] else None
+        except (KeyError, ValueError):
+            sh = None
+        ax = (sh.axes if sh is not None else None) or MapAxes()
+        out = {}
+        for d_, k_ in zip(("X", "Y", "Z"), "xyz"):
+            lab_ = ax.label(k_)
+            out[d_] = f"map {k_}" + ("" if lab_ == k_ else f" = {lab_}") + (
+                " (BD)" if ax.mode == "approximate" and ax.build_axis == k_ else "")
+        out["build"] = "build direction (BD)" + ("" if sh is not None and sh.build_direction else " – not entered")
+        out["custom"] = "custom vector"
+        return out
+
+    def refresh_ipf_dir_labels() -> None:
+        labs = ipf_dir_labels()
+        for _k, dd in ipf_w.values():
+            dd.options = labs
+            dd.update()
+
     def lastp(op: str) -> dict:
         s = service.latest_step(p, (op,), map_id=st["map"])
         return s.params if s else {}
@@ -1199,6 +1273,8 @@ def ebsd_page() -> None:
                             v_ = lp_.get(name_, default_)
                             if kind_ == "num":
                                 ss.num(name_, label_, v_, f"clean_{name_}", **kw_)
+                            elif kind_ == "select":
+                                ss.select(name_, kw_["options"], v_, label_, f"clean_{name_}")
                             else:
                                 ss.check(name_, label_, bool(v_), f"clean_{name_}")
                         clean_sum[op_] = ui.label("").classes("text-xs").style("overflow-wrap: anywhere") \
@@ -1273,7 +1349,8 @@ def ebsd_page() -> None:
                     with ui.row().classes("w-full no-wrap gap-2 items-end"):
                         ui.label({"alpha": "α", "beta": "β"}[short]).classes("w-4 pb-2")
                         ipf_w[ph] = (si.select(f"key_{short}", IPF_KEYS, k.key, "IPF key", "ipf_key"),
-                                     si.select(f"dir_{short}", DIRECTIONS, k.direction, "reference direction", "ipf_dir"))
+                                     si.select(f"dir_{short}", ipf_dir_labels(), k.direction, "reference direction",
+                                               "ipf_dir"))
                 cv_row = ui.row().classes("w-full no-wrap gap-2")
                 with cv_row:
                     vs["cv"] = [si.num(f"cv_{c}", f"custom {c}", v, "ipf_dir", step=0.1)
@@ -1537,41 +1614,70 @@ def ebsd_page() -> None:
                         update_tab_parts(tabkey(), lay.available(p, st["map"]))
                 ui.button("Apply", icon="check", on_click=apply_gs).mark("run_gs")
                 gs_fig_row = ui.column().classes("w-full gap-1 mt-2")
+                vset = views.settings(p.root, st["map"]) if st["map"] else {}     # view settings of this map
                 with gs_fig_row:
-                    ui.label("Histograms (log-normal fit) and the colony map").classes("text-sm font-semibold")
-                    gfk = sz.select("fig", GS_FIG_LABELS, "alpha_ecd", "figure", "gs_fig")
-                    with ui.row().classes("w-full no-wrap gap-2 items-end"):
-                        with ui.element("div").classes("grow min-w-0"):
-                            bw = sz.num("bin_um", "bin width [µm] (empty = automatic)", None, "gs_bin", step=0.5,
-                                        min=0).props("clearable")
-                        bw.bind_visibility_from(gfk, "value", backward=lambda v: v != "colony_map")
-                    with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(
-                            gfk, "value", backward=lambda v: v != "colony_map"):
-                        sz.num("min_um", "shown from [µm]", None, "gs_range", step=0.5, min=0) \
-                            .props("clearable")
-                        sz.num("max_um", "up to [µm]", None, "gs_range", step=1, min=0).props("clearable")
+                    ui.label("Histograms and the colony map").classes("text-sm font-semibold") \
+                        .tooltip("Drawing a figure is display, not analysis: it is not a recipe step and does not "
+                                 "appear in History. Its settings are kept per map (like export settings).")
+                    figw: dict = {}               # view settings, not section drafts (no 'changed' badge)
+                    figw["kind"] = ui.select(GS_FIG_LABELS, value=vset.get("kind", "alpha_ecd"), label="figure") \
+                        .classes("w-full").tooltip(tip("gs_fig")).mark("grainsize_fig")
+                    gfk = figw["kind"]
+                    not_map = {"backward": lambda v: v != "colony_map"}
+                    figw["bin_width_um"] = ui.number("bin width [µm] (empty = automatic)",
+                                                     value=vset.get("bin_width_um"), step=0.5, min=0) \
+                        .props("clearable").classes("w-full").tooltip(tip("gs_bin")).mark("grainsize_bin_um")
+                    figw["bin_width_um"].bind_visibility_from(gfk, "value", **not_map)
+                    with ui.row().classes("w-full no-wrap gap-2").bind_visibility_from(gfk, "value", **not_map):
+                        figw["min_um"] = ui.number("shown from [µm]", value=vset.get("min_um"), step=0.5, min=0) \
+                            .props("clearable").classes("w-full").tooltip(tip("gs_range")).mark("grainsize_min_um")
+                        figw["max_um"] = ui.number("up to [µm]", value=vset.get("max_um"), step=1, min=0) \
+                            .props("clearable").classes("w-full").tooltip(tip("gs_range")).mark("grainsize_max_um")
+                    figw["lognormal_fit"] = ui.checkbox("log-normal fit", value=bool(vset.get("lognormal_fit"))) \
+                        .props("dense").tooltip(tip("gs_lognormal")).mark("grainsize_lognormal_fit")
+                    figw["lognormal_fit"].bind_visibility_from(gfk, "value", **not_map)
+
+                    def fig_params() -> dict:
+                        prm = {"kind": gfk.value}
+                        if gfk.value != "colony_map":
+                            for k_ in ("bin_width_um", "min_um", "max_um"):
+                                if figw[k_].value not in (None, ""):
+                                    prm[k_] = float(figw[k_].value)
+                            prm["lognormal_fit"] = bool(figw["lognormal_fit"].value)
+                        return prm
+
+                    def keep_fig_settings(_=None):            # view state: saved as the user changes it
+                        if st["map"]:
+                            views.set_settings(p.root, st["map"], "grainsize.figure", fig_params())
+                    for w_ in figw.values():
+                        w_.on_value_change(keep_fig_settings)
                     with ui.row().classes("w-full no-wrap gap-2 items-end"):
                         ui.space()
 
                         async def gs_fig():
-                            prm = {"kind": gfk.value}
-                            if gfk.value != "colony_map" and sz.v("bin_um"):
-                                prm["bin_width_um"] = float(sz.v("bin_um"))
-                            if gfk.value != "colony_map":
-                                for k_ in ("min_um", "max_um"):
-                                    if sz.v(k_) not in (None, ""):
-                                        prm[k_] = float(sz.v(k_))
+                            prm = {"map_id": st["map"], **fig_params()}
                             from ..ops_grainsize import grainsize_step_for  # noqa: PLC0415
 
                             sid = grainsize_step_for(p, st["map"], "prior_beta" if gfk.value in GS_BETA_KINDS
                                                      else "alpha")
                             s_ = p.recipe().step(sid) if sid else None
-                            step = await run_step("grainsize.figure", prm, f"figure {gfk.value}",
-                                                  s_.backend if s_ else None)
-                            if step:
-                                show_image(p.root / step.outputs["figure"].path,
-                                           f"{GS_FIG_LABELS[gfk.value]} ({step.backend})", step=step)
-                        ui.button("Draw", icon="brush", on_click=gs_fig).props("outline").mark("run_gs_fig")
+                            if st["busy"]:
+                                ui.notify("Another step is still running.", type="warning")
+                                return
+                            st["busy"] = True
+                            try:
+                                step = await ng_run.io_bound(service.draw_view, p, "grainsize.figure", prm,
+                                                             s_.backend if s_ else None)
+                            except Exception as e:  # noqa: BLE001
+                                error(e, "The grain-size figure could not be drawn")
+                                return
+                            finally:
+                                st["busy"] = False
+                            show_image(p.root / step.outputs["figure"].path,
+                                       f"{GS_FIG_LABELS[gfk.value]} ({step.backend})", step=step)
+                        ui.button("Draw", icon="brush", on_click=stable(gs_fig)).props("outline") \
+                            .mark("run_gs_fig").tooltip("Draw the figure with the backend that computed the grain "
+                                                        "size (display only: no recipe step)")
 
                 async def gs_oim():
                     f = await dialogs.open_files("OIM grain file", gs.get("last_folder") or "",
@@ -1590,9 +1696,10 @@ def ebsd_page() -> None:
             # 6b texture (phase 6.7): ODF, pole figures, inverse pole figures in the specimen frame
             lt = lastp("texture.run")
             with Section(gs, "texture", "Texture", "radio_button_checked") as stx:
-                ui.label("ODF of α or reconstructed prior-β orientations in the specimen frame (beam axis / "
-                         "thickness / width, from the map sheet's position; BD from the sample sheet). Results: the "
-                         "'Pole figures' and 'Inverse pole figures' tabs above the map.").classes("text-xs ti-muted")
+                ui.label("ODF of α or reconstructed prior-β orientations. Directions are named as set in the map "
+                         "sheet's 'Map axes' (Files tab): beam axis / thickness / width when the position on the "
+                         "specimen is entered, else the map axes by their labels (x / y / z or your own, e.g. L / S / "
+                         "T). Results: the 'Pole figures' and 'Inverse pole figures' tabs above the map.")                     .classes("text-xs ti-muted")
                 with ui.row().classes("w-full no-wrap gap-2"):
                     tph = stx.select("phase", {"alpha": "α", "beta": "prior β (reconstruction)"},
                                      g(lt, "phase", default="alpha"), "phase", "tex_phase")
@@ -1611,8 +1718,11 @@ def ebsd_page() -> None:
                                g(lt, "plot", default="density"), "plot", "tex_plot")
                 tpoles = stx.select("poles", list(PF_ALPHA), g(lt, "poles") or list(PF_ALPHA), "pole figures",
                                     "tex_poles", multiple=True).props("use-chips")
-                tdirs = stx.select("ipf_dirs", IPF_DIR_OPTIONS, g(lt, "ipf_dirs", default=["BD", "beam axis", "width"]),
+                _ch = dir_choices()
+                tdirs = stx.select("ipf_dirs", _ch["options"], _ch["pick"](g(lt, "ipf_dirs")),
                                    "inverse pole figures along", "tex_ipf_dirs", multiple=True).props("use-chips")
+                tex_na = ui.row().classes("w-full gap-1 items-center").mark("tex_dirs_unavailable")
+                dir_widgets.append((tdirs, tex_na, lambda: g(lastp("texture.run"), "ipf_dirs")))
                 tcv = ui.row().classes("w-full no-wrap gap-2")
                 with tcv:
                     tex_cv = [stx.num(f"cv_{c}", f"custom {c}", v, "tex_custom", step=0.1)
@@ -1680,9 +1790,11 @@ def ebsd_page() -> None:
                         .classes("min-w-0 flex-1")
                     sel_.num("bootstrap_runs", "bootstrap runs", g(le, "bootstrap_runs", default=200), "el_bootstrap",
                              step=50, min=0, max=5000).classes("min-w-0 flex-1")
-                edirs = sel_.select("directions", IPF_DIR_OPTIONS, g(le, "directions",
-                                                                     default=["BD", "beam axis", "width"]),
+                edirs = sel_.select("directions", _ch["options"], _ch["pick"](g(le, "directions")),
                                     "E along", "el_directions", multiple=True).props("use-chips")
+                el_na = ui.row().classes("w-full gap-1 items-center").mark("el_dirs_unavailable")
+                dir_widgets.append((edirs, el_na, lambda: g(lastp("elastic.run"), "directions")))
+                refresh_dirs()
                 ecv = ui.row().classes("w-full no-wrap gap-2")
                 with ecv:
                     el_cv = [sel_.num(f"cv_{c}", f"custom {c}", v, "tex_custom", step=0.1)
@@ -1708,11 +1820,12 @@ def ebsd_page() -> None:
                 ui.button("Apply", icon="check", on_click=apply_elastic).mark("run_elastic")
 
             # 7 annotations
-            with Section(gs, "annotations", "Annotations and ROIs", "edit"):
+            with Section(gs, "annotations", "Annotations and ROIs", "edit", tooltip=tip("annotations")):
                 ui.label("Pick a drawing tool in the 'tool' list of the map toolbar. 2-point tools: click start and end; polylines / crack / "
                          "ROI polygon: click points, double-click or Enter to finish; Esc cancels.") \
                     .classes("text-xs ti-muted")
-                vs["ann_text"] = ui.input("text / name").classes("w-full").mark("ann_text")
+                vs["ann_text"] = ui.input("text / name").classes("w-full").mark("ann_text") \
+                    .tooltip("Text of a text annotation, or the name of the next ROI / crack path. " + tip("roi"))
                 with ui.row().classes("w-full no-wrap gap-2"):
                     vs["ann_color"] = ui.color_input("colour", value="").classes("grow")
                     vs["ann_w"] = ui.number("width [pt]", value=1.5, step=0.5, min=0.25).classes("w-28")
@@ -1948,12 +2061,22 @@ def ebsd_page() -> None:
 
             lab = indexing_label(m)
             sheet_lab.text = (f"{sh.specimen_id or 'no sample'}: {state}, {bd}"
-                              + (f", indexing: {lab}" if lab else ""))
+                              + (f", indexing: {lab}" if lab else "") + f"; axes: {axes_text()}")
             miss = missing_fields(m) if m is not None else []
             sheet_link.set_visibility(bool(miss))
         except (KeyError, ValueError):
             sheet_lab.text = "map sheet incomplete (Files tab)"
         load_info.text = frame_text()
+
+    def axes_text() -> str:
+        """Active axis labels of the map (map sheet 'Map axes', fix 6.7.1 item 9), for the map info."""
+        from ..sample import MapAxes  # noqa: PLC0415
+
+        try:
+            ax = p.sample(st["map"]).axes or MapAxes()
+        except (KeyError, ValueError):
+            ax = MapAxes()
+        return ax.text() + (" (approximate)" if ax.mode == "approximate" else "")
 
     def frame_text() -> str:
         """Load section: EDAX setting, the crystal frame (file vs backend) and the OIM axes of the newest load."""
@@ -2114,6 +2237,10 @@ def recon_summary(p: Project, step) -> None:
             ("fit quantiles 10/25/50/75/90 %", ", ".join(f"{v:.2f}" for v in s["fit_quantiles"])),
             ("area-weighted ECD", f"{s['ecd_aw_um']:.1f} µm"),
             ("bridged steps / split noise", f"{s['bridged_pct']:.1f} % / {s['split_pct']:.1f} %")]
+    if s.get("beta_added"):
+        a_ = (step.params.get("params") or {}).get("betaLattice")
+        rows.insert(1, ("parent phase", "β not in file: Ti (beta) (m-3m" + (f", a = {a_:g} Å" if a_ else "")
+                        + ", Settings > Parent β phase) added for the reconstruction; retained β = 0"))
     gs_ = s["grain_shape"]
     if gs_.get("aspect_along_across"):
         rows.append(("caliper along / across BD (area-w., edge grains excluded)",
@@ -2154,6 +2281,9 @@ def _fmt(v, nd=2) -> str:
 
 def grainsize_summary(p: Project, step) -> None:
     s = json.loads((p.root / step.outputs["summary"].path).read_text(encoding="utf-8"))
+    # log-normal fit numbers only when 'log-normal fit' is ticked for this map (fix 6.7.1 item 7; the CSV / XLSX
+    # tables always have them)
+    show_fit = bool(views.settings(p.root, s.get("map_id") or step.params.get("map_id", "")).get("lognormal_fit"))
 
     def stat(d, aw=True):
         if not d:
@@ -2162,7 +2292,7 @@ def grainsize_summary(p: Project, step) -> None:
         if aw and d.get("area_weighted"):
             t += f"; area-weighted {_fmt(d['area_weighted']['mean'])} µm"
         ln = d.get("lognormal") or {}
-        if ln.get("sigma"):
+        if show_fit and ln.get("sigma"):
             t += f"; log-normal median {_fmt(ln['median'])}, σ {_fmt(ln['sigma'])}"
         return t
     a, c, b, rb = s.get("alpha"), s.get("colony"), s.get("prior_beta"), s["retained_beta"]
@@ -2181,8 +2311,9 @@ def grainsize_summary(p: Project, step) -> None:
                 rows.append((lab, f"E112 mean intercept {_fmt(b[k]['mean_e112_um'], 1)} µm "
                                   f"({b[k]['n_complete']} complete + {b[k]['n_truncated']} edge chords)"))
     if "loaded" in rb:
-        rows.append(("retained β (indexed fraction)", f"loaded {100 * rb['loaded']['fraction']:.3f} %, "
-                                                      f"analysed map {100 * rb['source_map']['fraction']:.3f} %"))
+        rows.append(("retained β (indexed fraction)", "0 % (not in file: the map has no β phase)"
+                     if rb.get("in_file") is False else f"loaded {100 * rb['loaded']['fraction']:.3f} %, "
+                                                         f"analysed map {100 * rb['source_map']['fraction']:.3f} %"))
     elif "reconstruction" in rb:
         rows.append(("retained β after reconstruction", f"{100 * rb['reconstruction']['fraction_of_kept']:.3f} % "
                                                         "of the kept pixels"))

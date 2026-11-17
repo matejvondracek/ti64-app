@@ -183,6 +183,11 @@ class Project:
         n = migrate_recipe(self.root)                   # exports are not recipe steps (fix 3.4)
         if n:
             done.append(f"{n} export step(s) moved from the recipe to the export log")
+        from .views import migrate_recipe as migrate_views  # noqa: PLC0415
+
+        n = migrate_views(self.root)                    # figures drawn from results are view state (fix 6.7.1)
+        if n:
+            done.append(f"{n} grain-size figure step(s) moved from the recipe to the view settings (views.json)")
         return done
 
     # -- state --------------------------------------------------------------------------------
@@ -385,12 +390,17 @@ class Project:
         else:
             sid = None
             fields = {"input_state": sheet.input_state, "build_direction": sheet.build_direction,
-                      "position": sheet.position, "notes": sheet.notes, "phase_map": sheet.phase_map}
+                      "position": sheet.position, "notes": sheet.notes, "phase_map": sheet.phase_map,
+                      "axes": sheet.axes}
             for k in ("material", "process", "bending"):
                 if m is not None and getattr(m, k) is not None:
                     fields[k] = getattr(sheet, k)
         if (m is not None and m.input_state is None and fields.get("input_state") == suggest_input_state(sheet.map_file)):
             fields["input_state"] = None
+        if sheet.axes is not None and sheet.axes.mode == "approximate":
+            # the effective BD of 'approximate' map axes is derived from the BD axis: it must not overwrite the exact
+            # build direction the map sheet keeps for 'exact' mode (fix 6.7.1)
+            fields.pop("build_direction", None)
         f = Path(sheet.map_file)
         st = f.stat() if f.is_file() else None
         base = {"id": sheet.map_id, "file": str(f), "kind": file_kind(f) or "other", "sample_id": sid,
